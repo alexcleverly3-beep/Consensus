@@ -401,33 +401,33 @@ db.exec(`
 const stmtGetCache =
   db.prepare(`
     SELECT
-      data_json,
+      stats_json,
       updated_at
 
     FROM wallet_cache
 
     WHERE wallet_address = ?
-      AND kind = ?
+      AND period = ?
   `);
 
 const stmtPutCache =
   db.prepare(`
     INSERT INTO wallet_cache(
       wallet_address,
-      kind,
-      data_json,
+      period,
+      stats_json,
       updated_at
     )
     VALUES (?, ?, ?, ?)
 
     ON CONFLICT(
       wallet_address,
-      kind
+      period
     )
 
     DO UPDATE SET
-      data_json =
-        excluded.data_json,
+      stats_json =
+        excluded.stats_json,
 
       updated_at =
         excluded.updated_at
