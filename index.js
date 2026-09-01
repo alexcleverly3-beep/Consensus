@@ -69,12 +69,12 @@ const ACTIVITY_SAMPLE =
     100
   );
 
-// Main GMGN protection.
-// Every REAL GMGN request is separated by this gap.
+// One real GMGN request at a time,
+// with a deliberately long gap.
 const MIN_GMGN_GAP_MS =
   clampInt(
     process.env.GMGN_MIN_REQUEST_GAP_MS,
-    8000,
+    12000,
     3000,
     30000
   );
@@ -105,7 +105,7 @@ const MIN_30D_TRACK_SCORE = 54;
 const MIN_7D_TRACK_SCORE = 46;
 const MIN_FINAL_SCORE = 64;
 
-// Bot/high-frequency protection.
+// Bot / high-frequency protection.
 const HARD_MAX_TRADES_PER_DAY = 250;
 const HARD_MAX_TRADES_PER_TOKEN = 40;
 
@@ -117,7 +117,6 @@ const FAST_AVG_HOLD_SEC =
 
 const HARD_MAX_THIS_TOKEN_TX = 80;
 
-// These are not useful wallets to track manually.
 const HARD_TAGS =
   new Set([
     "rat_trader",
@@ -138,9 +137,12 @@ function clampInt(
   min,
   max
 ) {
-  const n = Number(value);
+  const n =
+    Number(value);
 
-  if (!Number.isFinite(n)) {
+  if (
+    !Number.isFinite(n)
+  ) {
     return fallback;
   }
 
@@ -234,15 +236,16 @@ function short(address) {
 }
 
 function findSolAddress(text) {
+  const matches =
+    String(
+      text || ""
+    ).match(
+      SOL_ADDR_IN_TEXT
+    ) ||
+    [];
+
   return (
-    (
-      String(
-        text || ""
-      ).match(
-        SOL_ADDR_IN_TEXT
-      ) ||
-      []
-    ).find(
+    matches.find(
       (x) =>
         SOL_ADDR.test(x)
     ) ||
@@ -271,7 +274,9 @@ function tagsOf(obj) {
 
     ...(
       Array.isArray(
-        obj?.common?.tags
+        obj
+          ?.common
+          ?.tags
       )
         ? obj.common.tags
         : []
@@ -288,7 +293,9 @@ function tagsOf(obj) {
 }
 
 function median(values) {
-  if (!values.length) {
+  if (
+    !values.length
+  ) {
     return null;
   }
 
@@ -335,17 +342,22 @@ db.pragma(
   "synchronous = NORMAL"
 );
 
+// IMPORTANT:
+// wallet_cache deliberately keeps the OLD column names
+// period / stats_json so it works with the database
+// already stored on the Railway volume.
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS wallet_cache (
-  wallet_address TEXT NOT NULL,
-  period TEXT NOT NULL,
-  stats_json TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (
-    wallet_address,
-    period
-  )
-);
+    wallet_address TEXT NOT NULL,
+    period TEXT NOT NULL,
+    stats_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (
+      wallet_address,
+      period
+    )
+  );
 
   CREATE TABLE IF NOT EXISTS token_cache (
     token_address TEXT PRIMARY KEY,
@@ -363,6 +375,8 @@ db.exec(`
     realized_profit REAL,
     total_profit REAL,
     entry_delay_sec REAL,
+    buy_count INTEGER,
+    sell_count INTEGER,
     PRIMARY KEY (
       wallet_address,
       token_address
@@ -470,7 +484,8 @@ const stmtPutTokenCache =
 
 const stmtPrevSent =
   db.prepare(`
-    SELECT COUNT(*) AS count
+    SELECT
+      COUNT(*) AS count
 
     FROM sent_results
 
@@ -511,9 +526,11 @@ const stmtObservation =
       profit_change,
       realized_profit,
       total_profit,
-      entry_delay_sec
+      entry_delay_sec,
+      buy_count,
+      sell_count
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
     ON CONFLICT(
       wallet_address,
@@ -537,7 +554,13 @@ const stmtObservation =
         excluded.total_profit,
 
       entry_delay_sec =
-        excluded.entry_delay_sec
+        excluded.entry_delay_sec,
+
+      buy_count =
+        excluded.buy_count,
+
+      sell_count =
+        excluded.sell_count
   `);
 
 const stmtObservationSummary =
@@ -561,8 +584,7 @@ const stmtObservationSummary =
       SUM(
         CASE
           WHEN
-            entry_delay_sec
-              IS NOT NULL
+            entry_delay_sec IS NOT NULL
             AND entry_delay_sec >= 0
             AND entry_delay_sec <= 21600
           THEN 1
@@ -745,7 +767,6 @@ function getDiscoveryCache(
       tokenInfo,
       traders,
     };
-
   } catch {
     return null;
   }
@@ -807,7 +828,9 @@ function saveObservation(
     x.profitChange,
     x.realized,
     x.totalProfit,
-    x.entryDelaySec
+    x.entryDelaySec,
+    x.buyCount,
+    x.sellCount
   );
 }
 
@@ -1139,17 +1162,16 @@ function rawCli(args) {
                 stdout
               )
             );
-
           } catch {
             reject(
               new Error(
                 "Unparseable gmgn-cli output: " +
-                String(
-                  stdout
-                ).slice(
-                  0,
-                  400
-                )
+                  String(
+                    stdout
+                  ).slice(
+                    0,
+                    400
+                  )
               )
             );
           }
@@ -1215,7 +1237,6 @@ function cli(args) {
           return await rawCli(
             args
           );
-
         } finally {
           lastCliFinishedAt =
             Date.now();
@@ -1308,10 +1329,6 @@ async function getTopTraders(
     : [];
 }
 
-// IMPORTANT:
-// Wallet stats are now ONE wallet per GMGN request.
-// No broken batch request.
-// No individual fallback storm.
 function unwrapSingleStats(
   response,
   wallet
@@ -1398,6 +1415,7 @@ function unwrapSingleStats(
   return null;
 }
 
+// Wallet stats are intentionally ONE wallet per request.
 async function getStatsOne(
   wallet,
   period
@@ -1536,6 +1554,9 @@ async function getActivityOne(
   };
 }
 
+// IMPORTANT:
+// Top traders is now the FIRST GMGN request.
+// Token info only happens after the essential trader request succeeds.
 async function getDiscovery(
   address,
   progress
@@ -1554,15 +1575,6 @@ async function getDiscovery(
   }
 
   await progress?.(
-    `🔎 ${short(address)} — checking token info...`
-  );
-
-  const tokenInfo =
-    await getTokenInfo(
-      address
-    );
-
-  await progress?.(
     `🔎 ${short(address)} — finding top traders...`
   );
 
@@ -1570,6 +1582,44 @@ async function getDiscovery(
     await getTopTraders(
       address
     );
+
+  if (
+    !traders.length
+  ) {
+    return {
+      tokenInfo: {},
+      traders: [],
+    };
+  }
+
+  await progress?.(
+    `🔎 ${short(address)} — checking token info...`
+  );
+
+  let tokenInfo = {};
+
+  try {
+    tokenInfo =
+      await getTokenInfo(
+        address
+      );
+  } catch (error) {
+    if (
+      isRateLimitError(
+        error
+      )
+    ) {
+      throw error;
+    }
+
+    console.warn(
+      `Token info failed for ${address}; continuing without it:`,
+
+      error instanceof Error
+        ? error.message
+        : String(error)
+    );
+  }
 
   putDiscoveryCache(
     address,
@@ -1697,7 +1747,8 @@ function hasStats(s) {
     (
       s.tokenNum > 0 ||
       s.trades > 0 ||
-      s.realizedProfit !== 0
+      s.realizedProfit !==
+        0
     )
   );
 }
@@ -1708,6 +1759,7 @@ function severeLossRate(s) {
       ? clamp(
           s.dist.lt50 /
             s.tokenNum,
+
           0,
           1
         )
@@ -1777,7 +1829,9 @@ function trackScore(s) {
   const positive =
     clamp(
       (
-        positiveBucketRate(s) -
+        positiveBucketRate(
+          s
+        ) -
         0.35
       ) /
         0.55,
@@ -1800,11 +1854,15 @@ function trackScore(s) {
 
   const lossDiscipline =
     1 -
-    severeLossRate(s);
+    severeLossRate(
+      s
+    );
 
   const bigWins =
     clamp(
-      bigWinnerRate(s) /
+      bigWinnerRate(
+        s
+      ) /
         0.18,
 
       0,
@@ -2023,9 +2081,7 @@ function entryDelay(
   );
 }
 
-function normalizeFraction(
-  value
-) {
+function normalizeFraction(value) {
   const n =
     num(value);
 
@@ -2062,6 +2118,7 @@ function tokenPerformance(
   const totalProfit =
     num(
       trader?.profit,
+
       realized +
         unrealized
     );
@@ -2154,7 +2211,8 @@ function tokenPerformance(
       1
     );
 
-  let timingQ = 0.45;
+  let timingQ =
+    0.45;
 
   if (
     entryDelaySec !==
@@ -2333,18 +2391,26 @@ function analyseActivity(rows) {
     const firstBuy =
       events.find(
         (x) =>
-          activityType(x) ===
+          activityType(
+            x
+          ) ===
             "buy" &&
-          activityPrice(x) > 0
+          activityPrice(
+            x
+          ) >
+            0
       );
 
-    if (!firstBuy) {
+    if (
+      !firstBuy
+    ) {
       continue;
     }
 
     const buyTs =
       num(
-        firstBuy.timestamp
+        firstBuy
+          .timestamp
       );
 
     const buyPrice =
@@ -2355,12 +2421,20 @@ function analyseActivity(rows) {
     const sells =
       events.filter(
         (x) =>
-          activityType(x) ===
+          activityType(
+            x
+          ) ===
             "sell" &&
+
           num(
             x.timestamp
-          ) >= buyTs &&
-          activityPrice(x) > 0
+          ) >=
+            buyTs &&
+
+          activityPrice(
+            x
+          ) >
+            0
       );
 
     if (
@@ -2389,12 +2463,8 @@ function analyseActivity(rows) {
       continue;
     }
 
-    // This is deliberately relative price behaviour,
-    // not a fixed market-cap threshold.
-    //
-    // If the first observed buy was much cheaper
-    // than later sells, that is evidence the wallet
-    // got in before meaningful upside.
+    // Evidence the wallet bought before
+    // meaningful later upside.
     captures.push(
       bestSellPrice /
       buyPrice
@@ -2609,7 +2679,9 @@ function traderExclusion(
     );
 
   if (badTag) {
-    return `tag:${badTag}`;
+    return (
+      `tag:${badTag}`
+    );
   }
 
   const tx =
@@ -2644,7 +2716,9 @@ function traderExclusion(
         .buy_volume_cur
     ) <= 0
   ) {
-    return "transfer-only";
+    return (
+      "transfer-only"
+    );
   }
 
   return null;
@@ -2657,7 +2731,9 @@ function statsExclusion(
   if (
     !hasStats(s)
   ) {
-    return "no stats";
+    return (
+      "no stats"
+    );
   }
 
   const badTag =
@@ -2671,7 +2747,9 @@ function statsExclusion(
     );
 
   if (badTag) {
-    return `tag:${badTag}`;
+    return (
+      `tag:${badTag}`
+    );
   }
 
   const perDay =
@@ -2808,14 +2886,14 @@ function chooseCandidates(
     const trader
     of traders
   ) {
+    const wallet =
+      trader?.address;
+
     const reason =
       traderExclusion(
         trader,
         creator
       );
-
-    const wallet =
-      trader?.address;
 
     if (reason) {
       if (
@@ -2864,14 +2942,15 @@ function chooseCandidates(
         tokenAddress
       );
 
-    // Submitted-token performance matters.
-    // We don't waste a 30d request researching
-    // an actual loser on the discovery token.
+    // Submitted-token performance counts.
+    // Don't spend a 30d request on a wallet
+    // that lost on the discovery token.
     if (
       candidate
         .token
         .totalProfit <=
         0 &&
+
       candidate
         .token
         .profitChange <=
@@ -2934,18 +3013,22 @@ function passes30d(row) {
   }
 
   if (
-    severeLossRate(s) >
+    severeLossRate(
+      s
+    ) >
     0.34
   ) {
     return false;
   }
 
-  // Low win rate can still survive if the
-  // wallet regularly catches large winners.
+  // A lower win rate can still pass
+  // if the wallet repeatedly catches big winners.
   if (
     s.winrate <
       0.28 &&
-    bigWinnerRate(s) <
+    bigWinnerRate(
+      s
+    ) <
       0.10
   ) {
     return false;
@@ -2967,8 +3050,6 @@ function passes7d(row) {
   if (
     s.tokenNum < 3
   ) {
-    // Very small recent sample:
-    // only survive with exceptional 30d history.
     return (
       row.track30 >=
       70
@@ -2992,7 +3073,9 @@ function passes7d(row) {
   }
 
   if (
-    severeLossRate(s) >
+    severeLossRate(
+      s
+    ) >
     0.40
   ) {
     return false;
@@ -3002,14 +3085,13 @@ function passes7d(row) {
 }
 
 function preActivityScore(row) {
-  const history =
-    row.history;
-
   const historyBonus =
-    history.observations >= 2
+    row.history
+      .observations >=
+      2
       ? clamp(
           (
-            history
+            row.history
               .avgTokenScore -
             55
           ) /
@@ -3053,14 +3135,13 @@ function preActivityScore(row) {
 }
 
 function finalScore(row) {
-  const history =
-    row.history;
-
   const historyBonus =
-    history.observations >= 2
+    row.history
+      .observations >=
+      2
       ? clamp(
           (
-            history
+            row.history
               .avgTokenScore -
             55
           ) /
@@ -3106,14 +3187,12 @@ function finalScore(row) {
   );
 }
 
-// The wallet must show some actual evidence
-// of getting in before meaningful upside.
 function hasEarlyEvidence(row) {
-  // Recent activity across multiple tokens.
   if (
     row.activity
       .pairedTokens >=
       3 &&
+
     row.activity
       .upside15Rate >=
       0.35
@@ -3121,11 +3200,11 @@ function hasEarlyEvidence(row) {
     return true;
   }
 
-  // Our own growing cross-CA history.
   if (
     row.history
       .earlyResults >=
       2 &&
+
     row.history
       .goodResults >=
       2
@@ -3133,8 +3212,6 @@ function hasEarlyEvidence(row) {
     return true;
   }
 
-  // Smaller activity sample, but also got
-  // into this submitted token early.
   if (
     row.activity
       .pairedTokens >=
@@ -3180,8 +3257,6 @@ function qualifiesFinal(row) {
     return false;
   }
 
-  // 8-14 tokens can qualify,
-  // but only with unusually strong evidence.
   if (
     row.s30.tokenNum <
       PREFERRED_30D_TOKENS &&
@@ -3192,7 +3267,9 @@ function qualifiesFinal(row) {
   }
 
   if (
-    !passes7d(row)
+    !passes7d(
+      row
+    )
   ) {
     return false;
   }
@@ -3201,6 +3278,7 @@ function qualifiesFinal(row) {
     row.activity
       .pairedTokens >=
       2 &&
+
     row.activity
       .fastFlipRate >
       0.45
@@ -3212,7 +3290,9 @@ function qualifiesFinal(row) {
     row.activity
       .pairedTokens >=
       3 &&
-    row.activity.score <
+
+    row.activity
+      .score <
       48
   ) {
     return false;
@@ -3278,7 +3358,8 @@ function labelsFor(row) {
     );
 
   if (
-    s.avgHoldSec > 0 &&
+    s.avgHoldSec >
+      0 &&
     s.avgHoldSec <
       FAST_AVG_HOLD_SEC
   ) {
@@ -3290,6 +3371,7 @@ function labelsFor(row) {
   if (
     perDay >
       HIGH_ACTIVITY_TRADES_PER_DAY ||
+
     perToken >
       HIGH_ACTIVITY_TRADES_PER_TOKEN
   ) {
@@ -3301,6 +3383,7 @@ function labelsFor(row) {
   if (
     row.track30 >=
       65 &&
+
     severeLossRate(
       row.s30
     ) <=
@@ -3383,8 +3466,7 @@ async function scan(
     };
   }
 
-  // Store submitted-token observations.
-  // This costs zero extra API requests.
+  // Free local observations from the submitted CA.
   for (
     const candidate
     of candidates
@@ -3408,7 +3490,8 @@ async function scan(
     `📊 ${short(address)} — 30d consistency checks: 0/${candidates.length}...`
   );
 
-  const thirtyDaySurvivors = [];
+  const thirtyDaySurvivors =
+    [];
 
   let done30 = 0;
 
@@ -3455,7 +3538,6 @@ async function scan(
             14
           );
         }
-
       } else {
         const row = {
           ...candidate,
@@ -3495,7 +3577,6 @@ async function scan(
       await progress?.(
         `📊 ${short(address)} — 30d consistency ${done30}/${candidates.length} • ${thirtyDaySurvivors.length} survived${cached ? " • cache" : ""}`
       );
-
     } catch (error) {
       if (
         isRateLimitError(
@@ -3509,8 +3590,10 @@ async function scan(
 
       console.warn(
         `30d failed for ${wallet}:`,
-        error.message ||
-          error
+
+        error instanceof Error
+          ? error.message
+          : String(error)
       );
 
       await progress?.(
@@ -3532,16 +3615,15 @@ async function scan(
     };
   }
 
-  // Consistency comes first.
   thirtyDaySurvivors.sort(
     (a, b) =>
       b.track30 -
         a.track30 ||
+
       b.token.score -
         a.token.score
   );
 
-  // Only the strongest 30d wallets cost us a 7d request.
   const recentCandidates =
     thirtyDaySurvivors.slice(
       0,
@@ -3556,7 +3638,8 @@ async function scan(
     `📈 ${short(address)} — recent-form checks: 0/${recentCandidates.length}...`
   );
 
-  const recentSurvivors = [];
+  const recentSurvivors =
+    [];
 
   let done7 = 0;
 
@@ -3613,7 +3696,6 @@ async function scan(
       await progress?.(
         `📈 ${short(address)} — 7d form ${done7}/${recentCandidates.length} • ${recentSurvivors.length} survived${cached ? " • cache" : ""}`
       );
-
     } catch (error) {
       if (
         isRateLimitError(
@@ -3627,8 +3709,10 @@ async function scan(
 
       console.warn(
         `7d failed for ${row.wallet}:`,
-        error.message ||
-          error
+
+        error instanceof Error
+          ? error.message
+          : String(error)
       );
 
       await progress?.(
@@ -3656,7 +3740,6 @@ async function scan(
       a.preScore
   );
 
-  // Only these wallets get an activity request.
   const deepCandidates =
     recentSurvivors.slice(
       0,
@@ -3664,7 +3747,7 @@ async function scan(
     );
 
   // ==========================================================
-  // STAGE 3 — EARLY-ENTRY / ACTIVITY
+  // STAGE 3 — ACTIVITY / EARLY ENTRY
   // ==========================================================
 
   await progress?.(
@@ -3718,7 +3801,6 @@ async function scan(
       await progress?.(
         `🧭 ${short(address)} — early-entry ${doneActivity}/${deepCandidates.length} • ${finalists.length} qualified${cached ? " • cache" : ""}`
       );
-
     } catch (error) {
       if (
         isRateLimitError(
@@ -3732,8 +3814,10 @@ async function scan(
 
       console.warn(
         `Activity failed for ${row.wallet}:`,
-        error.message ||
-          error
+
+        error instanceof Error
+          ? error.message
+          : String(error)
       );
 
       await progress?.(
@@ -3791,7 +3875,8 @@ function fmtUsd(value) {
     return (
       `${sign}$` +
       `${(
-        a / 1e6
+        a /
+        1e6
       ).toFixed(1)}M`
     );
   }
@@ -3802,7 +3887,8 @@ function fmtUsd(value) {
     return (
       `${sign}$` +
       `${(
-        a / 1e3
+        a /
+        1e3
       ).toFixed(1)}K`
     );
   }
@@ -3863,7 +3949,8 @@ function fmtHold(seconds) {
   ) {
     return (
       `${Math.round(
-        n / 60
+        n /
+        60
       )}m`
     );
   }
@@ -3873,14 +3960,16 @@ function fmtHold(seconds) {
   ) {
     return (
       `${(
-        n / 3600
+        n /
+        3600
       ).toFixed(1)}h`
     );
   }
 
   return (
     `${(
-      n / 86400
+      n /
+      86400
     ).toFixed(1)}d`
   );
 }
@@ -3896,7 +3985,8 @@ function positionStatus(
   }
 
   if (
-    token.soldPct > 0
+    token.soldPct >
+    0
   ) {
     return (
       `holding ${
@@ -3912,7 +4002,8 @@ function positionStatus(
   }
 
   return (
-    token.buyCount > 0
+    token.buyCount >
+      0
       ? "holding"
       : "position unclear"
   );
@@ -3935,9 +4026,6 @@ function walletField(
         !/^[♻️🆕⚡⚠️]/u
           .test(x)
     );
-
-  const activity =
-    row.activity;
 
   const thisToken = [
     `${fmtUsd(
@@ -3974,21 +4062,24 @@ function walletField(
   }
 
   const earlyLine =
-    activity.pairedTokens
+    row.activity
+      .pairedTokens
       ? (
           `${fmtPct(
-            activity
+            row.activity
               .upside15Rate
           )} caught 1.5x+ upside` +
 
-          ` | ${activity.pairedTokens} sampled tokens` +
+          ` | ${
+            row.activity
+              .pairedTokens
+          } sampled tokens` +
 
           ` | median hold ${fmtHold(
-            activity
+            row.activity
               .medianHoldSec
           )}`
         )
-
       : "limited recent buy/sell pairs";
 
   return {
@@ -4027,7 +4118,9 @@ function walletField(
               .realizedProfit
           )})` +
 
-          ` | ${row.s30.tokenNum} tokens` +
+          ` | ${
+            row.s30.tokenNum
+          } tokens` +
 
           ` | avg hold ${fmtHold(
             row.s30
@@ -4048,7 +4141,9 @@ function walletField(
               .realizedProfit
           )})` +
 
-          ` | ${row.s7.tokenNum} tokens`
+          ` | ${
+            row.s7.tokenNum
+          } tokens`
         ),
 
         `**Early behavior:** ${earlyLine}`,
@@ -4140,6 +4235,7 @@ function buildEmbeds(
                 `${Math.floor(i / 5) + 1}/` +
                 `${Math.ceil(result.wallets.length / 5)}`
               )
+
             : "🎯 Top wallets to track"
         )
 
@@ -4192,8 +4288,7 @@ async function sendResult(
     );
 
   await status.edit({
-    content:
-      "",
+    content: "",
 
     embeds: [
       embeds[0],
@@ -4214,7 +4309,7 @@ async function sendResult(
   }
 
   // SEEN only counts wallets that were
-  // actually shown in Discord.
+  // actually shown to you in Discord.
   for (
     const row
     of result.wallets
@@ -4228,7 +4323,7 @@ async function sendResult(
 }
 
 // ============================================================
-// DISCORD
+// DISCORD / SCAN QUEUE
 // ============================================================
 
 const client =
@@ -4281,6 +4376,7 @@ function putResultCache(
 ) {
   resultCache.set(
     address,
+
     {
       at:
         Date.now(),
@@ -4304,7 +4400,9 @@ function putResultCache(
 
 function enqueueScan(fn) {
   const job =
-    scanQueue.then(fn);
+    scanQueue.then(
+      fn
+    );
 
   scanQueue =
     job.catch(
@@ -4329,7 +4427,8 @@ function makeProgress(
       return;
     }
 
-    last = text;
+    last =
+      text;
 
     await status
       .edit({
@@ -4407,7 +4506,9 @@ client.on(
         message.content
       );
 
-    if (!address) {
+    if (
+      !address
+    ) {
       return;
     }
 
@@ -4494,7 +4595,6 @@ client.on(
             address,
             result
           );
-
         } catch (error) {
           console.error(
             error
@@ -4567,7 +4667,6 @@ client.on(
             .catch(
               () => {}
             );
-
         } finally {
           queuedAddresses.delete(
             address
@@ -4589,7 +4688,9 @@ function requireEnv(name) {
       ""
     ).trim();
 
-  if (!value) {
+  if (
+    !value
+  ) {
     throw new Error(
       `Missing required environment variable: ${name}`
     );
@@ -4612,8 +4713,8 @@ function requireEnv(name) {
       "DISCORD_CHANNEL_ID"
     );
 
-    // Don't let gmgn-cli retry a 429
-    // behind our own rate limiter.
+    // Do not allow gmgn-cli to automatically
+    // make another request after a 429.
     if (
       process.env
         .GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS ===
@@ -4636,7 +4737,6 @@ function requireEnv(name) {
       .catch(
         () => {}
       );
-
   } catch (error) {
     console.error(
       `Startup failed: ${
