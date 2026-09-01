@@ -681,10 +681,9 @@ function getWalletCache(
     return null;
   }
 
-  try {
-    return JSON.parse(
-      row.data_json
-    );
+  return JSON.parse(
+  row.stats_json
+);
 
   } catch {
     return null;
