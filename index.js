@@ -4,349 +4,176 @@ const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
 const Database = require("better-sqlite3");
-const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+} = require("discord.js");
 
-// ========================= CONFIG =========================
+// ============================================================
+// CONFIG
+// ============================================================
 
-const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
+const SOL_ADDR =
+  /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-const DISCORD_CHANNEL_ID = String(
-  process.env.DISCORD_CHANNEL_ID || ""
-).trim();
+const SOL_ADDR_IN_TEXT =
+  /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
 
-const DB_PATH = String(
-  process.env.DB_PATH ||
-    path.join(process.cwd(), "data", "wallets.db")
-).trim();
+const DISCORD_CHANNEL_ID =
+  String(
+    process.env.DISCORD_CHANNEL_ID || ""
+  ).trim();
+
+const DB_PATH =
+  String(
+    process.env.DB_PATH ||
+      path.join(
+        process.cwd(),
+        "data",
+        "wallets.db"
+      )
+  ).trim();
 
 const TOP_TRADERS_LIMIT = 100;
 
-const MAX_CANDIDATES = Math.max(
-  10,
-  Math.min(
+const MAX_CANDIDATES =
+  clampInt(
+    process.env.MAX_CANDIDATES,
+    20,
+    5,
+    30
+  );
+
+const MAX_7D_CHECKS =
+  clampInt(
+    process.env.MAX_7D_CHECKS,
+    6,
+    1,
+    10
+  );
+
+const MAX_ACTIVITY_CHECKS =
+  clampInt(
+    process.env.MAX_ACTIVITY_CHECKS,
+    4,
+    1,
+    6
+  );
+
+const ACTIVITY_SAMPLE =
+  clampInt(
+    process.env.ACTIVITY_SAMPLE,
     50,
-    Number(process.env.MAX_CANDIDATES || 30)
-  )
-);
+    20,
+    100
+  );
 
-const STATS_BATCH_SIZE = 10;
-
-const CACHE_7D_MS = 3 * 60 * 60 * 1000;
-const CACHE_30D_MS = 12 * 60 * 60 * 1000;
-const DISCOVERY_CACHE_MS = 15 * 60 * 1000;
-const RESULT_CACHE_MS = 15 * 60 * 1000;
-
-// Slow on purpose.
-// 8 completely uncached GMGN calls = roughly 70-100 sec.
-const MIN_GMGN_GAP_MS = Math.max(
-  5000,
-  Number(
-    process.env.GMGN_MIN_REQUEST_GAP_MS || 10000
-  )
-);
-
-// Secondary protection.
-// The fixed 10-second gap above is the main limiter.
-const RATE_UNITS_PER_SEC = Math.max(
-  0.25,
-  Number(
-    process.env.GMGN_RATE_UNITS_PER_SEC || 1
-  )
-);
-
-const RATE_CAPACITY = Math.max(
-  5,
-  Number(
-    process.env.GMGN_RATE_CAPACITY || 5
-  )
-);
+// Main GMGN protection.
+// Every REAL GMGN request is separated by this gap.
+const MIN_GMGN_GAP_MS =
+  clampInt(
+    process.env.GMGN_MIN_REQUEST_GAP_MS,
+    8000,
+    3000,
+    30000
+  );
 
 const RATE_LIMIT_GRACE_MS = 5000;
 
-const MIN_30D_TOKENS = 5;
-const LOW_SAMPLE_30D_TOKENS = 15;
-const MIN_30D_TRACK_SCORE = 38;
-const MIN_OVERALL_SCORE = 48;
+// Cache windows.
+const CACHE_30D_MS =
+  12 * 60 * 60 * 1000;
 
+const CACHE_7D_MS =
+  3 * 60 * 60 * 1000;
+
+const CACHE_ACTIVITY_MS =
+  3 * 60 * 60 * 1000;
+
+const CACHE_DISCOVERY_MS =
+  10 * 60 * 1000;
+
+const CACHE_RESULT_MS =
+  10 * 60 * 1000;
+
+// Quality thresholds.
+const MIN_30D_TOKENS = 8;
+const PREFERRED_30D_TOKENS = 15;
+
+const MIN_30D_TRACK_SCORE = 54;
+const MIN_7D_TRACK_SCORE = 46;
+const MIN_FINAL_SCORE = 64;
+
+// Bot/high-frequency protection.
 const HARD_MAX_TRADES_PER_DAY = 250;
 const HARD_MAX_TRADES_PER_TOKEN = 40;
 
 const HIGH_ACTIVITY_TRADES_PER_DAY = 80;
 const HIGH_ACTIVITY_TRADES_PER_TOKEN = 15;
 
-const FAST_AVG_HOLD_SEC = 15 * 60;
+const FAST_AVG_HOLD_SEC =
+  15 * 60;
+
 const HARD_MAX_THIS_TOKEN_TX = 80;
 
-const EXCLUDE_TAGS = new Set([
-  "rat_trader",
-  "bundler",
-  "dex_bot",
-  "dev",
-]);
+// These are not useful wallets to track manually.
+const HARD_TAGS =
+  new Set([
+    "rat_trader",
+    "bundler",
+    "dex_bot",
+    "dev",
+    "arbitrager",
+    "mev_bot",
+  ]);
+
+// ============================================================
+// BASIC HELPERS
+// ============================================================
+
+function clampInt(
+  value,
+  fallback,
+  min,
+  max
+) {
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+
+  return Math.max(
+    min,
+    Math.min(
+      max,
+      Math.floor(n)
+    )
+  );
+}
 
 const sleep = (ms) =>
-  new Promise((resolve) =>
-    setTimeout(resolve, ms)
+  new Promise(
+    (resolve) =>
+      setTimeout(
+        resolve,
+        ms
+      )
   );
 
-// ========================= DATABASE =========================
-
-fs.mkdirSync(
-  path.dirname(DB_PATH),
-  { recursive: true }
-);
-
-const db =
-  new Database(DB_PATH);
-
-db.pragma("journal_mode = WAL");
-db.pragma("synchronous = NORMAL");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS wallet_cache (
-    wallet_address TEXT NOT NULL,
-    period TEXT NOT NULL,
-    stats_json TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (wallet_address, period)
+const clamp = (
+  value,
+  min,
+  max
+) =>
+  Math.max(
+    min,
+    Math.min(
+      max,
+      value
+    )
   );
-
-  CREATE TABLE IF NOT EXISTS token_cache (
-    token_address TEXT PRIMARY KEY,
-    token_info_json TEXT NOT NULL,
-    traders_json TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS wallet_observations (
-    wallet_address TEXT NOT NULL,
-    token_address TEXT NOT NULL,
-    observed_at INTEGER NOT NULL,
-    token_score REAL,
-    profit_change REAL,
-    realized_profit REAL,
-    total_profit REAL,
-    entry_delay_sec REAL,
-    buy_count INTEGER,
-    sell_count INTEGER,
-    PRIMARY KEY (wallet_address, token_address)
-  );
-
-  CREATE TABLE IF NOT EXISTS sent_results (
-    wallet_address TEXT NOT NULL,
-    token_address TEXT NOT NULL,
-    sent_at INTEGER NOT NULL,
-    overall_score REAL,
-    PRIMARY KEY (wallet_address, token_address)
-  );
-
-  CREATE TABLE IF NOT EXISTS blacklist (
-    wallet_address TEXT PRIMARY KEY,
-    reason TEXT NOT NULL,
-    expires_at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_sent_wallet
-    ON sent_results(wallet_address);
-
-  CREATE INDEX IF NOT EXISTS idx_obs_wallet
-    ON wallet_observations(wallet_address);
-`);
-
-const qCache =
-  db.prepare(`
-    SELECT stats_json, updated_at
-    FROM wallet_cache
-    WHERE wallet_address = ?
-      AND period = ?
-  `);
-
-const qPutCache =
-  db.prepare(`
-    INSERT INTO wallet_cache(
-      wallet_address,
-      period,
-      stats_json,
-      updated_at
-    )
-    VALUES (?, ?, ?, ?)
-
-    ON CONFLICT(wallet_address, period)
-    DO UPDATE SET
-      stats_json = excluded.stats_json,
-      updated_at = excluded.updated_at
-  `);
-
-const qTokenCache =
-  db.prepare(`
-    SELECT
-      token_info_json,
-      traders_json,
-      updated_at
-    FROM token_cache
-    WHERE token_address = ?
-  `);
-
-const qPutTokenCache =
-  db.prepare(`
-    INSERT INTO token_cache(
-      token_address,
-      token_info_json,
-      traders_json,
-      updated_at
-    )
-    VALUES (?, ?, ?, ?)
-
-    ON CONFLICT(token_address)
-    DO UPDATE SET
-      token_info_json = excluded.token_info_json,
-      traders_json = excluded.traders_json,
-      updated_at = excluded.updated_at
-  `);
-
-const qBlacklist =
-  db.prepare(`
-    SELECT reason, expires_at
-    FROM blacklist
-    WHERE wallet_address = ?
-  `);
-
-const qPutBlacklist =
-  db.prepare(`
-    INSERT INTO blacklist(
-      wallet_address,
-      reason,
-      expires_at
-    )
-    VALUES (?, ?, ?)
-
-    ON CONFLICT(wallet_address)
-    DO UPDATE SET
-      reason = excluded.reason,
-      expires_at = excluded.expires_at
-  `);
-
-const qDeleteBlacklist =
-  db.prepare(`
-    DELETE FROM blacklist
-    WHERE wallet_address = ?
-  `);
-
-const qPreviousSent =
-  db.prepare(`
-    SELECT COUNT(*) count
-    FROM sent_results
-    WHERE wallet_address = ?
-      AND token_address <> ?
-  `);
-
-const qPutSent =
-  db.prepare(`
-    INSERT INTO sent_results(
-      wallet_address,
-      token_address,
-      sent_at,
-      overall_score
-    )
-    VALUES (?, ?, ?, ?)
-
-    ON CONFLICT(
-      wallet_address,
-      token_address
-    )
-    DO UPDATE SET
-      sent_at = excluded.sent_at,
-      overall_score = excluded.overall_score
-  `);
-
-const qObservation =
-  db.prepare(`
-    INSERT INTO wallet_observations(
-      wallet_address,
-      token_address,
-      observed_at,
-      token_score,
-      profit_change,
-      realized_profit,
-      total_profit,
-      entry_delay_sec,
-      buy_count,
-      sell_count
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-
-    ON CONFLICT(
-      wallet_address,
-      token_address
-    )
-    DO UPDATE SET
-      observed_at = excluded.observed_at,
-      token_score = excluded.token_score,
-      profit_change = excluded.profit_change,
-      realized_profit = excluded.realized_profit,
-      total_profit = excluded.total_profit,
-      entry_delay_sec = excluded.entry_delay_sec,
-      buy_count = excluded.buy_count,
-      sell_count = excluded.sell_count
-  `);
-
-const qObservationSummary =
-  db.prepare(`
-    SELECT
-      COUNT(*) observations,
-
-      AVG(token_score)
-        avg_token_score,
-
-      SUM(
-        CASE
-          WHEN profit_change > 0.15
-            OR realized_profit > 500
-          THEN 1
-          ELSE 0
-        END
-      ) good_results,
-
-      SUM(
-        CASE
-          WHEN entry_delay_sec IS NOT NULL
-            AND entry_delay_sec >= 0
-            AND entry_delay_sec <= 21600
-          THEN 1
-          ELSE 0
-        END
-      ) early_results
-
-    FROM wallet_observations
-
-    WHERE wallet_address = ?
-      AND token_address <> ?
-  `);
-
-const qMeta =
-  db.prepare(`
-    SELECT value
-    FROM meta
-    WHERE key = ?
-  `);
-
-const qPutMeta =
-  db.prepare(`
-    INSERT INTO meta(key, value)
-    VALUES (?, ?)
-
-    ON CONFLICT(key)
-    DO UPDATE SET
-      value = excluded.value
-  `);
-
-// ========================= HELPERS =========================
 
 function num(
   value,
@@ -368,16 +195,6 @@ function num(
     : fallback;
 }
 
-const clamp = (
-  value,
-  min,
-  max
-) =>
-  Math.max(
-    min,
-    Math.min(max, value)
-  );
-
 function boolish(value) {
   if (
     typeof value === "boolean"
@@ -391,101 +208,41 @@ function boolish(value) {
     return value !== 0;
   }
 
-  return (
-    typeof value === "string" &&
-    [
-      "1",
-      "true",
-      "yes",
-    ].includes(
-      value
-        .trim()
-        .toLowerCase()
-    )
+  if (
+    typeof value !== "string"
+  ) {
+    return false;
+  }
+
+  return [
+    "1",
+    "true",
+    "yes",
+  ].includes(
+    value
+      .trim()
+      .toLowerCase()
   );
 }
 
-const short = (address) =>
-  `${address.slice(0, 4)}…${address.slice(-4)}`;
-
-function chunk(
-  items,
-  size
-) {
-  const out = [];
-
-  for (
-    let i = 0;
-    i < items.length;
-    i += size
-  ) {
-    out.push(
-      items.slice(
-        i,
-        i + size
-      )
-    );
-  }
-
-  return out;
-}
-
-function tagsOf(object) {
-  return [
-    ...(
-      Array.isArray(
-        object?.tags
-      )
-        ? object.tags
-        : []
-    ),
-
-    ...(
-      Array.isArray(
-        object?.maker_token_tags
-      )
-        ? object.maker_token_tags
-        : []
-    ),
-  ]
-    .filter(Boolean)
-    .map(
-      (x) =>
-        String(x)
-          .toLowerCase()
-    );
-}
-
-function statsTags(common) {
-  return [
-    common?.tag,
-
-    ...(
-      Array.isArray(
-        common?.tags
-      )
-        ? common.tags
-        : []
-    ),
-  ]
-    .filter(Boolean)
-    .map(
-      (x) =>
-        String(x)
-          .toLowerCase()
-    );
+function short(address) {
+  return (
+    `${address.slice(0, 4)}` +
+    `…` +
+    `${address.slice(-4)}`
+  );
 }
 
 function findSolAddress(text) {
-  const matches =
-    String(
-      text || ""
-    ).match(
-      SOL_ADDR_IN_TEXT
-    ) || [];
-
   return (
-    matches.find(
+    (
+      String(
+        text || ""
+      ).match(
+        SOL_ADDR_IN_TEXT
+      ) ||
+      []
+    ).find(
       (x) =>
         SOL_ADDR.test(x)
     ) ||
@@ -493,103 +250,514 @@ function findSolAddress(text) {
   );
 }
 
-function safeJsonParse(text) {
+function tagsOf(obj) {
+  return [
+    ...(
+      Array.isArray(
+        obj?.tags
+      )
+        ? obj.tags
+        : []
+    ),
+
+    ...(
+      Array.isArray(
+        obj
+          ?.maker_token_tags
+      )
+        ? obj.maker_token_tags
+        : []
+    ),
+
+    ...(
+      Array.isArray(
+        obj?.common?.tags
+      )
+        ? obj.common.tags
+        : []
+    ),
+
+    obj?.common?.tag,
+  ]
+    .filter(Boolean)
+    .map(
+      (x) =>
+        String(x)
+          .toLowerCase()
+    );
+}
+
+function median(values) {
+  if (!values.length) {
+    return null;
+  }
+
+  const a =
+    [...values].sort(
+      (x, y) =>
+        x - y
+    );
+
+  const i =
+    Math.floor(
+      a.length / 2
+    );
+
+  return (
+    a.length % 2
+      ? a[i]
+      : (
+          a[i - 1] +
+          a[i]
+        ) / 2
+  );
+}
+
+// ============================================================
+// SQLITE DATABASE
+// ============================================================
+
+fs.mkdirSync(
+  path.dirname(DB_PATH),
+  {
+    recursive: true,
+  }
+);
+
+const db =
+  new Database(DB_PATH);
+
+db.pragma(
+  "journal_mode = WAL"
+);
+
+db.pragma(
+  "synchronous = NORMAL"
+);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS wallet_cache (
+    wallet_address TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (
+      wallet_address,
+      kind
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS token_cache (
+    token_address TEXT PRIMARY KEY,
+    token_info_json TEXT NOT NULL,
+    traders_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS wallet_observations (
+    wallet_address TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
+    token_score REAL,
+    profit_change REAL,
+    realized_profit REAL,
+    total_profit REAL,
+    entry_delay_sec REAL,
+    PRIMARY KEY (
+      wallet_address,
+      token_address
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS sent_results (
+    wallet_address TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    sent_at INTEGER NOT NULL,
+    overall_score REAL,
+    PRIMARY KEY (
+      wallet_address,
+      token_address
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS blacklist (
+    wallet_address TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_sent_wallet
+    ON sent_results(wallet_address);
+
+  CREATE INDEX IF NOT EXISTS idx_obs_wallet
+    ON wallet_observations(wallet_address);
+`);
+
+const stmtGetCache =
+  db.prepare(`
+    SELECT
+      data_json,
+      updated_at
+
+    FROM wallet_cache
+
+    WHERE wallet_address = ?
+      AND kind = ?
+  `);
+
+const stmtPutCache =
+  db.prepare(`
+    INSERT INTO wallet_cache(
+      wallet_address,
+      kind,
+      data_json,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?)
+
+    ON CONFLICT(
+      wallet_address,
+      kind
+    )
+
+    DO UPDATE SET
+      data_json =
+        excluded.data_json,
+
+      updated_at =
+        excluded.updated_at
+  `);
+
+const stmtGetTokenCache =
+  db.prepare(`
+    SELECT
+      token_info_json,
+      traders_json,
+      updated_at
+
+    FROM token_cache
+
+    WHERE token_address = ?
+  `);
+
+const stmtPutTokenCache =
+  db.prepare(`
+    INSERT INTO token_cache(
+      token_address,
+      token_info_json,
+      traders_json,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?)
+
+    ON CONFLICT(token_address)
+
+    DO UPDATE SET
+      token_info_json =
+        excluded.token_info_json,
+
+      traders_json =
+        excluded.traders_json,
+
+      updated_at =
+        excluded.updated_at
+  `);
+
+const stmtPrevSent =
+  db.prepare(`
+    SELECT COUNT(*) AS count
+
+    FROM sent_results
+
+    WHERE wallet_address = ?
+      AND token_address <> ?
+  `);
+
+const stmtMarkSent =
+  db.prepare(`
+    INSERT INTO sent_results(
+      wallet_address,
+      token_address,
+      sent_at,
+      overall_score
+    )
+    VALUES (?, ?, ?, ?)
+
+    ON CONFLICT(
+      wallet_address,
+      token_address
+    )
+
+    DO UPDATE SET
+      sent_at =
+        excluded.sent_at,
+
+      overall_score =
+        excluded.overall_score
+  `);
+
+const stmtObservation =
+  db.prepare(`
+    INSERT INTO wallet_observations(
+      wallet_address,
+      token_address,
+      observed_at,
+      token_score,
+      profit_change,
+      realized_profit,
+      total_profit,
+      entry_delay_sec
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+
+    ON CONFLICT(
+      wallet_address,
+      token_address
+    )
+
+    DO UPDATE SET
+      observed_at =
+        excluded.observed_at,
+
+      token_score =
+        excluded.token_score,
+
+      profit_change =
+        excluded.profit_change,
+
+      realized_profit =
+        excluded.realized_profit,
+
+      total_profit =
+        excluded.total_profit,
+
+      entry_delay_sec =
+        excluded.entry_delay_sec
+  `);
+
+const stmtObservationSummary =
+  db.prepare(`
+    SELECT
+      COUNT(*) AS observations,
+
+      AVG(token_score)
+        AS avg_token_score,
+
+      SUM(
+        CASE
+          WHEN
+            profit_change > 0.15
+            OR realized_profit > 500
+          THEN 1
+          ELSE 0
+        END
+      ) AS good_results,
+
+      SUM(
+        CASE
+          WHEN
+            entry_delay_sec
+              IS NOT NULL
+            AND entry_delay_sec >= 0
+            AND entry_delay_sec <= 21600
+          THEN 1
+          ELSE 0
+        END
+      ) AS early_results
+
+    FROM wallet_observations
+
+    WHERE wallet_address = ?
+      AND token_address <> ?
+  `);
+
+const stmtGetBlacklist =
+  db.prepare(`
+    SELECT
+      reason,
+      expires_at
+
+    FROM blacklist
+
+    WHERE wallet_address = ?
+  `);
+
+const stmtPutBlacklist =
+  db.prepare(`
+    INSERT INTO blacklist(
+      wallet_address,
+      reason,
+      expires_at
+    )
+    VALUES (?, ?, ?)
+
+    ON CONFLICT(wallet_address)
+
+    DO UPDATE SET
+      reason =
+        excluded.reason,
+
+      expires_at =
+        excluded.expires_at
+  `);
+
+const stmtDeleteBlacklist =
+  db.prepare(`
+    DELETE FROM blacklist
+    WHERE wallet_address = ?
+  `);
+
+const stmtGetMeta =
+  db.prepare(`
+    SELECT value
+    FROM meta
+    WHERE key = ?
+  `);
+
+const stmtPutMeta =
+  db.prepare(`
+    INSERT INTO meta(
+      key,
+      value
+    )
+    VALUES (?, ?)
+
+    ON CONFLICT(key)
+
+    DO UPDATE SET
+      value =
+        excluded.value
+  `);
+
+// ============================================================
+// DATABASE HELPERS
+// ============================================================
+
+function cacheTtl(kind) {
+  if (
+    kind === "30d"
+  ) {
+    return CACHE_30D_MS;
+  }
+
+  if (
+    kind === "7d"
+  ) {
+    return CACHE_7D_MS;
+  }
+
+  if (
+    kind === "activity"
+  ) {
+    return CACHE_ACTIVITY_MS;
+  }
+
+  return 0;
+}
+
+function getWalletCache(
+  wallet,
+  kind
+) {
+  const row =
+    stmtGetCache.get(
+      wallet,
+      kind
+    );
+
+  if (
+    !row ||
+    Date.now() -
+      Number(
+        row.updated_at
+      ) >
+      cacheTtl(kind)
+  ) {
+    return null;
+  }
+
   try {
-    return JSON.parse(text);
+    return JSON.parse(
+      row.data_json
+    );
+
   } catch {
     return null;
   }
 }
 
-// ========================= DB HELPERS =========================
-
-function getCachedStats(
+function putWalletCache(
   wallet,
-  period
+  kind,
+  data
 ) {
-  const row =
-    qCache.get(
-      wallet,
-      period
-    );
-
-  if (!row) {
-    return null;
-  }
-
-  const ttl =
-    period === "7d"
-      ? CACHE_7D_MS
-      : CACHE_30D_MS;
-
-  if (
-    Date.now() -
-      Number(row.updated_at) >
-    ttl
-  ) {
-    return null;
-  }
-
-  return safeJsonParse(
-    row.stats_json
-  );
-}
-
-function putCachedStats(
-  wallet,
-  period,
-  stats
-) {
-  qPutCache.run(
+  stmtPutCache.run(
     wallet,
-    period,
-    JSON.stringify(stats),
+    kind,
+    JSON.stringify(data),
     Date.now()
   );
 }
 
-function getCachedDiscovery(token) {
+function getDiscoveryCache(
+  token
+) {
   const row =
-    qTokenCache.get(token);
+    stmtGetTokenCache.get(
+      token
+    );
 
   if (
     !row ||
     Date.now() -
-      Number(row.updated_at) >
-      DISCOVERY_CACHE_MS
+      Number(
+        row.updated_at
+      ) >
+      CACHE_DISCOVERY_MS
   ) {
     return null;
   }
 
-  const tokenInfo =
-    safeJsonParse(
-      row.token_info_json
-    );
+  try {
+    const tokenInfo =
+      JSON.parse(
+        row.token_info_json
+      );
 
-  const traders =
-    safeJsonParse(
-      row.traders_json
-    );
+    const traders =
+      JSON.parse(
+        row.traders_json
+      );
 
-  if (
-    !tokenInfo ||
-    !Array.isArray(traders)
-  ) {
+    if (
+      !Array.isArray(
+        traders
+      )
+    ) {
+      return null;
+    }
+
+    return {
+      tokenInfo,
+      traders,
+    };
+
+  } catch {
     return null;
   }
-
-  return {
-    tokenInfo,
-    traders,
-  };
 }
 
-function putCachedDiscovery(
+function putDiscoveryCache(
   token,
   tokenInfo,
   traders
 ) {
-  qPutTokenCache.run(
+  stmtPutTokenCache.run(
     token,
     JSON.stringify(
       tokenInfo || {}
@@ -601,9 +769,91 @@ function putCachedDiscovery(
   );
 }
 
+function previousSentCount(
+  wallet,
+  token
+) {
+  return Number(
+    stmtPrevSent.get(
+      wallet,
+      token
+    )?.count ||
+      0
+  );
+}
+
+function markSent(
+  wallet,
+  token,
+  score
+) {
+  stmtMarkSent.run(
+    wallet,
+    token,
+    Date.now(),
+    score
+  );
+}
+
+function saveObservation(
+  wallet,
+  token,
+  x
+) {
+  stmtObservation.run(
+    wallet,
+    token,
+    Date.now(),
+    x.score,
+    x.profitChange,
+    x.realized,
+    x.totalProfit,
+    x.entryDelaySec
+  );
+}
+
+function observationSummary(
+  wallet,
+  token
+) {
+  const r =
+    stmtObservationSummary.get(
+      wallet,
+      token
+    ) ||
+    {};
+
+  return {
+    observations:
+      Number(
+        r.observations ||
+          0
+      ),
+
+    avgTokenScore:
+      num(
+        r.avg_token_score
+      ),
+
+    goodResults:
+      Number(
+        r.good_results ||
+          0
+      ),
+
+    earlyResults:
+      Number(
+        r.early_results ||
+          0
+      ),
+  };
+}
+
 function getBlacklist(wallet) {
   const row =
-    qBlacklist.get(wallet);
+    stmtGetBlacklist.get(
+      wallet
+    );
 
   if (!row) {
     return null;
@@ -614,7 +864,7 @@ function getBlacklist(wallet) {
       row.expires_at
     ) <= Date.now()
   ) {
-    qDeleteBlacklist.run(
+    stmtDeleteBlacklist.run(
       wallet
     );
 
@@ -629,107 +879,24 @@ function blacklist(
   reason,
   days
 ) {
-  qPutBlacklist.run(
+  stmtPutBlacklist.run(
     wallet,
     reason,
-
     Date.now() +
       days *
         86400000
   );
 }
 
-function previousSentCount(
-  wallet,
-  token
-) {
-  return Number(
-    qPreviousSent.get(
-      wallet,
-      token
-    )?.count ||
-      0
-  );
-}
-
-function markSent(
-  wallet,
-  token,
-  score
-) {
-  qPutSent.run(
-    wallet,
-    token,
-    Date.now(),
-    score
-  );
-}
-
-function saveObservation(
-  wallet,
-  token,
-  x
-) {
-  qObservation.run(
-    wallet,
-    token,
-    Date.now(),
-    x.score,
-    x.profitChange,
-    x.realized,
-    x.totalProfit,
-    x.entryDelaySec,
-    x.buyCount,
-    x.sellCount
-  );
-}
-
-function observationSummary(
-  wallet,
-  token
-) {
-  const row =
-    qObservationSummary.get(
-      wallet,
-      token
-    ) || {};
-
-  return {
-    observations:
-      Number(
-        row.observations ||
-          0
-      ),
-
-    avgTokenScore:
-      num(
-        row.avg_token_score
-      ),
-
-    goodResults:
-      Number(
-        row.good_results ||
-          0
-      ),
-
-    earlyResults:
-      Number(
-        row.early_results ||
-          0
-      ),
-  };
-}
-
 function getMetaNumber(
   key,
   fallback = 0
 ) {
-  const row =
-    qMeta.get(key);
-
   const n =
     Number(
-      row?.value
+      stmtGetMeta.get(
+        key
+      )?.value
     );
 
   return Number.isFinite(n)
@@ -741,25 +908,20 @@ function setMetaNumber(
   key,
   value
 ) {
-  qPutMeta.run(
+  stmtPutMeta.run(
     key,
     String(value)
   );
 }
 
-// ========================= GMGN RATE LIMIT =========================
+// ============================================================
+// GMGN RATE-LIMIT PROTECTION
+// ============================================================
 
 let cliQueue =
   Promise.resolve();
 
-let lastCliFinishedAt =
-  0;
-
-let rateTokens =
-  RATE_CAPACITY;
-
-let rateUpdatedAt =
-  Date.now();
+let lastCliFinishedAt = 0;
 
 let gmgnBlockedUntil =
   getMetaNumber(
@@ -771,8 +933,7 @@ if (
   gmgnBlockedUntil <=
   Date.now()
 ) {
-  gmgnBlockedUntil =
-    0;
+  gmgnBlockedUntil = 0;
 
   setMetaNumber(
     "gmgn_blocked_until",
@@ -790,7 +951,7 @@ function parseRateLimitReset(
 
   const unix =
     text.match(
-      /(?:"?reset_at"?|x-ratelimit-reset)\s*[:=]\s*"?(\d{10,13})/i
+      /(?:x-ratelimit-reset|"?reset_at"?)\s*[:=]\s*"?(\d{10,13})/i
     );
 
   if (unix) {
@@ -848,102 +1009,22 @@ function isRateLimitError(
         );
 
   return (
-    /RATE_LIMIT_EXCEEDED|RATE_LIMIT_BANNED|IP rate limit exceeded|rate[ _-]?limit|\b429\b/i
+    /RATE_LIMIT_EXCEEDED|RATE_LIMIT_BANNED|IP rate limit exceeded|\b429\b|rate[ _-]?limit/i
       .test(text)
   );
 }
 
-function requestWeight(args) {
-  if (
-    args[0] === "token" &&
-    args[1] === "traders"
-  ) {
-    return 5;
-  }
-
-  if (
-    args[0] === "token"
-  ) {
-    return 1;
-  }
-
-  if (
-    args[0] === "portfolio" &&
-    args[1] === "stats"
-  ) {
-    return 3;
-  }
-
-  return 2;
-}
-
-function refillBucket() {
-  const now =
-    Date.now();
-
-  rateTokens =
-    Math.min(
-      RATE_CAPACITY,
-
-      rateTokens +
-        (
-          (
-            now -
-            rateUpdatedAt
-          ) /
-          1000
-        ) *
-          RATE_UNITS_PER_SEC
-    );
-
-  rateUpdatedAt =
-    now;
-}
-
-async function spend(units) {
-  while (true) {
-    refillBucket();
-
-    if (
-      rateTokens >=
-      units
-    ) {
-      rateTokens -=
-        units;
-
-      return;
-    }
-
-    const waitMs =
-      Math.ceil(
-        (
-          (
-            units -
-            rateTokens
-          ) /
-          RATE_UNITS_PER_SEC
-        ) *
-          1000
-      ) +
-      100;
-
-    await sleep(
-      waitMs
-    );
-  }
-}
-
-async function waitForRequestGap() {
-  const waitMs =
+async function waitForGap() {
+  const wait =
     lastCliFinishedAt +
     MIN_GMGN_GAP_MS -
     Date.now();
 
   if (
-    waitMs > 0
+    wait > 0
   ) {
     await sleep(
-      waitMs
+      wait
     );
   }
 }
@@ -1000,7 +1081,7 @@ function rawCli(args) {
                 message
               )
             ) {
-              const resetAt =
+              const reset =
                 parseRateLimitReset(
                   message
                 );
@@ -1010,7 +1091,7 @@ function rawCli(args) {
                   gmgnBlockedUntil,
 
                   (
-                    resetAt ||
+                    reset ||
                     Date.now() +
                       5 *
                         60 *
@@ -1019,18 +1100,10 @@ function rawCli(args) {
                     RATE_LIMIT_GRACE_MS
                 );
 
-              // Store the cooldown in SQLite.
-              // Restarting Railway will NOT bypass it.
               setMetaNumber(
                 "gmgn_blocked_until",
                 gmgnBlockedUntil
               );
-
-              rateTokens =
-                0;
-
-              rateUpdatedAt =
-                Date.now();
             }
 
             const wrapped =
@@ -1043,13 +1116,18 @@ function rawCli(args) {
               gmgnBlockedUntil ||
               null;
 
-            return reject(
+            reject(
               wrapped
             );
+
+            return;
           }
 
           if (
-            stderr?.trim()
+            stderr?.trim() &&
+            process.env
+              .GMGN_DEBUG ===
+              "1"
           ) {
             console.warn(
               stderr.trim()
@@ -1062,17 +1140,17 @@ function rawCli(args) {
                 stdout
               )
             );
+
           } catch {
             reject(
               new Error(
-                `Unparseable gmgn-cli output: ${
-                  String(
-                    stdout
-                  ).slice(
-                    0,
-                    300
-                  )
-                }`
+                "Unparseable gmgn-cli output: " +
+                String(
+                  stdout
+                ).slice(
+                  0,
+                  400
+                )
               )
             );
           }
@@ -1132,20 +1210,13 @@ function cli(args) {
           throw e;
         }
 
-        // Hard 10-second minimum spacing.
-        await waitForRequestGap();
-
-        // Secondary weighted limiter.
-        await spend(
-          requestWeight(
-            args
-          )
-        );
+        await waitForGap();
 
         try {
           return await rawCli(
             args
           );
+
         } finally {
           lastCliFinishedAt =
             Date.now();
@@ -1161,7 +1232,9 @@ function cli(args) {
   return job;
 }
 
-// ========================= GMGN DATA =========================
+// ============================================================
+// GMGN DATA
+// ============================================================
 
 async function getTokenInfo(
   address
@@ -1236,413 +1309,118 @@ async function getTopTraders(
     : [];
 }
 
-// ========================= BATCH STATS PARSER =========================
+// IMPORTANT:
+// Wallet stats are now ONE wallet per GMGN request.
+// No broken batch request.
+// No individual fallback storm.
+function unwrapSingleStats(
+  response,
+  wallet
+) {
+  const p =
+    response?.data ??
+    response;
 
-function looksLikeStats(obj) {
   if (
-    !obj ||
-    typeof obj !==
-      "object" ||
-    Array.isArray(obj)
-  ) {
-    return false;
-  }
-
-  return (
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "pnl_stat"
-    ) ||
-
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "realized_profit"
-    ) ||
-
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "realized_profit_pnl"
-    ) ||
-
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "winrate"
-    ) ||
-
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "buy"
-    ) ||
-
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "buy_count"
-    ) ||
-
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "sell"
-    ) ||
-
-    Object.prototype.hasOwnProperty.call(
-      obj,
-      "sell_count"
-    )
-  );
-}
-
-function statsAddress(obj) {
-  if (
-    !obj ||
-    typeof obj !==
+    !p ||
+    typeof p !==
       "object"
   ) {
     return null;
   }
 
-  return (
-    obj.wallet_address ||
-    obj.wallet ||
-    obj.address ||
-    obj.owner ||
-    obj.account ||
-    null
-  );
-}
-
-/*
-GMGN's multi-wallet response shape can be wrapped differently.
-
-Instead of assuming:
-  data.list
-or:
-  data[wallet]
-
-we recursively walk the response and locate every object
-that actually looks like a wallet-stat record.
-
-This fixes the previous "omitted 9/10 wallets" problem.
-*/
-function mapStatsResponse(
-  response,
-  wallets
-) {
-  const walletSet =
-    new Set(
-      wallets
-    );
-
-  const out = {};
-  const statsObjects = [];
-  const seenObjects =
-    new Set();
-
-  function remember(
-    obj,
-    keyHint = null
+  if (
+    Array.isArray(p)
   ) {
-    if (
-      !looksLikeStats(obj) ||
-      seenObjects.has(obj)
-    ) {
-      return;
-    }
-
-    seenObjects.add(
-      obj
-    );
-
-    statsObjects.push({
-      obj,
-      keyHint,
-    });
-
-    const explicit =
-      statsAddress(
-        obj
-      );
-
-    if (
-      explicit &&
-      walletSet.has(
-        String(explicit)
-      )
-    ) {
-      out[
-        String(explicit)
-      ] =
-        obj;
-
-    } else if (
-      keyHint &&
-      walletSet.has(
-        keyHint
-      )
-    ) {
-      out[keyHint] =
-        obj;
-    }
-  }
-
-  function walk(
-    node,
-    keyHint = null,
-    depth = 0
-  ) {
-    if (
-      node === null ||
-      node === undefined ||
-      depth > 7
-    ) {
-      return;
-    }
-
-    if (
-      Array.isArray(node)
-    ) {
-      for (
-        const item
-        of node
-      ) {
-        walk(
-          item,
-          keyHint,
-          depth + 1
-        );
-      }
-
-      return;
-    }
-
-    if (
-      typeof node !==
-      "object"
-    ) {
-      return;
-    }
-
-    if (
-      node.data &&
-      typeof node.data ===
-        "object" &&
-      looksLikeStats(
-        node.data
-      )
-    ) {
-      remember(
-        node.data,
-        keyHint
-      );
-    }
-
-    remember(
-      node,
-      keyHint
-    );
-
-    for (
-      const [
-        key,
-        value,
-      ]
-      of Object.entries(
-        node
-      )
-    ) {
-      if (
-        !value ||
-        typeof value !==
-          "object"
-      ) {
-        continue;
-      }
-
-      // Common shape:
-      // {
-      //   "walletAddress": {...stats}
-      // }
-      if (
-        walletSet.has(
-          key
-        )
-      ) {
-        const candidate =
-          (
-            value.data &&
-            looksLikeStats(
-              value.data
-            )
-          )
-            ? value.data
-            : value;
-
-        if (
-          looksLikeStats(
-            candidate
-          )
-        ) {
-          out[key] =
-            candidate;
-
-          remember(
-            candidate,
-            key
-          );
-        }
-      }
-
-      // These belong to a single stats row.
-      // They aren't separate wallets.
-      if (
-        [
-          "pnl_stat",
-          "common",
-        ].includes(
-          key
-        )
-      ) {
-        continue;
-      }
-
-      walk(
-        value,
-
-        walletSet.has(
-          key
-        )
-          ? key
-          : keyHint,
-
-        depth + 1
-      );
-    }
-  }
-
-  walk(
-    response
-  );
-
-  /*
-  Some GMGN batch responses may return an ordered
-  array without putting wallet_address in every row.
-
-  When the number of remaining rows exactly matches
-  the requested wallets, map them by request order.
-  */
-
-  const missingWallets =
-    wallets.filter(
-      (w) =>
-        !out[w]
-    );
-
-  const alreadyUsed =
-    new Set(
-      Object.values(
-        out
-      )
-    );
-
-  const unmappedRows =
-    statsObjects
-      .map(
+    const row =
+      p.find(
         (x) =>
-          x.obj
-      )
-      .filter(
-        (obj) =>
-          !alreadyUsed.has(
-            obj
-          )
-      );
+          (
+            x?.wallet_address ||
+            x?.wallet ||
+            x?.address
+          ) === wallet
+      ) ||
+      p[0];
+
+    return (
+      row?.data &&
+      typeof row.data ===
+        "object"
+        ? row.data
+        : row ||
+          null
+    );
+  }
 
   if (
-    missingWallets.length &&
-    unmappedRows.length ===
-      missingWallets.length
+    p[wallet] &&
+    typeof p[wallet] ===
+      "object"
   ) {
-    missingWallets.forEach(
-      (
-        wallet,
-        i
-      ) => {
-        out[wallet] =
-          unmappedRows[i];
-      }
-    );
-
-  } else if (
-    Object.keys(
-      out
-    ).length === 0 &&
-    statsObjects.length >=
-      wallets.length
-  ) {
-    wallets.forEach(
-      (
-        wallet,
-        i
-      ) => {
-        out[wallet] =
-          statsObjects[i]
-            .obj;
-      }
-    );
+    return p[wallet];
   }
 
-  return out;
-}
-
-async function getWalletStats(
-  wallets,
-  period,
-  onProgress
-) {
-  const out = {};
-  const missing = [];
-
-  for (
-    const wallet
-    of wallets
-  ) {
-    const cached =
-      getCachedStats(
-        wallet,
-        period
-      );
-
-    if (cached) {
-      out[wallet] =
-        cached;
-    } else {
-      missing.push(
-        wallet
-      );
-    }
-  }
-
-  let completed =
-    wallets.length -
-    missing.length;
-
-  await onProgress?.(
-    period,
-    completed,
-    wallets.length,
-
-    completed > 0
-      ? "cache"
-      : "start"
-  );
-
-  for (
-    const batch
-    of chunk(
-      missing,
-      STATS_BATCH_SIZE
+  if (
+    Array.isArray(
+      p.list
     )
   ) {
-    const args = [
+    const row =
+      p.list.find(
+        (x) =>
+          (
+            x?.wallet_address ||
+            x?.wallet ||
+            x?.address
+          ) === wallet
+      ) ||
+      p.list[0];
+
+    return (
+      row?.data &&
+      typeof row.data ===
+        "object"
+        ? row.data
+        : row ||
+          null
+    );
+  }
+
+  if (
+    p.wallet_address ||
+    p.pnl_stat ||
+    p.realized_profit !==
+      undefined
+  ) {
+    return p;
+  }
+
+  return null;
+}
+
+async function getStatsOne(
+  wallet,
+  period
+) {
+  const cached =
+    getWalletCache(
+      wallet,
+      period
+    );
+
+  if (cached) {
+    return {
+      data:
+        cached,
+
+      cached:
+        true,
+    };
+  }
+
+  const r =
+    await cli([
       "portfolio",
       "stats",
 
@@ -1651,142 +1429,133 @@ async function getWalletStats(
 
       "--period",
       period,
-    ];
 
-    for (
-      const wallet
-      of batch
-    ) {
-      args.push(
-        "--wallet",
-        wallet
-      );
-    }
+      "--wallet",
+      wallet,
 
-    args.push(
-      "--raw"
+      "--raw",
+    ]);
+
+  const stats =
+    unwrapSingleStats(
+      r,
+      wallet
     );
 
-    const r =
-      await cli(
-        args
-      );
-
-    const mapped =
-      mapStatsResponse(
-        r,
-        batch
-      );
-
-    for (
-      const [
-        wallet,
-        stats,
-      ]
-      of Object.entries(
-        mapped
-      )
-    ) {
-      if (
-        !batch.includes(
-          wallet
-        )
-      ) {
-        continue;
-      }
-
-      out[wallet] =
-        stats;
-
-      putCachedStats(
-        wallet,
-        period,
-        stats
-      );
-    }
-
-    const omitted =
-      batch.filter(
-        (wallet) =>
-          !mapped[wallet]
-      );
-
-    completed +=
-      batch.length;
-
-    if (
-      omitted.length
-    ) {
-      console.warn(
-        `${period}: GMGN response could not be mapped for ` +
-        `${omitted.length}/${batch.length} wallets. ` +
-        `Mapped ${Object.keys(mapped).length}. ` +
-        `No individual fallback calls.`
-      );
-
-      /*
-      Temporary debugging for the first deployment.
-
-      This contains public wallet statistics,
-      NOT your API key.
-      */
-      if (
-        process.env
-          .GMGN_DEBUG_BATCH ===
-        "1"
-      ) {
-        console.log(
-          `[GMGN batch debug ${period}] ${
-            JSON.stringify(r)
-              .slice(
-                0,
-                6000
-              )
-          }`
-        );
-      }
-
-    } else {
-      console.log(
-        `${period}: mapped ${batch.length}/${batch.length} wallets successfully.`
-      );
-    }
-
-    await onProgress?.(
-      period,
-
-      Math.min(
-        completed,
-        wallets.length
-      ),
-
-      wallets.length,
-      "batch"
+  if (!stats) {
+    throw new Error(
+      `${period} stats returned no usable data for ${wallet}`
     );
   }
 
-  return out;
+  putWalletCache(
+    wallet,
+    period,
+    stats
+  );
+
+  return {
+    data:
+      stats,
+
+    cached:
+      false,
+  };
+}
+
+async function getActivityOne(
+  wallet
+) {
+  const cached =
+    getWalletCache(
+      wallet,
+      "activity"
+    );
+
+  if (cached) {
+    return {
+      data:
+        cached,
+
+      cached:
+        true,
+    };
+  }
+
+  const r =
+    await cli([
+      "portfolio",
+      "activity",
+
+      "--chain",
+      "sol",
+
+      "--wallet",
+      wallet,
+
+      "--limit",
+      String(
+        ACTIVITY_SAMPLE
+      ),
+
+      "--raw",
+    ]);
+
+  const p =
+    r?.data ??
+    r ??
+    {};
+
+  const activities =
+    Array.isArray(p)
+      ? p
+      : (
+        p.activities ||
+        p.list ||
+        []
+      );
+
+  const rows =
+    Array.isArray(
+      activities
+    )
+      ? activities
+      : [];
+
+  putWalletCache(
+    wallet,
+    "activity",
+    rows
+  );
+
+  return {
+    data:
+      rows,
+
+    cached:
+      false,
+  };
 }
 
 async function getDiscovery(
   address,
-  onProgress
+  progress
 ) {
   const cached =
-    getCachedDiscovery(
+    getDiscoveryCache(
       address
     );
 
   if (cached) {
-    await onProgress?.(
-      "discovery-cache"
+    await progress?.(
+      `⚡ ${short(address)} — using cached token/trader data...`
     );
 
     return cached;
   }
 
-  await onProgress?.(
-    "token-info"
+  await progress?.(
+    `🔎 ${short(address)} — checking token info...`
   );
 
   const tokenInfo =
@@ -1794,8 +1563,8 @@ async function getDiscovery(
       address
     );
 
-  await onProgress?.(
-    "top-traders"
+  await progress?.(
+    `🔎 ${short(address)} — finding top traders...`
   );
 
   const traders =
@@ -1803,7 +1572,7 @@ async function getDiscovery(
       address
     );
 
-  putCachedDiscovery(
+  putDiscoveryCache(
     address,
     tokenInfo,
     traders
@@ -1815,23 +1584,26 @@ async function getDiscovery(
   };
 }
 
-// ========================= STATS =========================
+// ============================================================
+// NORMALISE WALLET STATS
+// ============================================================
 
 function parseStats(input) {
   const s =
-    input || {};
+    input ||
+    {};
 
   const p =
     s.pnl_stat ||
     {};
 
-  const buys =
+  const buyCount =
     num(
       s.buy ??
       s.buy_count
     );
 
-  const sells =
+  const sellCount =
     num(
       s.sell ??
       s.sell_count
@@ -1847,11 +1619,6 @@ function parseStats(input) {
     realizedProfit:
       num(
         s.realized_profit
-      ),
-
-    unrealizedProfit:
-      num(
-        s.unrealized_profit
       ),
 
     roi:
@@ -1873,15 +1640,13 @@ function parseStats(input) {
         s.token_num
       ),
 
-    buyCount:
-      buys,
+    buyCount,
 
-    sellCount:
-      sells,
+    sellCount,
 
     trades:
-      buys +
-      sells,
+      buyCount +
+      sellCount,
 
     createdTokenCount:
       num(
@@ -1951,36 +1716,6 @@ function severeLossRate(s) {
   );
 }
 
-function winnerRate(s) {
-  if (
-    !s?.tokenNum
-  ) {
-    return 0;
-  }
-
-  const bucketRate =
-    (
-      s.dist.gt5 +
-      s.dist.x2to5 +
-      s.dist.x0to2
-    ) /
-    s.tokenNum;
-
-  return Math.max(
-    clamp(
-      bucketRate,
-      0,
-      1
-    ),
-
-    clamp(
-      s.winrate,
-      0,
-      1
-    )
-  );
-}
-
 function bigWinnerRate(s) {
   return (
     s?.tokenNum > 0
@@ -1990,6 +1725,7 @@ function bigWinnerRate(s) {
             s.dist.x2to5
           ) /
             s.tokenNum,
+
           0,
           1
         )
@@ -1997,7 +1733,27 @@ function bigWinnerRate(s) {
   );
 }
 
-// ========================= SCORING =========================
+function positiveBucketRate(s) {
+  return (
+    s?.tokenNum > 0
+      ? clamp(
+          (
+            s.dist.gt5 +
+            s.dist.x2to5 +
+            s.dist.x0to2
+          ) /
+            s.tokenNum,
+
+          0,
+          1
+        )
+      : 0
+  );
+}
+
+// ============================================================
+// MULTI-TOKEN PERFORMANCE SCORE
+// ============================================================
 
 function trackScore(s) {
   if (
@@ -2007,66 +1763,90 @@ function trackScore(s) {
     return 0;
   }
 
+  const win =
+    clamp(
+      (
+        s.winrate -
+        0.25
+      ) /
+        0.5,
+
+      0,
+      1
+    );
+
+  const positive =
+    clamp(
+      (
+        positiveBucketRate(s) -
+        0.35
+      ) /
+        0.55,
+
+      0,
+      1
+    );
+
+  const roi =
+    clamp(
+      (
+        s.roi +
+        0.1
+      ) /
+        1.1,
+
+      0,
+      1
+    );
+
   const lossDiscipline =
     1 -
     severeLossRate(s);
 
-  const winQuality =
-    clamp(
-      (
-        winnerRate(s) -
-        0.30
-      ) /
-        0.40,
-      0,
-      1
-    );
-
-  const roiQuality =
-    clamp(
-      (
-        s.roi +
-        0.10
-      ) /
-        0.70,
-      0,
-      1
-    );
-
-  const bigWinnerQuality =
+  const bigWins =
     clamp(
       bigWinnerRate(s) /
-        0.20,
+        0.18,
+
       0,
       1
     );
 
-  const sampleQuality =
+  const avgProfitPerToken =
+    s.realizedProfit /
+    Math.max(
+      1,
+      s.tokenNum
+    );
+
+  const profitQuality =
+    clamp(
+      (
+        Math.log10(
+          Math.max(
+            1,
+            avgProfitPerToken
+          )
+        ) -
+        1.5
+      ) /
+        2.2,
+
+      0,
+      1
+    );
+
+  const sample =
     clamp(
       (
         Math.log2(
           1 +
           s.tokenNum
         ) -
-        2
+        2.5
       ) /
-        4,
-      0,
-      1
-    );
+        4.5,
 
-  const profitQuality =
-    clamp(
-      Math.log10(
-        1 +
-        Math.max(
-          0,
-          s.realizedProfit
-        )
-      ) /
-        Math.log10(
-          100001
-        ),
       0,
       1
     );
@@ -2074,26 +1854,33 @@ function trackScore(s) {
   return Math.round(
     100 *
     (
-      0.30 *
+      0.23 *
+        roi +
+
+      0.22 *
         lossDiscipline +
 
-      0.22 *
-        winQuality +
+      0.16 *
+        positive +
 
-      0.22 *
-        roiQuality +
+      0.12 *
+        win +
 
       0.11 *
-        bigWinnerQuality +
+        bigWins +
 
       0.10 *
-        sampleQuality +
+        profitQuality +
 
-      0.05 *
-        profitQuality
+      0.06 *
+        sample
     )
   );
 }
+
+// ============================================================
+// HOLDING / COPYABILITY
+// ============================================================
 
 function behaviorScore(
   s7,
@@ -2120,56 +1907,50 @@ function behaviorScore(
     days;
 
   const perToken =
-    s.tokenNum > 0
-      ? s.trades /
-        s.tokenNum
-      : s.trades;
+    s.trades /
+    Math.max(
+      1,
+      s.tokenNum
+    );
 
-  const h =
-    s.avgHoldSec;
-
-  let score = 55;
+  let score = 60;
 
   if (
-    h > 0 &&
-    h <
+    s.avgHoldSec > 0
+  ) {
+    if (
+      s.avgHoldSec <
       5 * 60
-  ) {
-    score = 20;
+    ) {
+      score = 20;
 
-  } else if (
-    h > 0 &&
-    h <
+    } else if (
+      s.avgHoldSec <
       15 * 60
-  ) {
-    score = 40;
+    ) {
+      score = 38;
 
-  } else if (
-    h > 0 &&
-    h <
+    } else if (
+      s.avgHoldSec <
       60 * 60
-  ) {
-    score = 65;
+    ) {
+      score = 62;
 
-  } else if (
-    h > 0 &&
-    h <
-      6 * 60 * 60
-  ) {
-    score = 78;
+    } else if (
+      s.avgHoldSec <
+      6 * 3600
+    ) {
+      score = 76;
 
-  } else if (
-    h > 0 &&
-    h <
-      24 * 60 * 60
-  ) {
-    score = 88;
+    } else if (
+      s.avgHoldSec <
+      24 * 3600
+    ) {
+      score = 88;
 
-  } else if (
-    h >=
-    24 * 60 * 60
-  ) {
-    score = 100;
+    } else {
+      score = 96;
+    }
   }
 
   score -=
@@ -2179,6 +1960,7 @@ function behaviorScore(
         25
       ) /
         100,
+
       0,
       1
     ) *
@@ -2191,6 +1973,7 @@ function behaviorScore(
         6
       ) /
         25,
+
       0,
       1
     ) *
@@ -2204,6 +1987,10 @@ function behaviorScore(
     )
   );
 }
+
+// ============================================================
+// PERFORMANCE ON SUBMITTED CA
+// ============================================================
 
 function entryDelay(
   trader,
@@ -2223,13 +2010,37 @@ function entryDelay(
         ?.creation_timestamp
     );
 
+  if (
+    !first ||
+    !opened ||
+    first < opened
+  ) {
+    return null;
+  }
+
   return (
-    first &&
-    opened &&
-    first >= opened
-      ? first -
-        opened
-      : null
+    first -
+    opened
+  );
+}
+
+function normalizeFraction(
+  value
+) {
+  const n =
+    num(value);
+
+  if (
+    n > 1 &&
+    n <= 100
+  ) {
+    return n / 100;
+  }
+
+  return clamp(
+    n,
+    0,
+    1
   );
 }
 
@@ -2280,13 +2091,9 @@ function tokenPerformance(
     );
 
   const soldPct =
-    clamp(
-      num(
-        trader
-          ?.sell_amount_percentage
-      ),
-      0,
-      1
+    normalizeFraction(
+      trader
+        ?.sell_amount_percentage
     );
 
   const avgCost =
@@ -2305,9 +2112,10 @@ function tokenPerformance(
     clamp(
       (
         profitChange +
-        0.10
+        0.1
       ) /
-        1.60,
+        1.6,
+
       0,
       1
     );
@@ -2318,18 +2126,36 @@ function tokenPerformance(
         1 +
         Math.max(
           0,
-          realized
+          totalProfit
         )
       ) /
         Math.log10(
           50001
         ),
+
       0,
       1
     );
 
-  let timingQ =
-    0.45;
+  const tx =
+    buyCount +
+    sellCount;
+
+  const simplicityQ =
+    clamp(
+      1 -
+        Math.max(
+          0,
+          tx -
+            12
+        ) /
+          70,
+
+      0,
+      1
+    );
+
+  let timingQ = 0.45;
 
   if (
     entryDelaySec !==
@@ -2345,23 +2171,23 @@ function tokenPerformance(
       entryDelaySec <=
       30 * 60
     ) {
-      timingQ = 0.92;
+      timingQ = 0.93;
 
     } else if (
       entryDelaySec <=
       2 * 3600
     ) {
-      timingQ = 0.80;
+      timingQ = 0.82;
 
     } else if (
       entryDelaySec <=
       6 * 3600
     ) {
-      timingQ = 0.68;
+      timingQ = 0.70;
 
     } else if (
       entryDelaySec <=
-      86400
+      24 * 3600
     ) {
       timingQ = 0.52;
 
@@ -2370,254 +2196,383 @@ function tokenPerformance(
     }
   }
 
-  let athQ =
-    0.5;
-
-  const ath =
-    num(
-      tokenInfo
-        ?.ath_price
-    );
-
-  if (
-    ath > 0 &&
-    avgCost > 0
-  ) {
-    athQ =
-      clamp(
-        (
-          Math.log2(
-            Math.max(
-              1,
-              ath /
-                avgCost
-            )
-          ) +
-          0.5
-        ) /
-          4,
-
-        0.35,
-        1
-      );
-  }
-
-  let realizeQ =
-    0.45;
-
-  if (
-    realized > 0 &&
-    soldPct >=
-      0.95
-  ) {
-    realizeQ = 1;
-
-  } else if (
-    realized > 0 &&
-    soldPct >=
-      0.40
-  ) {
-    realizeQ = 0.85;
-
-  } else if (
-    realized > 0
-  ) {
-    realizeQ = 0.70;
-
-  } else if (
-    unrealized > 0
-  ) {
-    realizeQ = 0.55;
-
-  } else if (
-    totalProfit < 0
-  ) {
-    realizeQ = 0.20;
-  }
-
   const score =
     Math.round(
       100 *
       (
-        0.38 *
+        0.40 *
           roiQ +
 
-        0.18 *
+        0.25 *
           profitQ +
 
-        0.18 *
+        0.25 *
           timingQ +
 
-        0.12 *
-          athQ +
-
-        0.14 *
-          realizeQ
+        0.10 *
+          simplicityQ
       )
     );
 
   return {
     score,
+
     realized,
+
     unrealized,
+
     totalProfit,
+
     profitChange,
+
     buyCount,
+
     sellCount,
+
     soldPct,
+
     avgCost,
+
     entryDelaySec,
   };
 }
 
-function discoveryScore(
-  summary
+// ============================================================
+// RECENT ACTIVITY / EARLY-ENTRY ANALYSIS
+// ============================================================
+
+function activityType(row) {
+  return String(
+    row?.event_type ||
+    row?.type ||
+    ""
+  ).toLowerCase();
+}
+
+function activityTokenAddress(
+  row
 ) {
-  if (
-    !summary.observations
+  return (
+    row?.token?.address ||
+    row?.token_address ||
+    row?.address ||
+    null
+  );
+}
+
+function activityPrice(row) {
+  return num(
+    row?.price_usd ??
+    row?.price
+  );
+}
+
+function analyseActivity(rows) {
+  const byToken =
+    new Map();
+
+  for (
+    const row
+    of rows || []
   ) {
-    return 50;
+    const type =
+      activityType(
+        row
+      );
+
+    if (
+      type !== "buy" &&
+      type !== "sell"
+    ) {
+      continue;
+    }
+
+    const token =
+      activityTokenAddress(
+        row
+      );
+
+    if (!token) {
+      continue;
+    }
+
+    if (
+      !byToken.has(
+        token
+      )
+    ) {
+      byToken.set(
+        token,
+        []
+      );
+    }
+
+    byToken
+      .get(token)
+      .push(row);
   }
 
-  const goodRate =
-    summary.goodResults /
-    summary.observations;
+  const captures = [];
+  const holds = [];
 
-  const earlyRate =
-    summary.earlyResults /
-    summary.observations;
+  let fastPairs = 0;
 
-  const avg =
-    clamp(
-      summary.avgTokenScore /
-        100,
-      0,
-      1
-    );
-
-  const sample =
-    clamp(
-      summary.observations /
-        8,
-      0,
-      1
-    );
-
-  return Math.round(
-    100 *
-    (
-      0.45 *
-        avg +
-
-      0.30 *
-        goodRate +
-
-      0.15 *
-        earlyRate +
-
-      0.10 *
-        sample
-    )
-  );
-}
-
-function overallScore(
-  track30,
-  track7,
-  tokenScore,
-  behavior,
-  discovery,
-  previousSeen,
-  observations
-) {
-  const discoveryWeight =
-    observations >= 2
-      ? 0.08
-      : 0;
-
-  const normalWeight =
-    1 -
-    discoveryWeight;
-
-  const base =
-    normalWeight *
-    (
-      0.45 *
-        track30 +
-
-      0.25 *
-        track7 +
-
-      0.20 *
-        tokenScore +
-
-      0.10 *
-        behavior
-    ) +
-
-    discoveryWeight *
-      discovery;
-
-  const repeatBonus =
-    previousSeen
-      ? clamp(
-          previousSeen *
-            0.8 +
-
-          clamp(
-            observations /
-              5,
-            0,
-            1
-          ) *
-            2 +
-
-          clamp(
-            (
-              discovery -
-              50
-            ) /
-              40,
-            0,
-            1
-          ) *
-            2,
-
-          0,
-          5
+  for (
+    const events
+    of byToken.values()
+  ) {
+    events.sort(
+      (a, b) =>
+        num(
+          a.timestamp
+        ) -
+        num(
+          b.timestamp
         )
+    );
+
+    const firstBuy =
+      events.find(
+        (x) =>
+          activityType(x) ===
+            "buy" &&
+          activityPrice(x) > 0
+      );
+
+    if (!firstBuy) {
+      continue;
+    }
+
+    const buyTs =
+      num(
+        firstBuy.timestamp
+      );
+
+    const buyPrice =
+      activityPrice(
+        firstBuy
+      );
+
+    const sells =
+      events.filter(
+        (x) =>
+          activityType(x) ===
+            "sell" &&
+          num(
+            x.timestamp
+          ) >= buyTs &&
+          activityPrice(x) > 0
+      );
+
+    if (
+      !sells.length
+    ) {
+      continue;
+    }
+
+    const firstSellTs =
+      num(
+        sells[0]
+          .timestamp
+      );
+
+    const bestSellPrice =
+      Math.max(
+        ...sells.map(
+          activityPrice
+        )
+      );
+
+    if (
+      buyPrice <= 0 ||
+      bestSellPrice <= 0
+    ) {
+      continue;
+    }
+
+    // This is deliberately relative price behaviour,
+    // not a fixed market-cap threshold.
+    //
+    // If the first observed buy was much cheaper
+    // than later sells, that is evidence the wallet
+    // got in before meaningful upside.
+    captures.push(
+      bestSellPrice /
+      buyPrice
+    );
+
+    if (
+      firstSellTs >
+      buyTs
+    ) {
+      const hold =
+        firstSellTs -
+        buyTs;
+
+      holds.push(
+        hold
+      );
+
+      if (
+        hold <=
+        5 * 60
+      ) {
+        fastPairs += 1;
+      }
+    }
+  }
+
+  const pairedTokens =
+    captures.length;
+
+  const upside15Rate =
+    pairedTokens
+      ? captures.filter(
+          (x) =>
+            x >= 1.5
+        ).length /
+        pairedTokens
       : 0;
 
-  return Math.round(
-    clamp(
-      base +
-        repeatBonus,
-      0,
-      100
-    )
-  );
+  const upside2xRate =
+    pairedTokens
+      ? captures.filter(
+          (x) =>
+            x >= 2
+        ).length /
+        pairedTokens
+      : 0;
+
+  const lossRate =
+    pairedTokens
+      ? captures.filter(
+          (x) =>
+            x < 0.8
+        ).length /
+        pairedTokens
+      : 0;
+
+  const fastFlipRate =
+    holds.length
+      ? fastPairs /
+        holds.length
+      : 0;
+
+  const medianHoldSec =
+    median(
+      holds
+    );
+
+  const medianCapture =
+    median(
+      captures
+    );
+
+  let score = 35;
+
+  if (
+    pairedTokens
+  ) {
+    const sampleQ =
+      clamp(
+        pairedTokens /
+          8,
+
+        0,
+        1
+      );
+
+    const holdQ =
+      medianHoldSec ===
+      null
+        ? 0.5
+
+        : medianHoldSec <
+          5 * 60
+          ? 0.15
+
+          : medianHoldSec <
+            30 * 60
+            ? 0.45
+
+            : medianHoldSec <
+              6 * 3600
+              ? 0.75
+
+              : 1;
+
+    score =
+      Math.round(
+        100 *
+        (
+          0.38 *
+            upside15Rate +
+
+          0.18 *
+            upside2xRate +
+
+          0.20 *
+            (
+              1 -
+              lossRate
+            ) +
+
+          0.12 *
+            (
+              1 -
+              fastFlipRate
+            ) +
+
+          0.07 *
+            holdQ +
+
+          0.05 *
+            sampleQ
+        )
+      );
+  }
+
+  return {
+    score,
+
+    pairedTokens,
+
+    upside15Rate,
+
+    upside2xRate,
+
+    lossRate,
+
+    fastFlipRate,
+
+    medianHoldSec,
+
+    medianCapture,
+  };
 }
 
-// ========================= BOT FILTERS =========================
+// ============================================================
+// HARD FILTERING
+// ============================================================
 
 function traderExclusion(
   trader,
   creatorAddress
 ) {
-  const address =
+  const wallet =
     trader?.address;
 
   if (
-    !address ||
+    !wallet ||
     !SOL_ADDR.test(
-      address
+      wallet
     )
   ) {
     return "invalid wallet";
   }
 
   if (
-    address ===
+    wallet ===
     creatorAddress
   ) {
     return "token creator";
@@ -2628,15 +2583,53 @@ function traderExclusion(
       trader.addr_type
     ) === 2
   ) {
-    return "exchange/liquidity pool";
+    return (
+      "exchange/liquidity pool"
+    );
   }
 
   if (
     boolish(
-      trader.is_suspicious
+      trader
+        .is_suspicious
     )
   ) {
-    return "GMGN suspicious wallet";
+    return (
+      "GMGN suspicious"
+    );
+  }
+
+  const badTag =
+    tagsOf(
+      trader
+    ).find(
+      (tag) =>
+        HARD_TAGS.has(
+          tag
+        )
+    );
+
+  if (badTag) {
+    return `tag:${badTag}`;
+  }
+
+  const tx =
+    num(
+      trader
+        .buy_tx_count_cur
+    ) +
+    num(
+      trader
+        .sell_tx_count_cur
+    );
+
+  if (
+    tx >
+    HARD_MAX_THIS_TOKEN_TX
+  ) {
+    return (
+      "extreme token transaction count"
+    );
   }
 
   if (
@@ -2652,15 +2645,28 @@ function traderExclusion(
         .buy_volume_cur
     ) <= 0
   ) {
-    return "transfer-only position";
+    return "transfer-only";
+  }
+
+  return null;
+}
+
+function statsExclusion(
+  s,
+  rawStats
+) {
+  if (
+    !hasStats(s)
+  ) {
+    return "no stats";
   }
 
   const badTag =
     tagsOf(
-      trader
+      rawStats
     ).find(
       (tag) =>
-        EXCLUDE_TAGS.has(
+        HARD_TAGS.has(
           tag
         )
     );
@@ -2669,68 +2675,33 @@ function traderExclusion(
     return `tag:${badTag}`;
   }
 
-  const thisTokenTx =
-    num(
-      trader
-        .buy_tx_count_cur
-    ) +
-    num(
-      trader
-        .sell_tx_count_cur
-    );
-
-  if (
-    thisTokenTx >
-    HARD_MAX_THIS_TOKEN_TX
-  ) {
-    return "extreme submitted-token transaction count";
-  }
-
-  return null;
-}
-
-function statsExclusion(
-  s7,
-  s30
-) {
-  const s =
-    hasStats(s7)
-      ? s7
-      : s30;
-
-  if (
-    !hasStats(s)
-  ) {
-    return null;
-  }
-
-  const days =
-    s === s7
-      ? 7
-      : 30;
-
   const perDay =
     s.trades /
-    days;
+    30;
 
   const perToken =
-    s.tokenNum > 0
-      ? s.trades /
-        s.tokenNum
-      : s.trades;
+    s.trades /
+    Math.max(
+      1,
+      s.tokenNum
+    );
 
   if (
     perDay >
     HARD_MAX_TRADES_PER_DAY
   ) {
-    return "bot-like trade frequency";
+    return (
+      "bot-like trades/day"
+    );
   }
 
   if (
     perToken >
     HARD_MAX_TRADES_PER_TOKEN
   ) {
-    return "bot-like transactions/token";
+    return (
+      "bot-like trades/token"
+    );
   }
 
   if (
@@ -2741,16 +2712,35 @@ function statsExclusion(
       s.tokenNum
     )
   ) {
-    return "mostly token creator";
+    return (
+      "mostly token creator"
+    );
   }
 
   return null;
 }
 
+// ============================================================
+// CANDIDATE SELECTION
+// ============================================================
+
 function candidatePriority(
   trader,
-  previousSeen
+  tokenInfo,
+  tokenAddress
 ) {
+  const token =
+    tokenPerformance(
+      trader,
+      tokenInfo
+    );
+
+  const seen =
+    previousSentCount(
+      trader.address,
+      tokenAddress
+    );
+
   const tags =
     tagsOf(
       trader
@@ -2767,84 +2757,66 @@ function candidatePriority(
       "kol"
     );
 
-  const profit =
-    Math.max(
-      0,
-      num(
-        trader.profit
-      )
-    );
+  return {
+    trader,
 
-  const roi =
-    num(
-      trader
-        .profit_change
-    );
+    token,
 
-  const tx =
-    num(
-      trader
-        .buy_tx_count_cur
-    ) +
-    num(
-      trader
-        .sell_tx_count_cur
-    );
+    previousSeen:
+      seen,
 
-  return (
-    Math.log10(
-      1 +
-      profit
-    ) *
-      8 +
+    priority:
+      token.score *
+        0.65 +
 
-    clamp(
-      roi,
-      -0.5,
-      3
-    ) *
-      12 +
+      Math.log10(
+        1 +
+        Math.max(
+          0,
+          token.totalProfit
+        )
+      ) *
+        5 +
 
-    (
-      smart
-        ? 20
-        : 0
-    ) +
+      Math.min(
+        5,
+        seen
+      ) *
+        3 +
 
-    Math.min(
-      previousSeen,
-      5
-    ) *
-      5 -
-
-    Math.max(
-      0,
-      tx -
-        12
-    ) *
-      0.25
-  );
+      (
+        smart
+          ? 8
+          : 0
+      ),
+  };
 }
 
 function chooseCandidates(
   traders,
-  creatorAddress,
+  tokenInfo,
   tokenAddress
 ) {
-  const candidates = [];
+  const creator =
+    tokenInfo
+      ?.dev
+      ?.creator_address ||
+    null;
+
+  const out = [];
 
   for (
     const trader
     of traders
   ) {
-    const wallet =
-      trader?.address;
-
     const reason =
       traderExclusion(
         trader,
-        creatorAddress
+        creator
       );
+
+    const wallet =
+      trader?.address;
 
     if (reason) {
       if (
@@ -2864,20 +2836,8 @@ function chooseCandidates(
           );
 
         } else if (
-          reason ===
-            "GMGN suspicious wallet" ||
-
-          reason.startsWith(
-            "tag:dex_bot"
-          ) ||
-
-          reason.startsWith(
-            "tag:rat_trader"
-          ) ||
-
-          reason.startsWith(
-            "tag:bundler"
-          )
+          /dex_bot|rat_trader|bundler|arbitrager|mev_bot/
+            .test(reason)
         ) {
           blacklist(
             wallet,
@@ -2898,56 +2858,71 @@ function chooseCandidates(
       continue;
     }
 
-    const previousSeen =
-      previousSentCount(
-        wallet,
+    const candidate =
+      candidatePriority(
+        trader,
+        tokenInfo,
         tokenAddress
       );
 
-    candidates.push({
-      trader,
-      previousSeen,
+    // Submitted-token performance matters.
+    // We don't waste a 30d request researching
+    // an actual loser on the discovery token.
+    if (
+      candidate
+        .token
+        .totalProfit <=
+        0 &&
+      candidate
+        .token
+        .profitChange <=
+        0
+    ) {
+      continue;
+    }
 
-      priority:
-        candidatePriority(
-          trader,
-          previousSeen
-        ),
-    });
+    out.push(
+      candidate
+    );
   }
 
-  candidates.sort(
+  out.sort(
     (a, b) =>
       b.priority -
       a.priority
   );
 
-  return candidates.slice(
+  return out.slice(
     0,
     MAX_CANDIDATES
   );
 }
 
-function qualifies(row) {
+// ============================================================
+// QUALIFICATION STAGES
+// ============================================================
+
+function passes30d(row) {
+  const s =
+    row.s30;
+
   if (
-    !hasStats(
-      row.s30
-    )
+    !hasStats(s)
   ) {
     return false;
   }
 
   if (
-    row.s30.tokenNum <
+    s.tokenNum <
     MIN_30D_TOKENS
   ) {
     return false;
   }
 
   if (
-    row.s30
-      .realizedProfit <=
-    0
+    s.realizedProfit <=
+      0 ||
+    s.roi <= 0
   ) {
     return false;
   }
@@ -2960,19 +2935,19 @@ function qualifies(row) {
   }
 
   if (
-    row.overall <
-    MIN_OVERALL_SCORE
+    severeLossRate(s) >
+    0.34
   ) {
     return false;
   }
 
+  // Low win rate can still survive if the
+  // wallet regularly catches large winners.
   if (
-    row.s30.tokenNum >=
-      10 &&
-    severeLossRate(
-      row.s30
-    ) >
-      0.45
+    s.winrate <
+      0.28 &&
+    bigWinnerRate(s) <
+      0.10
   ) {
     return false;
   }
@@ -2980,15 +2955,287 @@ function qualifies(row) {
   return true;
 }
 
+function passes7d(row) {
+  const s =
+    row.s7;
+
+  if (
+    !hasStats(s)
+  ) {
+    return false;
+  }
+
+  if (
+    s.tokenNum < 3
+  ) {
+    // Very small recent sample:
+    // only survive with exceptional 30d history.
+    return (
+      row.track30 >=
+      70
+    );
+  }
+
+  if (
+    row.track7 <
+    MIN_7D_TRACK_SCORE
+  ) {
+    return false;
+  }
+
+  if (
+    s.roi <
+      -0.15 &&
+    s.realizedProfit <
+      0
+  ) {
+    return false;
+  }
+
+  if (
+    severeLossRate(s) >
+    0.40
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function preActivityScore(row) {
+  const history =
+    row.history;
+
+  const historyBonus =
+    history.observations >= 2
+      ? clamp(
+          (
+            history
+              .avgTokenScore -
+            55
+          ) /
+            20,
+
+          0,
+          1
+        ) *
+        4
+
+      : 0;
+
+  const seenBonus =
+    Math.min(
+      4,
+      row.previousSeen *
+        1.2
+    );
+
+  return Math.round(
+    clamp(
+      0.50 *
+        row.track30 +
+
+      0.23 *
+        row.track7 +
+
+      0.20 *
+        row.token.score +
+
+      0.07 *
+        row.behavior +
+
+      historyBonus +
+      seenBonus,
+
+      0,
+      100
+    )
+  );
+}
+
+function finalScore(row) {
+  const history =
+    row.history;
+
+  const historyBonus =
+    history.observations >= 2
+      ? clamp(
+          (
+            history
+              .avgTokenScore -
+            55
+          ) /
+            25,
+
+          0,
+          1
+        ) *
+        4
+
+      : 0;
+
+  const repeatBonus =
+    Math.min(
+      5,
+      row.previousSeen *
+        1.25
+    );
+
+  return Math.round(
+    clamp(
+      0.38 *
+        row.track30 +
+
+      0.20 *
+        row.track7 +
+
+      0.18 *
+        row.token.score +
+
+      0.17 *
+        row.activity.score +
+
+      0.07 *
+        row.behavior +
+
+      historyBonus +
+      repeatBonus,
+
+      0,
+      100
+    )
+  );
+}
+
+// The wallet must show some actual evidence
+// of getting in before meaningful upside.
+function hasEarlyEvidence(row) {
+  // Recent activity across multiple tokens.
+  if (
+    row.activity
+      .pairedTokens >=
+      3 &&
+    row.activity
+      .upside15Rate >=
+      0.35
+  ) {
+    return true;
+  }
+
+  // Our own growing cross-CA history.
+  if (
+    row.history
+      .earlyResults >=
+      2 &&
+    row.history
+      .goodResults >=
+      2
+  ) {
+    return true;
+  }
+
+  // Smaller activity sample, but also got
+  // into this submitted token early.
+  if (
+    row.activity
+      .pairedTokens >=
+      2 &&
+
+    row.activity
+      .upside15Rate >=
+      0.50 &&
+
+    row.token
+      .entryDelaySec !==
+      null &&
+
+    row.token
+      .entryDelaySec <=
+      6 * 3600
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function qualifiesFinal(row) {
+  if (
+    row.overall <
+    MIN_FINAL_SCORE
+  ) {
+    return false;
+  }
+
+  if (
+    row.track30 <
+    MIN_30D_TRACK_SCORE
+  ) {
+    return false;
+  }
+
+  if (
+    row.s30.tokenNum <
+    MIN_30D_TOKENS
+  ) {
+    return false;
+  }
+
+  // 8-14 tokens can qualify,
+  // but only with unusually strong evidence.
+  if (
+    row.s30.tokenNum <
+      PREFERRED_30D_TOKENS &&
+    row.overall <
+      72
+  ) {
+    return false;
+  }
+
+  if (
+    !passes7d(row)
+  ) {
+    return false;
+  }
+
+  if (
+    row.activity
+      .pairedTokens >=
+      2 &&
+    row.activity
+      .fastFlipRate >
+      0.45
+  ) {
+    return false;
+  }
+
+  if (
+    row.activity
+      .pairedTokens >=
+      3 &&
+    row.activity.score <
+      48
+  ) {
+    return false;
+  }
+
+  if (
+    !hasEarlyEvidence(
+      row
+    )
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+// ============================================================
+// PROFILE LABELS
+// ============================================================
+
 function labelsFor(row) {
   const labels = [];
-
-  const s =
-    hasStats(
-      row.s7
-    )
-      ? row.s7
-      : row.s30;
 
   if (
     row.previousSeen >
@@ -3001,22 +3248,19 @@ function labelsFor(row) {
 
   if (
     row.s30.tokenNum <
-    LOW_SAMPLE_30D_TOKENS
+    PREFERRED_30D_TOKENS
   ) {
     labels.push(
       "🆕 LOW SAMPLE"
     );
   }
 
-  if (
-    s.avgHoldSec > 0 &&
-    s.avgHoldSec <
-      FAST_AVG_HOLD_SEC
-  ) {
-    labels.push(
-      "⚡ FAST"
-    );
-  }
+  const s =
+    hasStats(
+      row.s7
+    )
+      ? row.s7
+      : row.s30;
 
   const days =
     s === row.s7
@@ -3028,10 +3272,21 @@ function labelsFor(row) {
     days;
 
   const perToken =
-    s.tokenNum > 0
-      ? s.trades /
-        s.tokenNum
-      : s.trades;
+    s.trades /
+    Math.max(
+      1,
+      s.tokenNum
+    );
+
+  if (
+    s.avgHoldSec > 0 &&
+    s.avgHoldSec <
+      FAST_AVG_HOLD_SEC
+  ) {
+    labels.push(
+      "⚡ FAST"
+    );
+  }
 
   if (
     perDay >
@@ -3045,14 +3300,12 @@ function labelsFor(row) {
   }
 
   if (
-    row.s30.tokenNum >=
-      15 &&
     row.track30 >=
-      60 &&
+      65 &&
     severeLossRate(
       row.s30
     ) <=
-      0.12
+      0.15
   ) {
     labels.push(
       "CONSISTENT"
@@ -3069,41 +3322,41 @@ function labelsFor(row) {
   }
 
   if (
-    row.token
-      .entryDelaySec !==
-      null &&
-    row.token
-      .entryDelaySec <=
-      6 * 3600 &&
-    row.token.score >=
-      60
+    hasEarlyEvidence(
+      row
+    )
   ) {
     labels.push(
-      "EARLY ENTRY"
+      "EARLY FINDER"
     );
   }
 
   return labels;
 }
 
-// ========================= MAIN SCAN =========================
+// ============================================================
+// MAIN QUALITY-FIRST FUNNEL
+// ============================================================
 
 async function scan(
   address,
-  onProgress
+  progress
 ) {
   const {
     tokenInfo,
-    traders: top,
+    traders,
   } =
     await getDiscovery(
       address,
-      onProgress
+      progress
     );
 
-  if (!top.length) {
+  if (
+    !traders.length
+  ) {
     return {
       tokenInfo,
+
       wallets: [],
 
       note:
@@ -3113,13 +3366,8 @@ async function scan(
 
   const candidates =
     chooseCandidates(
-      top,
-
-      tokenInfo
-        ?.dev
-        ?.creator_address ||
-        null,
-
+      traders,
+      tokenInfo,
       address
     );
 
@@ -3128,252 +3376,374 @@ async function scan(
   ) {
     return {
       tokenInfo,
+
       wallets: [],
 
       note:
-        "Top traders were found, but all candidates were filtered as bots/devs/pools/transfer-only wallets.",
+        "No suitable trader candidates remained after the bot/dev/junk filter.",
     };
   }
 
-  const wallets =
-    candidates.map(
-      (x) =>
-        x.trader.address
-    );
+  // Store submitted-token observations.
+  // This costs zero extra API requests.
+  for (
+    const candidate
+    of candidates
+  ) {
+    saveObservation(
+      candidate
+        .trader
+        .address,
 
-  await onProgress?.(
-    "30d-start",
-    wallets.length
+      address,
+
+      candidate.token
+    );
+  }
+
+  // ==========================================================
+  // STAGE 1 — 30D
+  // ==========================================================
+
+  await progress?.(
+    `📊 ${short(address)} — 30d consistency checks: 0/${candidates.length}...`
   );
 
-  const raw30 =
-    await getWalletStats(
-      wallets,
-      "30d",
+  const thirtyDaySurvivors = [];
 
-      async (
-        period,
-        done,
-        total
-      ) => {
-        await onProgress?.(
-          "stats",
-          period,
-          done,
-          total
-        );
-      }
-    );
-
-  await onProgress?.(
-    "7d-start",
-    wallets.length
-  );
-
-  const raw7 =
-    await getWalletStats(
-      wallets,
-      "7d",
-
-      async (
-        period,
-        done,
-        total
-      ) => {
-        await onProgress?.(
-          "stats",
-          period,
-          done,
-          total
-        );
-      }
-    );
-
-  await onProgress?.(
-    "scoring"
-  );
-
-  const results = [];
+  let done30 = 0;
 
   for (
     const candidate
     of candidates
   ) {
-    const trader =
-      candidate.trader;
-
     const wallet =
-      trader.address;
+      candidate
+        .trader
+        .address;
 
-    const s30 =
-      parseStats(
-        raw30[wallet]
-      );
-
-    const s7 =
-      parseStats(
-        raw7[wallet]
-      );
-
-    if (
-      !hasStats(s30) &&
-      !hasStats(s7)
-    ) {
-      continue;
-    }
-
-    const botReason =
-      statsExclusion(
-        s7,
-        s30
-      );
-
-    if (botReason) {
-      blacklist(
-        wallet,
-        botReason,
-        14
-      );
-
-      continue;
-    }
-
-    const mergedTags = [
-      ...new Set([
-        ...tagsOf(
-          trader
-        ),
-
-        ...statsTags(
-          s7.common
-        ),
-
-        ...statsTags(
-          s30.common
-        ),
-      ]),
-    ];
-
-    const badTag =
-      mergedTags.find(
-        (x) =>
-          EXCLUDE_TAGS.has(
-            x
-          )
-      );
-
-    if (badTag) {
-      if (
-        [
-          "dex_bot",
-          "rat_trader",
-          "bundler",
-        ].includes(
-          badTag
-        )
-      ) {
-        blacklist(
+    try {
+      const {
+        data,
+        cached,
+      } =
+        await getStatsOne(
           wallet,
-          `stats tag:${badTag}`,
-          30
+          "30d"
         );
+
+      const s30 =
+        parseStats(
+          data
+        );
+
+      const exclusion =
+        statsExclusion(
+          s30,
+          data
+        );
+
+      if (exclusion) {
+        if (
+          /arbitrager|dex_bot|rat_trader|bundler|mev_bot|bot-like/
+            .test(
+              exclusion
+            )
+        ) {
+          blacklist(
+            wallet,
+            exclusion,
+            14
+          );
+        }
+
+      } else {
+        const row = {
+          ...candidate,
+
+          wallet,
+
+          raw30:
+            data,
+
+          s30,
+
+          track30:
+            trackScore(
+              s30
+            ),
+
+          history:
+            observationSummary(
+              wallet,
+              address
+            ),
+        };
+
+        if (
+          passes30d(
+            row
+          )
+        ) {
+          thirtyDaySurvivors.push(
+            row
+          );
+        }
       }
 
-      continue;
-    }
+      done30 += 1;
 
-    const token =
-      tokenPerformance(
-        trader,
-        tokenInfo
+      await progress?.(
+        `📊 ${short(address)} — 30d consistency ${done30}/${candidates.length} • ${thirtyDaySurvivors.length} survived${cached ? " • cache" : ""}`
       );
 
-    const track30 =
-      trackScore(
-        s30
+    } catch (error) {
+      if (
+        isRateLimitError(
+          error
+        )
+      ) {
+        throw error;
+      }
+
+      done30 += 1;
+
+      console.warn(
+        `30d failed for ${wallet}:`,
+        error.message ||
+          error
       );
 
-    const track7 =
-      hasStats(s7)
-        ? trackScore(
-            s7
-          )
-        : Math.round(
-            track30 *
-            0.65
-          );
-
-    const behavior =
-      behaviorScore(
-        s7,
-        s30
-      );
-
-    const history =
-      observationSummary(
-        wallet,
-        address
-      );
-
-    const discovery =
-      discoveryScore(
-        history
-      );
-
-    const overall =
-      overallScore(
-        track30,
-        track7,
-        token.score,
-        behavior,
-        discovery,
-        candidate.previousSeen,
-        history.observations
-      );
-
-    // Researched wallets improve our free local history.
-    // This does NOT trigger the SEEN label.
-    saveObservation(
-      wallet,
-      address,
-      token
-    );
-
-    const row = {
-      wallet,
-      trader,
-      s30,
-      s7,
-      token,
-      track30,
-      track7,
-      behavior,
-      discovery,
-      history,
-
-      previousSeen:
-        candidate.previousSeen,
-
-      overall,
-    };
-
-    row.labels =
-      labelsFor(
-        row
-      );
-
-    if (
-      qualifies(
-        row
-      )
-    ) {
-      results.push(
-        row
+      await progress?.(
+        `📊 ${short(address)} — 30d consistency ${done30}/${candidates.length} • ${thirtyDaySurvivors.length} survived`
       );
     }
   }
 
-  results.sort(
+  if (
+    !thirtyDaySurvivors.length
+  ) {
+    return {
+      tokenInfo,
+
+      wallets: [],
+
+      note:
+        "0 wallets met the 30d consistency criteria.",
+    };
+  }
+
+  // Consistency comes first.
+  thirtyDaySurvivors.sort(
+    (a, b) =>
+      b.track30 -
+        a.track30 ||
+      b.token.score -
+        a.token.score
+  );
+
+  // Only the strongest 30d wallets cost us a 7d request.
+  const recentCandidates =
+    thirtyDaySurvivors.slice(
+      0,
+      MAX_7D_CHECKS
+    );
+
+  // ==========================================================
+  // STAGE 2 — 7D
+  // ==========================================================
+
+  await progress?.(
+    `📈 ${short(address)} — recent-form checks: 0/${recentCandidates.length}...`
+  );
+
+  const recentSurvivors = [];
+
+  let done7 = 0;
+
+  for (
+    const row
+    of recentCandidates
+  ) {
+    try {
+      const {
+        data,
+        cached,
+      } =
+        await getStatsOne(
+          row.wallet,
+          "7d"
+        );
+
+      row.raw7 =
+        data;
+
+      row.s7 =
+        parseStats(
+          data
+        );
+
+      row.track7 =
+        trackScore(
+          row.s7
+        );
+
+      row.behavior =
+        behaviorScore(
+          row.s7,
+          row.s30
+        );
+
+      row.preScore =
+        preActivityScore(
+          row
+        );
+
+      if (
+        passes7d(
+          row
+        )
+      ) {
+        recentSurvivors.push(
+          row
+        );
+      }
+
+      done7 += 1;
+
+      await progress?.(
+        `📈 ${short(address)} — 7d form ${done7}/${recentCandidates.length} • ${recentSurvivors.length} survived${cached ? " • cache" : ""}`
+      );
+
+    } catch (error) {
+      if (
+        isRateLimitError(
+          error
+        )
+      ) {
+        throw error;
+      }
+
+      done7 += 1;
+
+      console.warn(
+        `7d failed for ${row.wallet}:`,
+        error.message ||
+          error
+      );
+
+      await progress?.(
+        `📈 ${short(address)} — 7d form ${done7}/${recentCandidates.length} • ${recentSurvivors.length} survived`
+      );
+    }
+  }
+
+  if (
+    !recentSurvivors.length
+  ) {
+    return {
+      tokenInfo,
+
+      wallets: [],
+
+      note:
+        "0 wallets met both the 30d consistency and recent-form criteria.",
+    };
+  }
+
+  recentSurvivors.sort(
+    (a, b) =>
+      b.preScore -
+      a.preScore
+  );
+
+  // Only these wallets get an activity request.
+  const deepCandidates =
+    recentSurvivors.slice(
+      0,
+      MAX_ACTIVITY_CHECKS
+    );
+
+  // ==========================================================
+  // STAGE 3 — EARLY-ENTRY / ACTIVITY
+  // ==========================================================
+
+  await progress?.(
+    `🧭 ${short(address)} — early-entry checks: 0/${deepCandidates.length}...`
+  );
+
+  const finalists = [];
+
+  let doneActivity = 0;
+
+  for (
+    const row
+    of deepCandidates
+  ) {
+    try {
+      const {
+        data,
+        cached,
+      } =
+        await getActivityOne(
+          row.wallet
+        );
+
+      row.activity =
+        analyseActivity(
+          data
+        );
+
+      row.overall =
+        finalScore(
+          row
+        );
+
+      row.labels =
+        labelsFor(
+          row
+        );
+
+      if (
+        qualifiesFinal(
+          row
+        )
+      ) {
+        finalists.push(
+          row
+        );
+      }
+
+      doneActivity += 1;
+
+      await progress?.(
+        `🧭 ${short(address)} — early-entry ${doneActivity}/${deepCandidates.length} • ${finalists.length} qualified${cached ? " • cache" : ""}`
+      );
+
+    } catch (error) {
+      if (
+        isRateLimitError(
+          error
+        )
+      ) {
+        throw error;
+      }
+
+      doneActivity += 1;
+
+      console.warn(
+        `Activity failed for ${row.wallet}:`,
+        error.message ||
+          error
+      );
+
+      await progress?.(
+        `🧭 ${short(address)} — early-entry ${doneActivity}/${deepCandidates.length} • ${finalists.length} qualified`
+      );
+    }
+  }
+
+  finalists.sort(
     (a, b) =>
       b.overall -
       a.overall
@@ -3383,16 +3753,18 @@ async function scan(
     tokenInfo,
 
     wallets:
-      results,
+      finalists,
 
     note:
-      results.length
+      finalists.length
         ? null
-        : "Traders were found, but none passed the multi-token consistency filters.",
+        : "0 wallets met the full consistency + early-entry criteria.",
   };
 }
 
-// ========================= DISCORD FORMAT =========================
+// ============================================================
+// DISCORD FORMATTING
+// ============================================================
 
 function fmtUsd(value) {
   const n =
@@ -3414,25 +3786,32 @@ function fmtUsd(value) {
   const a =
     Math.abs(n);
 
-  const body =
+  if (
     a >= 1e6
-      ? `$${(
-          a /
-          1e6
-        ).toFixed(1)}M`
+  ) {
+    return (
+      `${sign}$` +
+      `${(
+        a / 1e6
+      ).toFixed(1)}M`
+    );
+  }
 
-      : a >= 1e3
-        ? `$${(
-            a /
-            1e3
-          ).toFixed(1)}K`
+  if (
+    a >= 1e3
+  ) {
+    return (
+      `${sign}$` +
+      `${(
+        a / 1e3
+      ).toFixed(1)}K`
+    );
+  }
 
-        : `$${a.toFixed(
-            0
-          )}`;
-
-  return sign +
-    body;
+  return (
+    `${sign}$` +
+    `${a.toFixed(0)}`
+  );
 }
 
 function fmtPct(
@@ -3448,50 +3827,17 @@ function fmtPct(
     return "N/A";
   }
 
-  const pct =
+  const p =
     n * 100;
 
   return (
     `${
       signed &&
-      pct > 0
+      p > 0
         ? "+"
         : ""
-    }${pct.toFixed(0)}%`
+    }${p.toFixed(0)}%`
   );
-}
-
-function fmtPrice(value) {
-  const n =
-    Number(value);
-
-  if (
-    !Number.isFinite(n) ||
-    n <= 0
-  ) {
-    return "N/A";
-  }
-
-  if (
-    n <
-    0.000001
-  ) {
-    return `$${n.toExponential(
-      2
-    )}`;
-  }
-
-  if (
-    n < 0.01
-  ) {
-    return `$${n.toPrecision(
-      3
-    )}`;
-  }
-
-  return `$${n.toFixed(
-    4
-  )}`;
 }
 
 function fmtHold(seconds) {
@@ -3508,36 +3854,41 @@ function fmtHold(seconds) {
   if (
     n < 60
   ) {
-    return `${Math.round(
-      n
-    )}s`;
+    return (
+      `${Math.round(n)}s`
+    );
   }
 
   if (
     n < 3600
   ) {
-    return `${Math.round(
-      n /
-      60
-    )}m`;
+    return (
+      `${Math.round(
+        n / 60
+      )}m`
+    );
   }
 
   if (
     n < 86400
   ) {
-    return `${(
-      n /
-      3600
-    ).toFixed(1)}h`;
+    return (
+      `${(
+        n / 3600
+      ).toFixed(1)}h`
+    );
   }
 
-  return `${(
-    n /
-    86400
-  ).toFixed(1)}d`;
+  return (
+    `${(
+      n / 86400
+    ).toFixed(1)}d`
+  );
 }
 
-function positionStatus(token) {
+function positionStatus(
+  token
+) {
   if (
     token.soldPct >=
     0.95
@@ -3546,8 +3897,7 @@ function positionStatus(token) {
   }
 
   if (
-    token.soldPct >
-    0
+    token.soldPct > 0
   ) {
     return (
       `holding ${
@@ -3562,14 +3912,11 @@ function positionStatus(token) {
     );
   }
 
-  if (
-    token.buyCount >
-    0
-  ) {
-    return "holding";
-  }
-
-  return "position unclear";
+  return (
+    token.buyCount > 0
+      ? "holding"
+      : "position unclear"
+  );
 }
 
 function walletField(
@@ -3583,24 +3930,17 @@ function walletField(
           .test(x)
     );
 
-  const profiles =
+  const profile =
     row.labels.filter(
       (x) =>
         !/^[♻️🆕⚡⚠️]/u
           .test(x)
     );
 
-  const heading = [
-    `${rank}. ${short(
-      row.wallet
-    )} [${row.overall}/100]`,
+  const activity =
+    row.activity;
 
-    ...flags,
-  ].join(
-    " • "
-  );
-
-  const tokenParts = [
+  const thisToken = [
     `${fmtUsd(
       row.token.realized
     )} realized`,
@@ -3622,22 +3962,11 @@ function walletField(
   ];
 
   if (
-    row.token.avgCost >
-    0
-  ) {
-    tokenParts.push(
-      `entry ${fmtPrice(
-        row.token.avgCost
-      )}`
-    );
-  }
-
-  if (
     row.token
       .entryDelaySec !==
     null
   ) {
-    tokenParts.push(
+    thisToken.push(
       `${fmtHold(
         row.token
           .entryDelaySec
@@ -3645,81 +3974,96 @@ function walletField(
     );
   }
 
-  const lines = [
-    `\`${row.wallet}\``,
+  const earlyLine =
+    activity.pairedTokens
+      ? (
+          `${fmtPct(
+            activity
+              .upside15Rate
+          )} caught 1.5x+ upside` +
 
-    `**This token:** ${
-      tokenParts.join(
-        " | "
-      )
-    }`,
+          ` | ${activity.pairedTokens} sampled tokens` +
 
-    `**30d:** ${
-      fmtPct(
-        row.s30.winrate
-      )
-    } WR | ${
-      fmtPct(
-        row.s30.roi,
-        true
-      )
-    } (${
-      fmtUsd(
-        row.s30
-          .realizedProfit
-      )
-    }) | ${
-      row.s30.tokenNum
-    } tokens | avg hold ${
-      fmtHold(
-        row.s30
-          .avgHoldSec
-      )
-    }`,
+          ` | median hold ${fmtHold(
+            activity
+              .medianHoldSec
+          )}`
+        )
 
-    `**7d:** ${
-      hasStats(
-        row.s7
-      )
-        ? `${
-            fmtPct(
-              row.s7.winrate
-            )
-          } WR | ${
-            fmtPct(
-              row.s7.roi,
-              true
-            )
-          } (${
-            fmtUsd(
-              row.s7
-                .realizedProfit
-            )
-          }) | ${
-            row.s7.tokenNum
-          } tokens`
-
-        : "no recent stats"
-    }`,
-
-    `**Profile:** ${
-      profiles.length
-        ? profiles.join(
-            " • "
-          )
-        : "MIXED PROFILE"
-    }`,
-  ];
+      : "limited recent buy/sell pairs";
 
   return {
     name:
-      heading.slice(
+      (
+        `${rank}. ${short(
+          row.wallet
+        )} [${row.overall}/100]` +
+
+        (
+          flags.length
+            ? ` • ${flags.join(" • ")}`
+            : ""
+        )
+      ).slice(
         0,
         256
       ),
 
     value:
-      lines
+      [
+        `\`${row.wallet}\``,
+
+        `**This token:** ${thisToken.join(" | ")}`,
+
+        (
+          `**30d:** ${fmtPct(
+            row.s30.winrate
+          )} WR` +
+
+          ` | ${fmtPct(
+            row.s30.roi,
+            true
+          )} (${fmtUsd(
+            row.s30
+              .realizedProfit
+          )})` +
+
+          ` | ${row.s30.tokenNum} tokens` +
+
+          ` | avg hold ${fmtHold(
+            row.s30
+              .avgHoldSec
+          )}`
+        ),
+
+        (
+          `**7d:** ${fmtPct(
+            row.s7.winrate
+          )} WR` +
+
+          ` | ${fmtPct(
+            row.s7.roi,
+            true
+          )} (${fmtUsd(
+            row.s7
+              .realizedProfit
+          )})` +
+
+          ` | ${row.s7.tokenNum} tokens`
+        ),
+
+        `**Early behavior:** ${earlyLine}`,
+
+        (
+          `**Profile:** ${
+            profile.length
+              ? profile.join(
+                  " • "
+                )
+              : "STRONG MULTI-TOKEN HISTORY"
+          }`
+        ),
+      ]
         .join("\n")
         .slice(
           0,
@@ -3733,34 +4077,37 @@ function buildEmbeds(
   result
 ) {
   const symbol =
-    result.tokenInfo
+    result
+      .tokenInfo
       ?.symbol
       ? String(
-          result.tokenInfo
+          result
+            .tokenInfo
             .symbol
         )
       : null;
 
   const tokenLabel =
     symbol
-      ? `${symbol} • ${short(
-          address
-        )} (SOL)`
-      : `${short(
-          address
-        )} (SOL)`;
+      ? `${symbol} • ${short(address)} (SOL)`
+      : `${short(address)} (SOL)`;
 
   if (
-    result.note
+    !result.wallets.length
   ) {
     return [
       new EmbedBuilder()
+
         .setTitle(
           "🎯 Top wallets to track"
         )
 
         .setDescription(
-          `Token: \`${tokenLabel}\`\n${result.note}`
+          `Token: \`${tokenLabel}\`\n\n` +
+          `${
+            result.note ||
+            "0 wallets met the criteria."
+          }`
         )
 
         .setColor(
@@ -3769,98 +4116,106 @@ function buildEmbeds(
     ];
   }
 
-  const pages =
-    chunk(
-      result.wallets,
-      6
-    );
+  const embeds = [];
 
-  return pages.map(
-    (
-      wallets,
-      page
-    ) => {
-      const embed =
-        new EmbedBuilder()
-
-          .setTitle(
-            pages.length > 1
-              ? `🎯 Top wallets to track — ${page + 1}/${pages.length}`
-              : "🎯 Top wallets to track"
-          )
-
-          .setDescription(
-            `Token: \`${tokenLabel}\`\n` +
-
-            `${
-              result.wallets.length
-            } wallet${
-              result.wallets.length === 1
-                ? ""
-                : "s"
-            } qualified.`
-          )
-
-          .setColor(
-            0x00c853
-          );
-
-      wallets.forEach(
-        (
-          row,
-          i
-        ) => {
-          embed.addFields(
-            walletField(
-              row,
-
-              page *
-                6 +
-                i +
-                1
-            )
-          );
-        }
+  for (
+    let i = 0;
+    i <
+    result.wallets.length;
+    i += 5
+  ) {
+    const page =
+      result.wallets.slice(
+        i,
+        i + 5
       );
 
-      return embed;
-    }
-  );
+    const embed =
+      new EmbedBuilder()
+
+        .setTitle(
+          result.wallets.length >
+            5
+            ? (
+                "🎯 Top wallets to track — " +
+                `${Math.floor(i / 5) + 1}/` +
+                `${Math.ceil(result.wallets.length / 5)}`
+              )
+            : "🎯 Top wallets to track"
+        )
+
+        .setDescription(
+          `Token: \`${tokenLabel}\`\n` +
+
+          `${result.wallets.length} wallet${
+            result.wallets.length === 1
+              ? ""
+              : "s"
+          } met the full tracking criteria.`
+        )
+
+        .setColor(
+          0x00c853
+        );
+
+    page.forEach(
+      (
+        row,
+        j
+      ) => {
+        embed.addFields(
+          walletField(
+            row,
+            i + j + 1
+          )
+        );
+      }
+    );
+
+    embeds.push(
+      embed
+    );
+  }
+
+  return embeds;
 }
 
 async function sendResult(
-  statusMessage,
+  status,
   sourceMessage,
   address,
   result
 ) {
-  const groups =
-    chunk(
-      buildEmbeds(
-        address,
-        result
-      ),
-      10
+  const embeds =
+    buildEmbeds(
+      address,
+      result
     );
 
-  await statusMessage.edit({
-    content: "",
-    embeds: groups[0],
+  await status.edit({
+    content:
+      "",
+
+    embeds: [
+      embeds[0],
+    ],
   });
 
   for (
     let i = 1;
-    i < groups.length;
+    i <
+    embeds.length;
     i++
   ) {
     await sourceMessage.reply({
-      embeds:
-        groups[i],
+      embeds: [
+        embeds[i],
+      ],
     });
   }
 
-  // SEEN counts only wallets actually
-  // returned to you in Discord.
+  // SEEN only counts wallets that were
+  // actually shown in Discord.
   for (
     const row
     of result.wallets
@@ -3873,13 +4228,17 @@ async function sendResult(
   }
 }
 
-// ========================= DISCORD / SCAN QUEUE =========================
+// ============================================================
+// DISCORD
+// ============================================================
 
 const client =
   new Client({
     intents: [
       GatewayIntentBits.Guilds,
+
       GatewayIntentBits.GuildMessages,
+
       GatewayIntentBits.MessageContent,
     ],
   });
@@ -3893,20 +4252,19 @@ const queuedAddresses =
 let scanQueue =
   Promise.resolve();
 
-function getCachedResult(address) {
+function getResultCache(
+  address
+) {
   const row =
     resultCache.get(
       address
     );
 
-  if (!row) {
-    return null;
-  }
-
   if (
+    !row ||
     Date.now() -
       row.at >
-    RESULT_CACHE_MS
+      CACHE_RESULT_MS
   ) {
     resultCache.delete(
       address
@@ -3918,13 +4276,12 @@ function getCachedResult(address) {
   return row.result;
 }
 
-function putCachedResult(
+function putResultCache(
   address,
   result
 ) {
   resultCache.set(
     address,
-
     {
       at:
         Date.now(),
@@ -3946,11 +4303,9 @@ function putCachedResult(
   }
 }
 
-function queueScan(fn) {
+function enqueueScan(fn) {
   const job =
-    scanQueue.then(
-      fn
-    );
+    scanQueue.then(fn);
 
   scanQueue =
     job.catch(
@@ -3960,86 +4315,22 @@ function queueScan(fn) {
   return job;
 }
 
-function makeProgressUpdater(
-  status,
-  address
+function makeProgress(
+  status
 ) {
-  let lastText = "";
+  let last = "";
 
   return async (
-    stage,
-    a,
-    b,
-    c
+    text
   ) => {
-    let text;
-
     if (
-      stage ===
-      "token-info"
-    ) {
-      text =
-        `🔎 ${short(address)} — checking token info...`;
-
-    } else if (
-      stage ===
-      "top-traders"
-    ) {
-      text =
-        `🔎 ${short(address)} — finding top traders...`;
-
-    } else if (
-      stage ===
-      "discovery-cache"
-    ) {
-      text =
-        `⚡ ${short(address)} — using cached token/trader data...`;
-
-    } else if (
-      stage ===
-      "30d-start"
-    ) {
-      text =
-        `📊 ${short(address)} — checking 30d history for ${a} candidates...`;
-
-    } else if (
-      stage ===
-      "7d-start"
-    ) {
-      text =
-        `📈 ${short(address)} — checking 7d history for ${a} candidates...`;
-
-    } else if (
-      stage ===
-      "stats"
-    ) {
-      text =
-        `${
-          a === "30d"
-            ? "📊"
-            : "📈"
-        } ${short(address)} — ${a} history ${b}/${c}...`;
-
-    } else if (
-      stage ===
-      "scoring"
-    ) {
-      text =
-        `🧠 ${short(address)} — scoring wallets...`;
-
-    } else {
-      return;
-    }
-
-    if (
-      text ===
-      lastText
+      !text ||
+      text === last
     ) {
       return;
     }
 
-    lastText =
-      text;
+    last = text;
 
     await status
       .edit({
@@ -4071,11 +4362,13 @@ client.once(
     );
 
     console.log(
-      `GMGN minimum request gap: ${MIN_GMGN_GAP_MS}ms`
+      `MAX_CANDIDATES=${MAX_CANDIDATES}, ` +
+      `MAX_7D_CHECKS=${MAX_7D_CHECKS}, ` +
+      `MAX_ACTIVITY_CHECKS=${MAX_ACTIVITY_CHECKS}`
     );
 
     console.log(
-      `GMGN weighted limiter: ${RATE_UNITS_PER_SEC} units/s, capacity ${RATE_CAPACITY}`
+      `GMGN minimum request gap: ${MIN_GMGN_GAP_MS}ms`
     );
 
     if (
@@ -4083,11 +4376,10 @@ client.once(
       Date.now()
     ) {
       console.log(
-        `GMGN stored cooldown active until ${
-          new Date(
-            gmgnBlockedUntil
-          ).toISOString()
-        }`
+        "Stored GMGN cooldown until " +
+        new Date(
+          gmgnBlockedUntil
+        ).toISOString()
       );
     }
   }
@@ -4121,36 +4413,36 @@ client.on(
     }
 
     const cached =
-      getCachedResult(
+      getResultCache(
         address
       );
 
     if (cached) {
-      const groups =
-        chunk(
-          buildEmbeds(
-            address,
-            cached
-          ),
-          10
+      const embeds =
+        buildEmbeds(
+          address,
+          cached
         );
 
       await message.reply({
         content:
-          "⚡ Recently scanned CA — using cached results (no new GMGN requests).",
+          "⚡ Recently scanned CA — cached result, no new GMGN requests.",
 
-        embeds:
-          groups[0],
+        embeds: [
+          embeds[0],
+        ],
       });
 
       for (
         let i = 1;
-        i < groups.length;
+        i <
+        embeds.length;
         i++
       ) {
         await message.reply({
-          embeds:
-            groups[i],
+          embeds: [
+            embeds[i],
+          ],
         });
       }
 
@@ -4175,18 +4467,15 @@ client.on(
 
     const status =
       await message.reply(
-        `🔎 Detected Solana CA \`${short(
-          address
-        )}\`. Queued for a slow, rate-limit-safe scan...`
+        `🔎 Detected \`${short(address)}\`. Starting quality-first wallet scan...`
       );
 
-    queueScan(
+    enqueueScan(
       async () => {
         try {
           const progress =
-            makeProgressUpdater(
-              status,
-              address
+            makeProgress(
+              status
             );
 
           const result =
@@ -4195,7 +4484,7 @@ client.on(
               progress
             );
 
-          putCachedResult(
+          putResultCache(
             address,
             result
           );
@@ -4215,7 +4504,9 @@ client.on(
           const raw =
             error instanceof Error
               ? error.message
-              : String(error);
+              : String(
+                  error
+                );
 
           let text =
             raw;
@@ -4255,12 +4546,12 @@ client.on(
 
             text =
               "GMGN rate-limited the scan. " +
-              "I stopped immediately and saved any wallet stats already completed." +
+              "I stopped immediately; successful wallet checks are cached." +
 
               (
                 seconds
                   ? ` Retry this CA in about ${seconds}s.`
-                  : " Retry after the GMGN cooldown clears."
+                  : " Retry after the cooldown clears."
               );
           }
 
@@ -4288,7 +4579,9 @@ client.on(
   }
 );
 
-// ========================= STARTUP =========================
+// ============================================================
+// STARTUP
+// ============================================================
 
 function requireEnv(name) {
   const value =
@@ -4320,14 +4613,8 @@ function requireEnv(name) {
       "DISCORD_CHANNEL_ID"
     );
 
-    /*
-    Current gmgn-cli supports this environment variable.
-
-    Setting it to 0 means gmgn-cli won't sit there
-    and automatically make another request after a 429.
-
-    We want OUR bot to control the cooldown.
-    */
+    // Don't let gmgn-cli retry a 429
+    // behind our own rate limiter.
     if (
       process.env
         .GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS ===
