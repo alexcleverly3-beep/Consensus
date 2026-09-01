@@ -337,15 +337,15 @@ db.pragma(
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS wallet_cache (
-    wallet_address TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    data_json TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (
-      wallet_address,
-      kind
-    )
-  );
+  wallet_address TEXT NOT NULL,
+  period TEXT NOT NULL,
+  stats_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (
+    wallet_address,
+    period
+  )
+);
 
   CREATE TABLE IF NOT EXISTS token_cache (
     token_address TEXT PRIMARY KEY,
