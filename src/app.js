@@ -10,19 +10,27 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const { initIntelligence } = require("./intelligence");
 const { createDiscoveryEngine } = require("./discovery-engine");
 const { extractTokenCandidates, shouldScanToken } = require("./market-discovery");
+const { extractBoughtTokens, parseSeedWallets } = require("./seed-discovery");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
+const DEFAULT_SEED_WALLETS = ["CaHbjM1AGhDPBR6JwiNHaUZAJBykqvj9LPxDouxXbiWB"];
+
 const DB_PATH = String(process.env.DB_PATH || path.join(process.cwd(), "data", "wallets.db")).trim();
 const DISCORD_CHANNEL_ID = String(process.env.DISCORD_CHANNEL_ID || "").trim();
 const MIN_GMGN_GAP_MS = clampInt(process.env.GMGN_MIN_REQUEST_GAP_MS, 12000, 3000, 60000);
-const DISCOVERY_INTERVAL_MS = clampInt(process.env.DISCOVERY_INTERVAL_MINUTES, 15, 5, 180) * 60 * 1000;
-const TOKEN_RESCAN_MS = clampInt(process.env.TOKEN_RESCAN_HOURS, 6, 1, 72) * 60 * 60 * 1000;
-const TOKENS_PER_CYCLE = clampInt(process.env.TOKENS_PER_CYCLE, 2, 1, 5);
+const DISCOVERY_INTERVAL_MS = clampInt(process.env.DISCOVERY_INTERVAL_MINUTES, 20, 5, 180) * 60 * 1000;
+const TOKEN_RESCAN_MS = clampInt(process.env.TOKEN_RESCAN_HOURS, 12, 1, 168) * 60 * 60 * 1000;
+const TOKEN_SCANS_PER_CYCLE = clampInt(process.env.TOKENS_PER_CYCLE, 1, 1, 3);
 const TRENDING_LIMIT = clampInt(process.env.TRENDING_LIMIT, 12, 5, 50);
 const CONSENSUS_WALLETS = clampInt(process.env.CONSENSUS_WALLETS, 2, 2, 5);
 const TRUSTED_REPUTATION = clampInt(process.env.TRUSTED_REPUTATION, 65, 40, 95);
 const TRUSTED_CONFIDENCE = clampInt(process.env.TRUSTED_CONFIDENCE, 50, 20, 95);
+const SEED_WALLETS = parseSeedWallets(process.env.SEED_WALLETS, DEFAULT_SEED_WALLETS);
+const SEED_REFRESH_MS = clampInt(process.env.SEED_REFRESH_HOURS, 24, 6, 168) * 60 * 60 * 1000;
+const SEED_ACTIVITY_LIMIT = clampInt(process.env.SEED_ACTIVITY_LIMIT, 100, 20, 100);
+const SEED_TOKEN_LIMIT = clampInt(process.env.SEED_TOKEN_LIMIT, 100, 10, 250);
+const SEED_SCAN_EVERY_CYCLES = clampInt(process.env.SEED_SCAN_EVERY_CYCLES, 2, 1, 12);
 
 function clampInt(value, fallback, min, max) {
   const n = Number(value);
@@ -61,6 +69,25 @@ db.exec(`
     wallet_count INTEGER NOT NULL,
     payload_json TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS seed_wallet_state (
+    wallet_address TEXT PRIMARY KEY,
+    last_refreshed_at INTEGER,
+    last_token_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+  );
+  CREATE TABLE IF NOT EXISTS seed_token_queue (
+    token_address TEXT NOT NULL,
+    source_wallet TEXT NOT NULL,
+    discovered_at INTEGER NOT NULL,
+    activity_at INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER,
+    last_error TEXT,
+    PRIMARY KEY(token_address, source_wallet)
+  );
+  CREATE INDEX IF NOT EXISTS idx_seed_token_queue_status
+    ON seed_token_queue(status, activity_at DESC);
 `);
 
 const getMetaStmt = db.prepare("SELECT value FROM meta WHERE key = ?");
@@ -88,6 +115,40 @@ const putConsensusAlertStmt = db.prepare(`
     sent_at = excluded.sent_at,
     wallet_count = excluded.wallet_count,
     payload_json = excluded.payload_json
+`);
+const getSeedStateStmt = db.prepare("SELECT * FROM seed_wallet_state WHERE wallet_address = ?");
+const putSeedStateStmt = db.prepare(`
+  INSERT INTO seed_wallet_state(wallet_address, last_refreshed_at, last_token_count, last_error)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(wallet_address) DO UPDATE SET
+    last_refreshed_at = excluded.last_refreshed_at,
+    last_token_count = excluded.last_token_count,
+    last_error = excluded.last_error
+`);
+const enqueueSeedTokenStmt = db.prepare(`
+  INSERT INTO seed_token_queue(token_address, source_wallet, discovered_at, activity_at, status)
+  VALUES (?, ?, ?, ?, 'pending')
+  ON CONFLICT(token_address, source_wallet) DO UPDATE SET
+    activity_at = MAX(seed_token_queue.activity_at, excluded.activity_at)
+`);
+const nextSeedTokenStmt = db.prepare(`
+  SELECT * FROM seed_token_queue
+  WHERE status = 'pending'
+  ORDER BY activity_at DESC, discovered_at ASC
+  LIMIT 1
+`);
+const markSeedTokenStmt = db.prepare(`
+  UPDATE seed_token_queue
+  SET status = ?, attempt_count = attempt_count + 1,
+      last_attempt_at = ?, last_error = ?
+  WHERE token_address = ? AND source_wallet = ?
+`);
+const seedQueueCountStmt = db.prepare(`
+  SELECT
+    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+    SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+  FROM seed_token_queue
 `);
 
 function metaNumber(key, fallback = 0) {
@@ -126,9 +187,13 @@ function rawCli(args) {
       env: process.env,
     }, (err, stdout, stderr) => {
       if (err) {
-        const message = [stderr, stdout, err.message].filter(Boolean).map(String).map((x) => x.trim()).filter(Boolean).join("\n");
+        const message = [stderr, stdout, err.message]
+          .filter(Boolean).map(String).map((x) => x.trim()).filter(Boolean).join("\n");
         if (isRateLimitError(message)) {
-          gmgnBlockedUntil = Math.max(gmgnBlockedUntil, (rateLimitReset(message) || Date.now() + 5 * 60 * 1000) + 5000);
+          gmgnBlockedUntil = Math.max(
+            gmgnBlockedUntil,
+            (rateLimitReset(message) || Date.now() + 5 * 60 * 1000) + 5000
+          );
           putMetaStmt.run("gmgn_blocked_until", String(gmgnBlockedUntil));
         }
         reject(new Error(message || "gmgn-cli failed"));
@@ -189,6 +254,13 @@ async function getTrending() {
   ]);
 }
 
+async function getWalletActivity(walletAddress) {
+  return cli([
+    "portfolio", "activity", "--chain", "sol", "--wallet", walletAddress,
+    "--limit", String(SEED_ACTIVITY_LIMIT), "--raw",
+  ]);
+}
+
 const intelligence = initIntelligence(db);
 const engine = createDiscoveryEngine({
   intelligence,
@@ -201,6 +273,7 @@ const engine = createDiscoveryEngine({
 
 let client = null;
 let cycleRunning = false;
+let cycleNumber = metaNumber("discovery_cycle_number", 0);
 
 async function processToken(tokenAddress, source = "autonomous") {
   const state = getTokenStateStmt.get(tokenAddress);
@@ -252,32 +325,114 @@ async function maybeSendConsensus(result) {
   const channel = await client.channels.fetch(DISCORD_CHANNEL_ID).catch(() => null);
   if (!channel?.send) return false;
   await channel.send({ embeds: [consensusEmbed(result)] });
-  putConsensusAlertStmt.run(result.tokenAddress, Date.now(), result.consensus.walletCount, JSON.stringify(result.consensus));
+  putConsensusAlertStmt.run(
+    result.tokenAddress,
+    Date.now(),
+    result.consensus.walletCount,
+    JSON.stringify(result.consensus)
+  );
   return true;
+}
+
+async function refreshOneSeedWallet() {
+  const now = Date.now();
+  const wallet = SEED_WALLETS.find((address) => {
+    const state = getSeedStateStmt.get(address);
+    return !state?.last_refreshed_at || now - state.last_refreshed_at >= SEED_REFRESH_MS;
+  });
+  if (!wallet) return null;
+
+  try {
+    const activity = await getWalletActivity(wallet);
+    const tokens = extractBoughtTokens(activity, { walletAddress: wallet, limit: SEED_TOKEN_LIMIT });
+    const insert = db.transaction((items) => {
+      for (const token of items) {
+        enqueueSeedTokenStmt.run(token.address, wallet, now, token.lastActivityAt || 0);
+      }
+    });
+    insert(tokens);
+    putSeedStateStmt.run(wallet, now, tokens.length, null);
+    console.log(`[seed] ${short(wallet)} refreshed; ${tokens.length} bought tokens available for gradual backfill`);
+    return { wallet, tokenCount: tokens.length };
+  } catch (error) {
+    const message = String(error.message || error).slice(0, 1000);
+    putSeedStateStmt.run(wallet, now, 0, message);
+    if (isRateLimitError(error)) throw error;
+    console.warn(`[seed] ${short(wallet)} refresh failed: ${message}`);
+    return { wallet, tokenCount: 0, error: message };
+  }
+}
+
+async function processOneSeedToken() {
+  const queued = nextSeedTokenStmt.get();
+  if (!queued) return false;
+  const now = Date.now();
+  const state = getTokenStateStmt.get(queued.token_address);
+
+  if (!shouldScanToken(state?.last_scanned_at, now, TOKEN_RESCAN_MS)) {
+    markSeedTokenStmt.run("done", now, null, queued.token_address, queued.source_wallet);
+    return false;
+  }
+
+  try {
+    const result = await processToken(queued.token_address, `seed:${queued.source_wallet}`);
+    markSeedTokenStmt.run("done", Date.now(), null, queued.token_address, queued.source_wallet);
+    await maybeSendConsensus(result);
+    console.log(
+      `[seed] ${short(queued.source_wallet)} -> ${short(queued.token_address)} candidates=${result.candidates?.length || 0} trusted=${result.trusted?.length || 0}`
+    );
+    return true;
+  } catch (error) {
+    const attempts = Number(queued.attempt_count || 0) + 1;
+    const status = attempts >= 3 && !isRateLimitError(error) ? "failed" : "pending";
+    markSeedTokenStmt.run(
+      status,
+      Date.now(),
+      String(error.message || error).slice(0, 1000),
+      queued.token_address,
+      queued.source_wallet
+    );
+    throw error;
+  }
+}
+
+async function processMarketToken() {
+  const trending = await getTrending();
+  const candidates = extractTokenCandidates(trending, { limit: TRENDING_LIMIT });
+  let scanned = 0;
+  for (const candidate of candidates) {
+    if (scanned >= TOKEN_SCANS_PER_CYCLE) break;
+    const state = getTokenStateStmt.get(candidate.address);
+    upsertTokenSeenStmt.run(candidate.address, Date.now(), Date.now());
+    if (!shouldScanToken(state?.last_scanned_at, Date.now(), TOKEN_RESCAN_MS)) continue;
+    const result = await processToken(candidate.address, "autonomous");
+    scanned += 1;
+    await maybeSendConsensus(result);
+    console.log(
+      `[discovery] ${short(candidate.address)} candidates=${result.candidates?.length || 0} trusted=${result.trusted?.length || 0}`
+    );
+  }
+  return scanned;
 }
 
 async function discoveryCycle() {
   if (cycleRunning) return;
   cycleRunning = true;
+  cycleNumber += 1;
+  putMetaStmt.run("discovery_cycle_number", String(cycleNumber));
+
   try {
-    const trending = await getTrending();
-    const candidates = extractTokenCandidates(trending, { limit: TRENDING_LIMIT });
-    let scanned = 0;
-    for (const candidate of candidates) {
-      if (scanned >= TOKENS_PER_CYCLE) break;
-      const state = getTokenStateStmt.get(candidate.address);
-      upsertTokenSeenStmt.run(candidate.address, Date.now(), Date.now());
-      if (!shouldScanToken(state?.last_scanned_at, Date.now(), TOKEN_RESCAN_MS)) continue;
-      try {
-        const result = await processToken(candidate.address, "autonomous");
-        scanned += 1;
-        await maybeSendConsensus(result);
-        console.log(`[discovery] ${short(candidate.address)} candidates=${result.candidates?.length || 0} trusted=${result.trusted?.length || 0}`);
-      } catch (error) {
-        console.warn(`[discovery] ${short(candidate.address)} failed: ${error.message}`);
-        if (isRateLimitError(error)) break;
-      }
+    await refreshOneSeedWallet();
+
+    // Seed history and live market discovery alternate. This prevents a large
+    // historical backfill from starving live discovery while keeping GMGN use bounded.
+    const seedTurn = SEED_WALLETS.length > 0 && cycleNumber % SEED_SCAN_EVERY_CYCLES === 0;
+    if (seedTurn) {
+      const scannedSeed = await processOneSeedToken();
+      if (scannedSeed) return;
     }
+
+    await processMarketToken();
   } catch (error) {
     console.warn(`[discovery] cycle failed: ${error.message}`);
   } finally {
@@ -287,13 +442,20 @@ async function discoveryCycle() {
 
 function statusEmbed() {
   const profiles = intelligence.getTopProfiles({ limit: 10, minObservations: 2 });
+  const queue = seedQueueCountStmt.get() || {};
   const rows = profiles.length
     ? profiles.map((p, i) => `${i + 1}. \`${p.wallet_address}\` — rep **${Math.round(p.reputation_score)}**, conf **${Math.round(p.confidence_score)}**, ${p.distinct_tokens} tokens`).join("\n")
     : "Evidence is still accumulating; no wallet has two distinct observations yet.";
   return new EmbedBuilder()
     .setTitle("🧠 Consensus V1 intelligence")
     .setDescription(rows)
-    .setFooter({ text: `Autonomous discovery every ${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m • max ${TOKENS_PER_CYCLE} new tokens/cycle` })
+    .addFields({
+      name: "Seed backfill",
+      value: `${SEED_WALLETS.length} seed wallet(s) • ${Number(queue.pending || 0)} pending • ${Number(queue.done || 0)} scanned`,
+    })
+    .setFooter({
+      text: `Discovery every ${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m • max ${TOKEN_SCANS_PER_CYCLE} token scan/cycle`,
+    })
     .setTimestamp(new Date());
 }
 
@@ -325,7 +487,9 @@ async function handleMessage(message) {
 
 async function start() {
   if (process.env.DISCORD_TOKEN) {
-    client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+    client = new Client({
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+    });
     client.on("messageCreate", handleMessage);
     client.once("ready", () => console.log(`Consensus V1 logged in as ${client.user?.tag || "Discord bot"}`));
     await client.login(process.env.DISCORD_TOKEN);
@@ -333,6 +497,7 @@ async function start() {
     console.warn("DISCORD_TOKEN is not set; autonomous discovery will run without Discord alerts.");
   }
 
+  console.log(`[startup] ${SEED_WALLETS.length} seed wallet(s); GMGN gap=${MIN_GMGN_GAP_MS}ms; cycle=${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m`);
   await discoveryCycle();
   setInterval(discoveryCycle, DISCOVERY_INTERVAL_MS).unref();
 }
