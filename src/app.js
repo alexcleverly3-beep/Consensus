@@ -1,0 +1,343 @@
+"use strict";
+
+require("dotenv").config();
+
+const fs = require("fs");
+const path = require("path");
+const { execFile } = require("child_process");
+const Database = require("better-sqlite3");
+const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
+const { initIntelligence } = require("./intelligence");
+const { createDiscoveryEngine } = require("./discovery-engine");
+const { extractTokenCandidates, shouldScanToken } = require("./market-discovery");
+
+const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
+const DB_PATH = String(process.env.DB_PATH || path.join(process.cwd(), "data", "wallets.db")).trim();
+const DISCORD_CHANNEL_ID = String(process.env.DISCORD_CHANNEL_ID || "").trim();
+const MIN_GMGN_GAP_MS = clampInt(process.env.GMGN_MIN_REQUEST_GAP_MS, 12000, 3000, 60000);
+const DISCOVERY_INTERVAL_MS = clampInt(process.env.DISCOVERY_INTERVAL_MINUTES, 15, 5, 180) * 60 * 1000;
+const TOKEN_RESCAN_MS = clampInt(process.env.TOKEN_RESCAN_HOURS, 6, 1, 72) * 60 * 60 * 1000;
+const TOKENS_PER_CYCLE = clampInt(process.env.TOKENS_PER_CYCLE, 2, 1, 5);
+const TRENDING_LIMIT = clampInt(process.env.TRENDING_LIMIT, 12, 5, 50);
+const CONSENSUS_WALLETS = clampInt(process.env.CONSENSUS_WALLETS, 2, 2, 5);
+const TRUSTED_REPUTATION = clampInt(process.env.TRUSTED_REPUTATION, 65, 40, 95);
+const TRUSTED_CONFIDENCE = clampInt(process.env.TRUSTED_CONFIDENCE, 50, 20, 95);
+
+function clampInt(value, fallback, min, max) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
+}
+
+function short(address) {
+  return `${String(address).slice(0, 4)}…${String(address).slice(-4)}`;
+}
+
+function findSolAddress(text) {
+  return (String(text || "").match(SOL_ADDR_IN_TEXT) || []).find((x) => SOL_ADDR.test(x)) || null;
+}
+
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
+db.pragma("synchronous = NORMAL");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS token_discovery_state (
+    token_address TEXT PRIMARY KEY,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    last_scanned_at INTEGER,
+    scan_count INTEGER NOT NULL DEFAULT 0,
+    last_candidate_count INTEGER NOT NULL DEFAULT 0,
+    last_consensus_count INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS consensus_alerts (
+    token_address TEXT PRIMARY KEY,
+    sent_at INTEGER NOT NULL,
+    wallet_count INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+  );
+`);
+
+const getMetaStmt = db.prepare("SELECT value FROM meta WHERE key = ?");
+const putMetaStmt = db.prepare(`
+  INSERT INTO meta(key, value) VALUES (?, ?)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`);
+const getTokenStateStmt = db.prepare("SELECT * FROM token_discovery_state WHERE token_address = ?");
+const upsertTokenSeenStmt = db.prepare(`
+  INSERT INTO token_discovery_state(token_address, first_seen_at, last_seen_at)
+  VALUES (?, ?, ?)
+  ON CONFLICT(token_address) DO UPDATE SET last_seen_at = excluded.last_seen_at
+`);
+const markTokenScannedStmt = db.prepare(`
+  UPDATE token_discovery_state
+  SET last_scanned_at = ?, scan_count = scan_count + 1,
+      last_candidate_count = ?, last_consensus_count = ?
+  WHERE token_address = ?
+`);
+const getConsensusAlertStmt = db.prepare("SELECT * FROM consensus_alerts WHERE token_address = ?");
+const putConsensusAlertStmt = db.prepare(`
+  INSERT INTO consensus_alerts(token_address, sent_at, wallet_count, payload_json)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(token_address) DO UPDATE SET
+    sent_at = excluded.sent_at,
+    wallet_count = excluded.wallet_count,
+    payload_json = excluded.payload_json
+`);
+
+function metaNumber(key, fallback = 0) {
+  const n = Number(getMetaStmt.get(key)?.value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+let cliQueue = Promise.resolve();
+let lastCliFinishedAt = 0;
+let gmgnBlockedUntil = metaNumber("gmgn_blocked_until", 0);
+
+function rateLimitReset(message) {
+  const text = String(message || "");
+  const unix = text.match(/(?:x-ratelimit-reset|"?reset_at"?)\s*[:=]\s*"?(\d{10,13})/i);
+  if (unix) {
+    const n = Number(unix[1]);
+    return n < 1e12 ? n * 1000 : n;
+  }
+  const seconds = text.match(/~?(\d+)s remaining/i);
+  return seconds ? Date.now() + Number(seconds[1]) * 1000 : null;
+}
+
+function isRateLimitError(error) {
+  return /RATE_LIMIT_EXCEEDED|RATE_LIMIT_BANNED|IP rate limit exceeded|\b429\b|rate[ _-]?limit/i.test(
+    error instanceof Error ? error.message : String(error || "")
+  );
+}
+
+function rawCli(args) {
+  return new Promise((resolve, reject) => {
+    execFile("gmgn-cli", args, {
+      shell: false,
+      windowsHide: true,
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 60000,
+      env: process.env,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        const message = [stderr, stdout, err.message].filter(Boolean).map(String).map((x) => x.trim()).filter(Boolean).join("\n");
+        if (isRateLimitError(message)) {
+          gmgnBlockedUntil = Math.max(gmgnBlockedUntil, (rateLimitReset(message) || Date.now() + 5 * 60 * 1000) + 5000);
+          putMetaStmt.run("gmgn_blocked_until", String(gmgnBlockedUntil));
+        }
+        reject(new Error(message || "gmgn-cli failed"));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error(`Unparseable gmgn-cli output: ${String(stdout).slice(0, 300)}`));
+      }
+    });
+  });
+}
+
+function cli(args) {
+  for (const arg of args) {
+    if (typeof arg !== "string" || /[;&|`$()<>"'\\\n]/.test(arg)) {
+      return Promise.reject(new Error(`Rejected unsafe CLI arg: ${arg}`));
+    }
+  }
+  const job = cliQueue.then(async () => {
+    if (Date.now() < gmgnBlockedUntil) {
+      throw new Error(`GMGN cooldown active for ${Math.ceil((gmgnBlockedUntil - Date.now()) / 1000)}s`);
+    }
+    const gap = lastCliFinishedAt + MIN_GMGN_GAP_MS - Date.now();
+    if (gap > 0) await new Promise((resolve) => setTimeout(resolve, gap));
+    try {
+      return await rawCli(args);
+    } finally {
+      lastCliFinishedAt = Date.now();
+    }
+  });
+  cliQueue = job.catch(() => {});
+  return job;
+}
+
+async function getTopTraders(address) {
+  const response = await cli([
+    "token", "traders", "--chain", "sol", "--address", address,
+    "--order-by", "profit", "--direction", "desc", "--limit", "100", "--raw",
+  ]);
+  const payload = response?.data ?? response ?? {};
+  const rows = Array.isArray(payload) ? payload : payload.list || response?.list || [];
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function getTokenInfo(address) {
+  const response = await cli(["token", "info", "--chain", "sol", "--address", address, "--raw"]);
+  return response?.data ?? response ?? {};
+}
+
+async function getTrending() {
+  return cli([
+    "market", "trending", "--chain", "sol", "--interval", "1h",
+    "--min-liquidity", "10000", "--min-marketcap", "50000",
+    "--max-insider-rate", "0.35", "--max-bundler-rate", "0.35",
+    "--order-by", "volume", "--limit", String(TRENDING_LIMIT), "--raw",
+  ]);
+}
+
+const intelligence = initIntelligence(db);
+const engine = createDiscoveryEngine({
+  intelligence,
+  maxFreshCalls: 0,
+  maxEnrichments: 0,
+  minTrustedReputation: TRUSTED_REPUTATION,
+  minTrustedConfidence: TRUSTED_CONFIDENCE,
+  minConsensusWallets: CONSENSUS_WALLETS,
+});
+
+let client = null;
+let cycleRunning = false;
+
+async function processToken(tokenAddress, source = "autonomous") {
+  const state = getTokenStateStmt.get(tokenAddress);
+  const now = Date.now();
+  upsertTokenSeenStmt.run(tokenAddress, now, now);
+
+  if (source === "autonomous" && !shouldScanToken(state?.last_scanned_at, now, TOKEN_RESCAN_MS)) {
+    return { skipped: true, reason: "recently-scanned", tokenAddress };
+  }
+
+  const traders = await getTopTraders(tokenAddress);
+  if (!traders.length) {
+    markTokenScannedStmt.run(now, 0, 0, tokenAddress);
+    return { tokenAddress, candidates: [], trusted: [], consensus: null, skipped: false };
+  }
+
+  let tokenInfo = {};
+  try {
+    tokenInfo = await getTokenInfo(tokenAddress);
+  } catch (error) {
+    if (isRateLimitError(error)) throw error;
+    console.warn(`Token info failed for ${short(tokenAddress)}: ${error.message}`);
+  }
+
+  const result = await engine.processToken({ tokenAddress, tokenInfo, traders, source });
+  markTokenScannedStmt.run(now, result.candidates.length, result.trusted.length, tokenAddress);
+  return { ...result, tokenInfo, skipped: false };
+}
+
+function consensusEmbed(result) {
+  const symbol = result.tokenInfo?.symbol ? String(result.tokenInfo.symbol) : short(result.tokenAddress);
+  const wallets = result.consensus.wallets.slice(0, 8).map((wallet) =>
+    `\`${wallet.walletAddress}\` — rep **${wallet.reputation}**, confidence **${wallet.confidence}**, token **${wallet.tokenScore}**`
+  );
+  return new EmbedBuilder()
+    .setTitle(`🧠 Consensus: ${symbol}`)
+    .setDescription(`**${result.consensus.walletCount} trusted wallets** independently appeared among profitable traders.\n\n${wallets.join("\n")}`)
+    .addFields({ name: "Token", value: `\`${result.tokenAddress}\`` })
+    .setFooter({ text: "Consensus V1 • longitudinal wallet evidence" })
+    .setTimestamp(new Date());
+}
+
+async function maybeSendConsensus(result) {
+  if (!result?.consensus || !client || !DISCORD_CHANNEL_ID) return false;
+  const previous = getConsensusAlertStmt.get(result.tokenAddress);
+  if (previous && Date.now() - previous.sent_at < 24 * 60 * 60 * 1000 && previous.wallet_count >= result.consensus.walletCount) {
+    return false;
+  }
+  const channel = await client.channels.fetch(DISCORD_CHANNEL_ID).catch(() => null);
+  if (!channel?.send) return false;
+  await channel.send({ embeds: [consensusEmbed(result)] });
+  putConsensusAlertStmt.run(result.tokenAddress, Date.now(), result.consensus.walletCount, JSON.stringify(result.consensus));
+  return true;
+}
+
+async function discoveryCycle() {
+  if (cycleRunning) return;
+  cycleRunning = true;
+  try {
+    const trending = await getTrending();
+    const candidates = extractTokenCandidates(trending, { limit: TRENDING_LIMIT });
+    let scanned = 0;
+    for (const candidate of candidates) {
+      if (scanned >= TOKENS_PER_CYCLE) break;
+      const state = getTokenStateStmt.get(candidate.address);
+      upsertTokenSeenStmt.run(candidate.address, Date.now(), Date.now());
+      if (!shouldScanToken(state?.last_scanned_at, Date.now(), TOKEN_RESCAN_MS)) continue;
+      try {
+        const result = await processToken(candidate.address, "autonomous");
+        scanned += 1;
+        await maybeSendConsensus(result);
+        console.log(`[discovery] ${short(candidate.address)} candidates=${result.candidates?.length || 0} trusted=${result.trusted?.length || 0}`);
+      } catch (error) {
+        console.warn(`[discovery] ${short(candidate.address)} failed: ${error.message}`);
+        if (isRateLimitError(error)) break;
+      }
+    }
+  } catch (error) {
+    console.warn(`[discovery] cycle failed: ${error.message}`);
+  } finally {
+    cycleRunning = false;
+  }
+}
+
+function statusEmbed() {
+  const profiles = intelligence.getTopProfiles({ limit: 10, minObservations: 2 });
+  const rows = profiles.length
+    ? profiles.map((p, i) => `${i + 1}. \`${p.wallet_address}\` — rep **${Math.round(p.reputation_score)}**, conf **${Math.round(p.confidence_score)}**, ${p.distinct_tokens} tokens`).join("\n")
+    : "Evidence is still accumulating; no wallet has two distinct observations yet.";
+  return new EmbedBuilder()
+    .setTitle("🧠 Consensus V1 intelligence")
+    .setDescription(rows)
+    .setFooter({ text: `Autonomous discovery every ${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m • max ${TOKENS_PER_CYCLE} new tokens/cycle` })
+    .setTimestamp(new Date());
+}
+
+async function handleMessage(message) {
+  if (message.author?.bot) return;
+  if (DISCORD_CHANNEL_ID && message.channelId !== DISCORD_CHANNEL_ID) return;
+  const text = String(message.content || "").trim();
+  if (/^!?status$/i.test(text) || /^!?consensus$/i.test(text)) {
+    await message.reply({ embeds: [statusEmbed()] });
+    return;
+  }
+  const address = findSolAddress(text);
+  if (!address) return;
+  const progress = await message.reply(`🔎 Scanning ${short(address)} with the V1 evidence engine…`);
+  try {
+    const result = await processToken(address, "manual");
+    if (result.consensus) {
+      await progress.edit({ content: "", embeds: [consensusEmbed(result)] });
+      await maybeSendConsensus(result);
+    } else {
+      await progress.edit(
+        `🧠 ${short(address)}: saved evidence from **${result.candidates?.length || 0}** promising traders; **${result.trusted?.length || 0}** currently meet trusted-wallet thresholds. The database keeps this evidence for future consensus.`
+      );
+    }
+  } catch (error) {
+    await progress.edit(`Scan failed: ${String(error.message || error).slice(0, 1500)}`);
+  }
+}
+
+async function start() {
+  if (process.env.DISCORD_TOKEN) {
+    client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+    client.on("messageCreate", handleMessage);
+    client.once("ready", () => console.log(`Consensus V1 logged in as ${client.user?.tag || "Discord bot"}`));
+    await client.login(process.env.DISCORD_TOKEN);
+  } else {
+    console.warn("DISCORD_TOKEN is not set; autonomous discovery will run without Discord alerts.");
+  }
+
+  await discoveryCycle();
+  setInterval(discoveryCycle, DISCOVERY_INTERVAL_MS).unref();
+}
+
+start().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
