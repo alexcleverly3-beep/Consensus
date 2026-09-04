@@ -15,6 +15,13 @@ if (process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS === undefined) {
 // Install before app.js captures child_process.execFile. This gives every GMGN
 // path (market, trader, token-info, and seed history) one shared rolling budget,
 // plus exact-request caching and in-flight deduplication.
-require("./gmgn-runtime-guard").install();
+const gmgnGuard = require("./gmgn-runtime-guard").install();
+
+// Budget diagnostics only read in-memory guard counters; they never make GMGN
+// requests. Railway logs now expose whether caching is saving calls and whether
+// the configured request ceiling is being approached or exhausted.
+require("./runtime-diagnostics")
+  .createRuntimeDiagnostics({ gmgnGuard })
+  .start();
 
 require("./app");
