@@ -9,14 +9,16 @@ function num(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function confidenceFromEvidence(observations, distinctTokens, positiveSignals) {
-  const sample = clamp(Math.log2(1 + observations) / 5, 0, 1);
-  const breadth = clamp(Math.log2(1 + distinctTokens) / 5, 0, 1);
-  const quality = observations > 0
-    ? clamp(positiveSignals / observations, 0, 1)
+function confidenceFromEvidence(evidenceMass, distinctTokens, positiveMass, matureTokens = 0) {
+  const breadth = clamp(Math.log2(1 + distinctTokens) / 4.5, 0, 1);
+  const quality = evidenceMass > 0
+    ? clamp(positiveMass / evidenceMass, 0, 1)
+    : 0;
+  const validation = distinctTokens > 0
+    ? clamp(matureTokens / Math.max(3, distinctTokens), 0, 1)
     : 0;
 
-  const score = Math.round(100 * (0.45 * sample + 0.35 * breadth + 0.20 * quality));
+  const score = Math.round(100 * (0.55 * breadth + 0.25 * quality + 0.20 * validation));
 
   return {
     score,
@@ -111,34 +113,59 @@ function initIntelligence(db) {
       evidence_weight = excluded.evidence_weight
   `);
 
+  // Reputation is deliberately aggregated by token first. Multiple discovery
+  // paths for the same wallet/token are useful provenance, but they are not
+  // independent proof that the wallet repeatedly finds winners.
   const aggregateWallet = db.prepare(`
+    WITH token_rollup AS (
+      SELECT
+        token_address,
+        COUNT(*) AS source_observations,
+        MAX(is_early) AS is_early,
+        MAX(is_profitable) AS is_profitable,
+        MAX(is_bad_token) AS is_bad_token,
+        MAX(CASE WHEN profit_change < -0.5 THEN 1 ELSE 0 END) AS has_large_loss,
+        MAX(evidence_weight) AS token_weight,
+        AVG(CASE WHEN entry_delay_sec IS NOT NULL AND entry_delay_sec >= 0 THEN entry_delay_sec END) AS entry_delay_sec,
+        AVG(CASE WHEN hold_sec IS NOT NULL AND hold_sec >= 0 THEN hold_sec END) AS hold_sec,
+        AVG(token_score) AS discovery_score,
+        MAX(outcome_score) AS outcome_score,
+        MIN(observed_at) AS first_seen_at,
+        MAX(observed_at) AS last_seen_at
+      FROM wallet_evidence
+      WHERE wallet_address = ?
+      GROUP BY token_address
+    ), scored AS (
+      SELECT *,
+        CASE
+          WHEN discovery_score IS NOT NULL AND outcome_score IS NOT NULL THEN discovery_score * 0.35 + outcome_score * 0.65
+          WHEN outcome_score IS NOT NULL THEN outcome_score
+          ELSE discovery_score
+        END AS token_quality
+      FROM token_rollup
+    )
     SELECT
-      COUNT(*) AS observations,
-      COUNT(DISTINCT token_address) AS distinct_tokens,
-      SUM(CASE WHEN is_early = 1 OR is_profitable = 1 THEN 1 ELSE 0 END) AS positive_signals,
-      SUM(CASE WHEN is_bad_token = 1 OR profit_change < -0.5 THEN 1 ELSE 0 END) AS negative_signals,
-      SUM(is_early) AS early_entries,
-      SUM(is_profitable) AS profitable_entries,
-      SUM(is_bad_token) AS rug_or_bad_token_hits,
-      SUM(evidence_weight) AS evidence_mass,
-      SUM(CASE WHEN is_early = 1 OR is_profitable = 1 THEN evidence_weight ELSE 0 END) AS weighted_positive_signals,
-      SUM(CASE WHEN is_bad_token = 1 OR profit_change < -0.5 THEN evidence_weight ELSE 0 END) AS weighted_negative_signals,
-      SUM(CASE WHEN is_early = 1 THEN evidence_weight ELSE 0 END) AS weighted_early_entries,
-      SUM(CASE WHEN is_profitable = 1 THEN evidence_weight ELSE 0 END) AS weighted_profitable_entries,
-      SUM(CASE WHEN is_bad_token = 1 THEN evidence_weight ELSE 0 END) AS weighted_bad_token_hits,
-      AVG(CASE WHEN entry_delay_sec IS NOT NULL AND entry_delay_sec >= 0 THEN entry_delay_sec END) AS avg_entry_delay_sec,
-      AVG(CASE WHEN hold_sec IS NOT NULL AND hold_sec >= 0 THEN hold_sec END) AS avg_hold_sec,
-      SUM(CASE
-        WHEN outcome_score IS NULL AND token_score IS NOT NULL THEN token_score * evidence_weight
-        WHEN token_score IS NULL AND outcome_score IS NOT NULL THEN outcome_score * evidence_weight
-        WHEN token_score IS NOT NULL AND outcome_score IS NOT NULL THEN (token_score * 0.55 + outcome_score * 0.45) * evidence_weight
-        ELSE 0
-      END) /
-      NULLIF(SUM(CASE WHEN token_score IS NOT NULL OR outcome_score IS NOT NULL THEN evidence_weight ELSE 0 END), 0) AS avg_token_score,
-      MIN(observed_at) AS first_seen_at,
-      MAX(observed_at) AS last_seen_at
-    FROM wallet_evidence
-    WHERE wallet_address = ?
+      COALESCE(SUM(source_observations), 0) AS observations,
+      COUNT(*) AS distinct_tokens,
+      COALESCE(SUM(CASE WHEN is_early = 1 OR is_profitable = 1 THEN 1 ELSE 0 END), 0) AS positive_signals,
+      COALESCE(SUM(CASE WHEN is_bad_token = 1 OR has_large_loss = 1 THEN 1 ELSE 0 END), 0) AS negative_signals,
+      COALESCE(SUM(is_early), 0) AS early_entries,
+      COALESCE(SUM(is_profitable), 0) AS profitable_entries,
+      COALESCE(SUM(is_bad_token), 0) AS rug_or_bad_token_hits,
+      COALESCE(SUM(token_weight), 0) AS evidence_mass,
+      COALESCE(SUM(CASE WHEN is_early = 1 OR is_profitable = 1 THEN token_weight ELSE 0 END), 0) AS weighted_positive_signals,
+      COALESCE(SUM(CASE WHEN is_bad_token = 1 OR has_large_loss = 1 THEN token_weight ELSE 0 END), 0) AS weighted_negative_signals,
+      COALESCE(SUM(CASE WHEN is_early = 1 THEN token_weight ELSE 0 END), 0) AS weighted_early_entries,
+      COALESCE(SUM(CASE WHEN is_profitable = 1 THEN token_weight ELSE 0 END), 0) AS weighted_profitable_entries,
+      COALESCE(SUM(CASE WHEN is_bad_token = 1 THEN token_weight ELSE 0 END), 0) AS weighted_bad_token_hits,
+      COALESCE(SUM(CASE WHEN outcome_score IS NOT NULL THEN 1 ELSE 0 END), 0) AS mature_tokens,
+      AVG(entry_delay_sec) AS avg_entry_delay_sec,
+      AVG(hold_sec) AS avg_hold_sec,
+      SUM(CASE WHEN token_quality IS NOT NULL THEN token_quality * token_weight ELSE 0 END) /
+        NULLIF(SUM(CASE WHEN token_quality IS NOT NULL THEN token_weight ELSE 0 END), 0) AS avg_token_score,
+      MIN(first_seen_at) AS first_seen_at,
+      MAX(last_seen_at) AS last_seen_at
+    FROM scored
   `);
 
   const upsertProfile = db.prepare(`
@@ -187,7 +214,7 @@ function initIntelligence(db) {
     SELECT *
     FROM wallet_profiles
     WHERE observations >= ?
-    ORDER BY reputation_score DESC, confidence_score DESC, observations DESC
+    ORDER BY reputation_score DESC, confidence_score DESC, distinct_tokens DESC
     LIMIT ?
   `);
 
@@ -210,7 +237,7 @@ function initIntelligence(db) {
   `);
 
   function refreshProfile(walletAddress, now = Date.now()) {
-    const aggregate = aggregateWallet.get(walletAddress);
+    const aggregate = aggregateWallet.get(walletAddress) || {};
     const observations = num(aggregate.observations);
     const distinctTokens = num(aggregate.distinct_tokens);
     const positiveSignals = num(aggregate.positive_signals);
@@ -218,25 +245,28 @@ function initIntelligence(db) {
     const earlyEntries = num(aggregate.early_entries);
     const profitableEntries = num(aggregate.profitable_entries);
     const badHits = num(aggregate.rug_or_bad_token_hits);
-    const evidenceMass = num(aggregate.evidence_mass, observations);
+    const evidenceMass = num(aggregate.evidence_mass, distinctTokens);
     const weightedPositiveSignals = num(aggregate.weighted_positive_signals, positiveSignals);
     const weightedNegativeSignals = num(aggregate.weighted_negative_signals, negativeSignals);
     const weightedEarlyEntries = num(aggregate.weighted_early_entries, earlyEntries);
     const weightedProfitableEntries = num(aggregate.weighted_profitable_entries, profitableEntries);
     const weightedBadHits = num(aggregate.weighted_bad_token_hits, badHits);
+    const matureTokens = num(aggregate.mature_tokens);
 
     const earlyRate = evidenceMass ? weightedEarlyEntries / evidenceMass : 0;
     const profitRate = evidenceMass ? weightedProfitableEntries / evidenceMass : 0;
     const badRate = evidenceMass ? weightedBadHits / evidenceMass : 0;
+    const outcomeCoverage = distinctTokens ? matureTokens / distinctTokens : 0;
     const avgScore = num(aggregate.avg_token_score, 50);
 
     const reputationScore = Math.round(clamp(
-      0.30 * avgScore +
-      25 * earlyRate +
-      25 * profitRate -
-      30 * badRate -
-      Math.min(12, weightedNegativeSignals * 1.5) +
-      Math.min(10, Math.log2(1 + distinctTokens) * 2.5),
+      0.36 * avgScore +
+      18 * earlyRate +
+      20 * profitRate -
+      32 * badRate -
+      Math.min(14, weightedNegativeSignals * 2) +
+      Math.min(8, Math.log2(1 + distinctTokens) * 2.5) +
+      6 * clamp(outcomeCoverage, 0, 1),
       0,
       100
     ));
@@ -244,7 +274,8 @@ function initIntelligence(db) {
     const confidence = confidenceFromEvidence(
       evidenceMass,
       distinctTokens,
-      weightedPositiveSignals
+      weightedPositiveSignals,
+      matureTokens
     );
 
     upsertProfile.run(

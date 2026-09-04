@@ -141,6 +141,7 @@ test("strong mature outcome boosts token quality without duplicating evidence", 
   assert.equal(after.distinct_tokens, 1);
   assert.ok(after.avg_token_score > before.avg_token_score);
   assert.ok(after.reputation_score >= before.reputation_score);
+  assert.ok(after.confidence_score > before.confidence_score);
 });
 
 test("higher-quality evidence weight materially affects longitudinal reputation", () => {
@@ -207,4 +208,77 @@ test("mature outcome weights are consumed by profile aggregation", () => {
   assert.equal(after.distinct_tokens, 2);
   assert.ok(after.avg_token_score > before.avg_token_score);
   assert.ok(after.reputation_score > before.reputation_score);
+});
+
+test("multiple evidence sources for one token do not fake repeat-wallet skill", () => {
+  const db = new Database(":memory:");
+  const intelligence = initIntelligence(db);
+
+  const once = intelligence.recordObservation({
+    walletAddress: "wallet-multisource",
+    tokenAddress: "same-token",
+    source: "discovery",
+    tokenScore: 92,
+    profitChange: 1.4,
+    isEarly: true,
+    isProfitable: true,
+  });
+
+  const repeated = intelligence.recordObservation({
+    walletAddress: "wallet-multisource",
+    tokenAddress: "same-token",
+    source: "history",
+    tokenScore: 92,
+    profitChange: 1.4,
+    isEarly: true,
+    isProfitable: true,
+  });
+
+  assert.equal(repeated.observations, 2);
+  assert.equal(repeated.distinct_tokens, 1);
+  assert.equal(repeated.positive_signals, 1);
+  assert.equal(repeated.early_entries, 1);
+  assert.equal(repeated.profitable_entries, 1);
+  assert.equal(repeated.reputation_score, once.reputation_score);
+  assert.equal(repeated.confidence_score, once.confidence_score);
+  db.close();
+});
+
+test("four independent winners build materially more confidence than four sources for one winner", () => {
+  const db = new Database(":memory:");
+  const intelligence = initIntelligence(db);
+
+  for (const source of ["discovery", "history", "seed-history", "rescan"]) {
+    intelligence.recordObservation({
+      walletAddress: "wallet-one-token",
+      tokenAddress: "winner",
+      source,
+      tokenScore: 88,
+      profitChange: 1.1,
+      isEarly: true,
+      isProfitable: true,
+    });
+  }
+
+  for (let i = 0; i < 4; i += 1) {
+    intelligence.recordObservation({
+      walletAddress: "wallet-four-tokens",
+      tokenAddress: `winner-${i}`,
+      source: "discovery",
+      tokenScore: 88,
+      profitChange: 1.1,
+      isEarly: true,
+      isProfitable: true,
+    });
+  }
+
+  const repeated = intelligence.getProfile("wallet-one-token");
+  const broad = intelligence.getProfile("wallet-four-tokens");
+  assert.equal(repeated.observations, 4);
+  assert.equal(repeated.distinct_tokens, 1);
+  assert.equal(broad.observations, 4);
+  assert.equal(broad.distinct_tokens, 4);
+  assert.ok(broad.confidence_score >= 50);
+  assert.ok(broad.confidence_score > repeated.confidence_score);
+  db.close();
 });
