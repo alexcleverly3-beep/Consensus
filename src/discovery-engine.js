@@ -117,6 +117,7 @@ function createDiscoveryEngine({
   minTokenScore = 35,
   minTrustedReputation = 65,
   minTrustedConfidence = 50,
+  minTrustedDistinctTokens = 4,
   minConsensusWallets = 2,
   traderFilter = defaultTraderFilter,
 } = {}) {
@@ -233,7 +234,8 @@ function createDiscoveryEngine({
       const profile = intelligence.getProfile(candidate.walletAddress) || candidate.profile;
       candidate.profile = profile;
       return num(profile?.reputation_score) >= minTrustedReputation &&
-        num(profile?.confidence_score) >= minTrustedConfidence;
+        num(profile?.confidence_score) >= minTrustedConfidence &&
+        num(profile?.distinct_tokens) >= minTrustedDistinctTokens;
     });
 
     const consensus = trusted.length >= minConsensusWallets
@@ -244,6 +246,7 @@ function createDiscoveryEngine({
             walletAddress: candidate.walletAddress,
             reputation: num(candidate.profile?.reputation_score),
             confidence: num(candidate.profile?.confidence_score),
+            distinctTokens: num(candidate.profile?.distinct_tokens),
             tokenScore: candidate.evidence.tokenScore,
           })),
         }
