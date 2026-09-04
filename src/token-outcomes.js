@@ -40,6 +40,11 @@ function normalizeTokenSnapshot(tokenInfo = {}) {
   return { price, marketCap, liquidity };
 }
 
+function hasSnapshotData(tokenInfo = {}) {
+  const snapshot = normalizeTokenSnapshot(tokenInfo);
+  return snapshot.price != null || snapshot.marketCap != null || snapshot.liquidity != null;
+}
+
 function ratio(current, baseline) {
   if (current == null || baseline == null || baseline <= 0) return null;
   return current / baseline;
@@ -127,6 +132,9 @@ function initTokenOutcomes(db) {
   const updateStmt = db.prepare(`
     UPDATE token_outcomes SET
       last_observed_at = ?,
+      first_price = COALESCE(first_price, ?),
+      first_market_cap = COALESCE(first_market_cap, ?),
+      first_liquidity = COALESCE(first_liquidity, ?),
       current_price = COALESCE(?, current_price),
       current_market_cap = COALESCE(?, current_market_cap),
       current_liquidity = COALESCE(?, current_liquidity),
@@ -156,10 +164,10 @@ function initTokenOutcomes(db) {
       return getStmt.get(tokenAddress);
     }
 
-    const baseline = {
-      price: row.first_price,
-      marketCap: row.first_market_cap,
-      liquidity: row.first_liquidity,
+    const effectiveBaseline = {
+      price: row.first_price ?? snapshot.price,
+      marketCap: row.first_market_cap ?? snapshot.marketCap,
+      liquidity: row.first_liquidity ?? snapshot.liquidity,
     };
     const current = {
       price: snapshot.price ?? row.current_price,
@@ -171,7 +179,7 @@ function initTokenOutcomes(db) {
       current.price == null ? 0 : current.price
     ) || null;
     const outcome = classifyOutcome({
-      baseline,
+      baseline: effectiveBaseline,
       current,
       maxPrice,
       ageMs: Math.max(0, now - row.first_observed_at),
@@ -179,6 +187,9 @@ function initTokenOutcomes(db) {
 
     updateStmt.run(
       now,
+      snapshot.price,
+      snapshot.marketCap,
+      snapshot.liquidity,
       snapshot.price,
       snapshot.marketCap,
       snapshot.liquidity,
@@ -203,5 +214,6 @@ function initTokenOutcomes(db) {
 module.exports = {
   initTokenOutcomes,
   normalizeTokenSnapshot,
+  hasSnapshotData,
   classifyOutcome,
 };
