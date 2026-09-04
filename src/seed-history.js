@@ -29,6 +29,7 @@ function mergeTokens(target, tokens) {
 async function collectSeedHistory({
   walletAddress,
   fetchPage,
+  startCursor = null,
   maxPages = 3,
   tokenLimit = 250,
 } = {}) {
@@ -38,8 +39,9 @@ async function collectSeedHistory({
   const boundedPages = Math.max(1, Math.min(10, Math.floor(Number(maxPages) || 1)));
   const boundedTokens = Math.max(1, Math.min(1000, Math.floor(Number(tokenLimit) || 250)));
   const tokens = new Map();
-  const seenCursors = new Set();
-  let cursor = null;
+  const initialCursor = startCursor == null || !String(startCursor).trim() ? null : String(startCursor);
+  const seenCursors = new Set(initialCursor ? [initialCursor] : []);
+  let cursor = initialCursor;
   let continuation = null;
   let pagesFetched = 0;
 
@@ -63,6 +65,7 @@ async function collectSeedHistory({
       .sort((a, b) => Number(b.lastActivityAt || 0) - Number(a.lastActivityAt || 0))
       .slice(0, boundedTokens),
     pagesFetched,
+    startCursor: initialCursor,
     nextCursor: continuation,
     exhausted: continuation == null,
   };
