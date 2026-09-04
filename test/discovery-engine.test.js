@@ -84,6 +84,54 @@ test("processToken saves free evidence before spending enrichment budget", async
   db.close();
 });
 
+test("duplicate trader rows cannot inflate distinct-wallet consensus", async () => {
+  const { db, intelligence } = makeStore();
+
+  for (let i = 0; i < 8; i += 1) {
+    intelligence.recordObservation({
+      walletAddress: WALLET_A,
+      tokenAddress: `${i + 90}`.repeat(32).slice(0, 32),
+      source: "history",
+      tokenScore: 95,
+      profitChange: 1.5,
+      entryDelaySec: 300,
+      isEarly: true,
+      isProfitable: true,
+    });
+  }
+
+  const engine = createDiscoveryEngine({
+    intelligence,
+    minTokenScore: 1,
+    minTrustedReputation: 1,
+    minTrustedConfidence: 1,
+    minConsensusWallets: 2,
+  });
+
+  const duplicate = {
+    address: WALLET_A,
+    profit: 5000,
+    profit_change: 2,
+    realized_profit: 5000,
+    start_holding_at: 1200,
+  };
+  const result = await engine.processToken({
+    tokenAddress: TOKEN,
+    tokenInfo: { open_timestamp: 1000 },
+    traders: [duplicate, { ...duplicate }],
+  });
+
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.trusted.length, 1);
+  assert.equal(result.consensus, null);
+  assert.equal(
+    result.rejected.some((entry) => entry.walletAddress === WALLET_A && entry.reason === "duplicate-wallet"),
+    true
+  );
+  assert.equal(intelligence.getProfile(WALLET_A).observations, 9);
+  db.close();
+});
+
 test("trusted wallets require evidence across at least four distinct tokens", async () => {
   const { db, intelligence } = makeStore();
 
