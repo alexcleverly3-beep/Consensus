@@ -1,6 +1,7 @@
 "use strict";
 
 const DEFAULT_MIN_AGE_MS = 48 * 60 * 60 * 1000;
+const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -54,7 +55,11 @@ function launchedAt(row) {
 function marketMetrics(row) {
   const liquidity = num(row?.liquidity ?? row?.liquidity_usd);
   const marketCap = num(row?.market_cap ?? row?.marketcap ?? row?.fdv);
-  const volume = num(row?.volume ?? row?.volume_usd ?? row?.volume_1h);
+  // GMGN's trending RankItem exposes `volume` for the requested interval. Keep
+  // interval-specific aliases as fallbacks for fixtures/older payload variants.
+  const volume = num(
+    row?.volume ?? row?.volume_usd ?? row?.volume_24h ?? row?.volume_24h_usd ?? row?.volume_1h
+  );
   const holderCount = num(row?.holder_count ?? row?.holders ?? row?.holders_count);
 
   return {
@@ -102,16 +107,10 @@ function qualityGate(row, {
   if (metrics.marketCap < minMarketCap) return { ok: false, reason: "low-market-cap", ageMs, ...metrics };
   if (metrics.volume < minVolume) return { ok: false, reason: "low-volume", ageMs, ...metrics };
 
-  // If GMGN supplies holder count, require a minimum breadth of ownership. Missing
-  // holder data is tolerated because some trending payloads omit the field.
   if (metrics.holderCount > 0 && metrics.holderCount < minHolderCount) {
     return { ok: false, reason: "low-holder-count", ageMs, ...metrics };
   }
 
-  // Thin liquidity relative to valuation is easy to manipulate even when the raw
-  // liquidity floor is met. Conversely, extreme volume relative to liquidity is a
-  // conservative pump/churn warning. These use fields already present in trending,
-  // so they cost no extra GMGN calls.
   if (metrics.marketCap > 0 && metrics.liquidityToMarketCap < minLiquidityToMarketCap) {
     return { ok: false, reason: "thin-liquidity", ageMs, ...metrics };
   }
@@ -134,8 +133,6 @@ function qualityScore(row, gate) {
   const ageDays = Number.isFinite(metrics.ageMs) ? metrics.ageMs / 86_400_000 : 0;
   let score = 0;
 
-  // Survival is deliberately valuable: a token that remains liquid and active for
-  // several days is a better training example than a fresh one-hour pump.
   score += Math.min(5, ageDays / 2);
   if (metrics.liquidity >= 50_000) score += 2;
   else if (metrics.liquidity >= 20_000) score += 1;
@@ -154,21 +151,67 @@ function qualityScore(row, gate) {
   return score;
 }
 
-function extractTokenCandidates(response, { limit = 8, ...qualityOptions } = {}) {
+function analyzeTokenCandidates(response, { limit = 8, ...qualityOptions } = {}) {
+  const rows = unwrapRows(response);
   const seen = new Set();
-  return unwrapRows(response)
-    .map((row) => {
-      const gate = qualityGate(row, qualityOptions);
-      return { row, address: tokenAddress(row), quality: gate, score: gate.ok ? qualityScore(row, gate) : -Infinity };
-    })
-    .filter(({ address, quality }) => quality.ok && typeof address === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
-    .filter(({ address }) => {
-      if (seen.has(address)) return false;
-      seen.add(address);
-      return true;
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, Math.max(1, Math.min(50, Number(limit) || 8)));
+  const rejected = {};
+  const accepted = [];
+  let invalidAddress = 0;
+  let duplicateAddress = 0;
+
+  for (const row of rows) {
+    const address = tokenAddress(row);
+    if (typeof address !== "string" || !SOL_ADDR.test(address)) {
+      invalidAddress += 1;
+      continue;
+    }
+    if (seen.has(address)) {
+      duplicateAddress += 1;
+      continue;
+    }
+    seen.add(address);
+
+    const gate = qualityGate(row, qualityOptions);
+    if (!gate.ok) {
+      rejected[gate.reason] = (rejected[gate.reason] || 0) + 1;
+      continue;
+    }
+    accepted.push({ row, address, quality: gate, score: qualityScore(row, gate) });
+  }
+
+  accepted.sort((a, b) => b.score - a.score);
+  const boundedLimit = Math.max(1, Math.min(50, Number(limit) || 8));
+  const candidates = accepted.slice(0, boundedLimit);
+  return {
+    candidates,
+    diagnostics: {
+      rows: rows.length,
+      uniqueAddresses: seen.size,
+      accepted: accepted.length,
+      selected: candidates.length,
+      invalidAddress,
+      duplicateAddress,
+      rejected,
+    },
+  };
+}
+
+function formatDiscoveryDiagnostics(diagnostics) {
+  const reasons = Object.entries(diagnostics?.rejected || {})
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(",");
+  return `rows=${diagnostics?.rows || 0} accepted=${diagnostics?.accepted || 0} selected=${diagnostics?.selected || 0} ` +
+    `invalid=${diagnostics?.invalidAddress || 0} duplicates=${diagnostics?.duplicateAddress || 0}` +
+    (reasons ? ` rejected[${reasons}]` : "");
+}
+
+function extractTokenCandidates(response, { limit = 8, diagnosticsLogger = console.log, ...qualityOptions } = {}) {
+  const analysis = analyzeTokenCandidates(response, { limit, ...qualityOptions });
+  // One concise line per trending fetch makes quality-gate starvation visible in
+  // production and consumes no extra API calls. Tests/callers may pass false.
+  if (diagnosticsLogger) diagnosticsLogger(`[market-quality] ${formatDiscoveryDiagnostics(analysis.diagnostics)}`);
+  return analysis.candidates;
 }
 
 function shouldScanToken(lastScannedAt, now = Date.now(), cooldownMs = 6 * 60 * 60 * 1000) {
@@ -177,6 +220,8 @@ function shouldScanToken(lastScannedAt, now = Date.now(), cooldownMs = 6 * 60 * 
 
 module.exports = {
   DEFAULT_MIN_AGE_MS,
+  analyzeTokenCandidates,
+  formatDiscoveryDiagnostics,
   extractTokenCandidates,
   shouldScanToken,
   tokenAddress,
