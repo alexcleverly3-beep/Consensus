@@ -6,6 +6,7 @@ const Database = require("better-sqlite3");
 const { initIntelligence } = require("../src/intelligence");
 const {
   createDiscoveryEngine,
+  defaultTraderFilter,
   traderTokenEvidence,
 } = require("../src/discovery-engine");
 
@@ -36,6 +37,44 @@ test("traderTokenEvidence recognises early profitable entries", () => {
   assert.equal(evidence.entryDelaySec, 900);
   assert.equal(evidence.profitChange, 1.4);
   assert.ok(evidence.tokenScore >= 70);
+});
+
+test("default trader filter rejects extreme single-token churn even without a bot tag", () => {
+  assert.equal(defaultTraderFilter({
+    address: WALLET_A,
+    buy_tx_count_cur: 45,
+    sell_tx_count_cur: 35,
+  }), "high-frequency-trading");
+
+  assert.equal(defaultTraderFilter({
+    address: WALLET_A,
+    buy_tx_count_cur: 12,
+    sell_tx_count_cur: 10,
+  }), null);
+});
+
+test("processToken does not persist high-frequency bot-like wallets as evidence", async () => {
+  const { db, intelligence } = makeStore();
+  const engine = createDiscoveryEngine({ intelligence, minTokenScore: 1 });
+
+  const result = await engine.processToken({
+    tokenAddress: TOKEN,
+    tokenInfo: { open_timestamp: 1000 },
+    traders: [{
+      address: WALLET_A,
+      profit: 50_000,
+      profit_change: 5,
+      realized_profit: 50_000,
+      start_holding_at: 1100,
+      buy_tx_count_cur: 60,
+      sell_tx_count_cur: 40,
+    }],
+  });
+
+  assert.equal(result.candidates.length, 0);
+  assert.equal(result.rejected[0].reason, "high-frequency-trading");
+  assert.equal(intelligence.getProfile(WALLET_A), null);
+  db.close();
 });
 
 test("processToken saves free evidence before spending enrichment budget", async () => {
