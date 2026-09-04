@@ -12,4 +12,9 @@ if (process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS === undefined) {
   process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS = "0";
 }
 
+// Install before app.js captures child_process.execFile. This gives every GMGN
+// path (market, trader, token-info, and seed history) one shared rolling budget,
+// plus exact-request caching and in-flight deduplication.
+require("./gmgn-runtime-guard").install();
+
 require("./app");
