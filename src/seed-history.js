@@ -40,6 +40,7 @@ async function collectSeedHistory({
   const tokens = new Map();
   const seenCursors = new Set();
   let cursor = null;
+  let continuation = null;
   let pagesFetched = 0;
 
   while (pagesFetched < boundedPages && tokens.size < boundedTokens) {
@@ -48,8 +49,12 @@ async function collectSeedHistory({
     mergeTokens(tokens, extractBoughtTokens(response, { walletAddress, limit: boundedTokens }));
 
     const next = nextCursor(response);
-    if (!next || next === cursor || seenCursors.has(next)) break;
+    if (!next || next === cursor || seenCursors.has(next)) {
+      continuation = null;
+      break;
+    }
     seenCursors.add(next);
+    continuation = next;
     cursor = next;
   }
 
@@ -58,8 +63,8 @@ async function collectSeedHistory({
       .sort((a, b) => Number(b.lastActivityAt || 0) - Number(a.lastActivityAt || 0))
       .slice(0, boundedTokens),
     pagesFetched,
-    nextCursor: cursor,
-    exhausted: !cursor || pagesFetched < boundedPages,
+    nextCursor: continuation,
+    exhausted: continuation == null,
   };
 }
 
