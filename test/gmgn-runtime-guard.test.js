@@ -156,3 +156,64 @@ test("budget resets after its configured window", async () => {
   await call(guarded, ["token", "info", "--address", "b"]);
   assert.equal(underlying, 2);
 });
+
+test("rate-limit feedback halves the effective budget and activates cooldown", async () => {
+  let time = 0;
+  let calls = 0;
+  const fake = (file, args, options, cb) => {
+    calls += 1;
+    if (calls === 1) queueMicrotask(() => cb(new Error("429 rate limit exceeded"), "", ""));
+    else queueMicrotask(() => cb(null, "ok", ""));
+    return {};
+  };
+  const guarded = createGmgnExecGuard({
+    execFile: fake,
+    maxFreshCalls: 8,
+    minFreshCalls: 2,
+    windowMs: 60_000,
+    cooldownMs: 5_000,
+    now: () => time,
+    ttlForKind: () => 0,
+  });
+
+  await assert.rejects(call(guarded, ["token", "info", "--address", "a"]));
+  assert.equal(guarded.snapshot().effectiveMaxFreshCalls, 4);
+  assert.equal(guarded.snapshot().rateLimitEvents, 1);
+  await assert.rejects(
+    call(guarded, ["token", "info", "--address", "b"]),
+    (error) => error.code === "GMGN_COOLDOWN_ACTIVE"
+  );
+  assert.equal(calls, 1);
+
+  time = 5_001;
+  await call(guarded, ["token", "info", "--address", "b"]);
+  assert.equal(calls, 2);
+});
+
+test("adaptive budget recovers one call after clean windows", async () => {
+  let time = 0;
+  let calls = 0;
+  const fake = (file, args, options, cb) => {
+    calls += 1;
+    if (calls === 1) queueMicrotask(() => cb(new Error("RATE_LIMIT_EXCEEDED"), "", ""));
+    else queueMicrotask(() => cb(null, "ok", ""));
+    return {};
+  };
+  const guarded = createGmgnExecGuard({
+    execFile: fake,
+    maxFreshCalls: 6,
+    minFreshCalls: 1,
+    windowMs: 60_000,
+    cooldownMs: 1_000,
+    recoveryWindows: 1,
+    now: () => time,
+    ttlForKind: () => 0,
+  });
+
+  await assert.rejects(call(guarded, ["token", "info", "--address", "a"]));
+  assert.equal(guarded.snapshot().effectiveMaxFreshCalls, 3);
+  time = 60_001;
+  await call(guarded, ["token", "info", "--address", "b"]);
+  time = 120_002;
+  assert.equal(guarded.snapshot().effectiveMaxFreshCalls, 4);
+});

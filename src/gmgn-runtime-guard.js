@@ -23,6 +23,11 @@ function defaultTtlMs(kind) {
   return 0;
 }
 
+function isRateLimitFailure(error, stdout = "", stderr = "") {
+  const text = [error?.message || error, stdout, stderr].filter(Boolean).join("\n");
+  return /RATE_LIMIT_EXCEEDED|RATE_LIMIT_BANNED|IP rate limit exceeded|\b429\b|rate[ _-]?limit/i.test(text);
+}
+
 function setFlag(args, flag, value) {
   const next = [...args];
   const index = next.indexOf(flag);
@@ -49,10 +54,6 @@ function addRepeatableFlag(args, flag, value) {
   return next;
 }
 
-// Autonomous discovery should learn from tokens that have survived, retained
-// liquidity and remained active for days, not whichever token is pumping hardest
-// in the current hour. Apply these constraints at the GMGN query boundary so bad
-// candidates are removed before the app spends a token-trader request on them.
 function hardenTrendingArgs(args = []) {
   let next = Array.isArray(args) ? args.map(String) : [];
   if (commandKind(next) !== "market-trending") return next;
@@ -75,14 +76,21 @@ function hardenTrendingArgs(args = []) {
 function createGmgnExecGuard({
   execFile,
   maxFreshCalls = 5,
+  minFreshCalls = 1,
   windowMs = 20 * 60 * 1000,
+  cooldownMs = 30 * 1000,
+  recoveryWindows = 2,
+  adaptive = true,
   now = () => Date.now(),
   ttlForKind = defaultTtlMs,
 } = {}) {
   if (typeof execFile !== "function") throw new Error("execFile is required");
 
   const maxCalls = clampInt(maxFreshCalls, 5, 1, 100);
+  const minCalls = clampInt(minFreshCalls, 1, 1, maxCalls);
   const safeWindowMs = clampInt(windowMs, 20 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000);
+  const safeCooldownMs = clampInt(cooldownMs, 30 * 1000, 1000, 60 * 60 * 1000);
+  const cleanWindowsNeeded = clampInt(recoveryWindows, 2, 1, 20);
   const cache = new Map();
   const inflight = new Map();
   let windowStartedAt = now();
@@ -90,11 +98,29 @@ function createGmgnExecGuard({
   let cacheHits = 0;
   let coalesced = 0;
   let rejected = 0;
+  let rateLimitEvents = 0;
+  let windowRateLimits = 0;
+  let cleanWindows = 0;
+  let effectiveMaxFreshCalls = maxCalls;
+  let blockedUntil = 0;
 
   function rollWindow(at) {
     if (at - windowStartedAt < safeWindowMs) return;
-    windowStartedAt = at;
+    if (adaptive && freshCalls > 0) {
+      if (windowRateLimits === 0) {
+        cleanWindows += 1;
+        if (cleanWindows >= cleanWindowsNeeded && effectiveMaxFreshCalls < maxCalls) {
+          effectiveMaxFreshCalls += 1;
+          cleanWindows = 0;
+        }
+      } else {
+        cleanWindows = 0;
+      }
+    }
+    const elapsedWindows = Math.max(1, Math.floor((at - windowStartedAt) / safeWindowMs));
+    windowStartedAt += elapsedWindows * safeWindowMs;
     freshCalls = 0;
+    windowRateLimits = 0;
   }
 
   function keyFor(file, args) {
@@ -102,21 +128,28 @@ function createGmgnExecGuard({
   }
 
   function snapshot() {
-    rollWindow(now());
+    const at = now();
+    rollWindow(at);
     return {
       maxFreshCalls: maxCalls,
+      effectiveMaxFreshCalls,
+      minFreshCalls: minCalls,
       freshCalls,
-      remaining: Math.max(0, maxCalls - freshCalls),
+      remaining: Math.max(0, effectiveMaxFreshCalls - freshCalls),
       cacheHits,
       coalesced,
       rejected,
+      rateLimitEvents,
+      cleanWindows,
+      blockedUntil,
+      cooldownRemainingMs: Math.max(0, blockedUntil - at),
       windowStartedAt,
       windowMs: safeWindowMs,
+      adaptive: Boolean(adaptive),
     };
   }
 
   function guardedExecFile(file, args, options, callback) {
-    // Preserve normal child_process behavior for anything except gmgn-cli.
     if (file !== "gmgn-cli") return execFile(file, args, options, callback);
 
     const effectiveArgs = hardenTrendingArgs(args);
@@ -139,10 +172,18 @@ function createGmgnExecGuard({
       return { coalesced: true };
     }
 
-    if (freshCalls >= maxCalls) {
+    if (at < blockedUntil) {
+      rejected += 1;
+      const error = new Error(`GMGN adaptive cooldown active for ${Math.ceil((blockedUntil - at) / 1000)}s`);
+      error.code = "GMGN_COOLDOWN_ACTIVE";
+      queueMicrotask(() => callback(error, "", ""));
+      return { rejected: true, cooldown: true };
+    }
+
+    if (freshCalls >= effectiveMaxFreshCalls) {
       rejected += 1;
       const error = new Error(
-        `GMGN request budget exhausted (${freshCalls}/${maxCalls} fresh calls in ${Math.round(safeWindowMs / 60000)}m)`
+        `GMGN request budget exhausted (${freshCalls}/${effectiveMaxFreshCalls} fresh calls in ${Math.round(safeWindowMs / 60000)}m)`
       );
       error.code = "GMGN_BUDGET_EXHAUSTED";
       queueMicrotask(() => callback(error, "", ""));
@@ -154,12 +195,18 @@ function createGmgnExecGuard({
     return execFile(file, effectiveArgs, options, (error, stdout, stderr) => {
       const callbacks = inflight.get(key) || [];
       inflight.delete(key);
-      if (!error) {
+
+      if (error && adaptive && isRateLimitFailure(error, stdout, stderr)) {
+        rateLimitEvents += 1;
+        windowRateLimits += 1;
+        cleanWindows = 0;
+        effectiveMaxFreshCalls = Math.max(minCalls, Math.floor(effectiveMaxFreshCalls / 2));
+        blockedUntil = Math.max(blockedUntil, now() + safeCooldownMs);
+      } else if (!error) {
         const ttlMs = Math.max(0, Number(ttlForKind(kind)) || 0);
-        if (ttlMs > 0) {
-          cache.set(key, { stdout, stderr, expiresAt: now() + ttlMs });
-        }
+        if (ttlMs > 0) cache.set(key, { stdout, stderr, expiresAt: now() + ttlMs });
       }
+
       for (const cb of callbacks) cb(error, stdout, stderr);
     });
   }
@@ -175,11 +222,18 @@ function install(options = {}) {
 
   const original = childProcess.execFile;
   const maxFreshCalls = clampInt(process.env.GMGN_MAX_FRESH_CALLS_PER_WINDOW, 5, 1, 100);
+  const minFreshCalls = clampInt(process.env.GMGN_MIN_FRESH_CALLS_PER_WINDOW, 1, 1, maxFreshCalls);
   const windowMinutes = clampInt(process.env.GMGN_BUDGET_WINDOW_MINUTES, 20, 1, 1440);
+  const cooldownSeconds = clampInt(process.env.GMGN_ADAPTIVE_COOLDOWN_SECONDS, 30, 1, 3600);
+  const recoveryWindows = clampInt(process.env.GMGN_ADAPTIVE_RECOVERY_WINDOWS, 2, 1, 20);
   const guarded = createGmgnExecGuard({
     execFile: original,
     maxFreshCalls,
+    minFreshCalls,
     windowMs: windowMinutes * 60 * 1000,
+    cooldownMs: cooldownSeconds * 1000,
+    recoveryWindows,
+    adaptive: process.env.GMGN_ADAPTIVE_BUDGET !== "0",
     ...options,
   });
   guarded.__consensusGmgnGuard = true;
@@ -192,5 +246,6 @@ module.exports = {
   commandKind,
   defaultTtlMs,
   hardenTrendingArgs,
+  isRateLimitFailure,
   install,
 };
