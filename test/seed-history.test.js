@@ -40,9 +40,11 @@ test("collectSeedHistory follows cursors, deduplicates tokens, and keeps newest 
   assert.equal(result.tokens.length, 2);
   assert.equal(result.tokens[0].address, TOKEN_A);
   assert.equal(result.tokens[0].lastActivityAt, 200000);
+  assert.equal(result.exhausted, true);
+  assert.equal(result.nextCursor, null);
 });
 
-test("collectSeedHistory obeys the page budget even if another cursor exists", async () => {
+test("collectSeedHistory obeys the page budget and exposes the continuation cursor", async () => {
   let calls = 0;
   const result = await collectSeedHistory({
     walletAddress: WALLET,
@@ -55,4 +57,6 @@ test("collectSeedHistory obeys the page budget even if another cursor exists", a
 
   assert.equal(calls, 2);
   assert.equal(result.pagesFetched, 2);
+  assert.equal(result.exhausted, false);
+  assert.ok(result.nextCursor);
 });
