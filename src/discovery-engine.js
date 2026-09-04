@@ -109,6 +109,14 @@ function defaultTraderFilter(trader, creatorAddress) {
   return bad ? `tag:${bad}` : null;
 }
 
+function currentConsensusEligible(evidence, minConsensusTokenScore = 45) {
+  return Boolean(
+    evidence?.isEarly &&
+    evidence?.isProfitable &&
+    num(evidence?.tokenScore) >= minConsensusTokenScore
+  );
+}
+
 function createDiscoveryEngine({
   intelligence,
   fetchWalletStats,
@@ -119,6 +127,7 @@ function createDiscoveryEngine({
   minTrustedConfidence = 50,
   minTrustedDistinctTokens = 4,
   minConsensusWallets = 2,
+  minConsensusTokenScore = 45,
   traderFilter = defaultTraderFilter,
 } = {}) {
   if (!intelligence?.recordObservation || !intelligence?.getProfile) {
@@ -150,8 +159,6 @@ function createDiscoveryEngine({
         continue;
       }
 
-      // This evidence is already present in the token-trader response, so saving it
-      // costs no additional GMGN request. Persist first; enrich only afterwards.
       const profile = intelligence.recordObservation({
         walletAddress,
         tokenAddress,
@@ -186,8 +193,6 @@ function createDiscoveryEngine({
       const mature = tokenOutcome.outcome_score != null &&
         !["unknown", "immature"].includes(String(tokenOutcome.outcome_status));
       if (mature && typeof intelligence.applyTokenOutcome === "function") {
-        // applyTokenOutcome stores the outcome separately from the raw trader score,
-        // so this is safe to repeat and also updates wallets first seen on this rescan.
         outcomeFeedback = intelligence.applyTokenOutcome({
           tokenAddress,
           outcomeScore: tokenOutcome.outcome_score,
@@ -196,8 +201,6 @@ function createDiscoveryEngine({
       }
     }
 
-    // Outcome feedback may have changed reputation on this same scan; refresh the
-    // candidate profiles before prioritization and consensus threshold checks.
     for (const candidate of candidates) {
       candidate.profile = intelligence.getProfile(candidate.walletAddress) || candidate.profile;
       candidate.priority = candidatePriority({
@@ -233,7 +236,8 @@ function createDiscoveryEngine({
     const trusted = candidates.filter((candidate) => {
       const profile = intelligence.getProfile(candidate.walletAddress) || candidate.profile;
       candidate.profile = profile;
-      return num(profile?.reputation_score) >= minTrustedReputation &&
+      return currentConsensusEligible(candidate.evidence, minConsensusTokenScore) &&
+        num(profile?.reputation_score) >= minTrustedReputation &&
         num(profile?.confidence_score) >= minTrustedConfidence &&
         num(profile?.distinct_tokens) >= minTrustedDistinctTokens;
     });
@@ -272,4 +276,5 @@ module.exports = {
   traderTokenEvidence,
   candidatePriority,
   defaultTraderFilter,
+  currentConsensusEligible,
 };
