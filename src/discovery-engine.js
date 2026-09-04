@@ -1,6 +1,7 @@
 "use strict";
 
 const { RequestBudget, RequestCoalescer } = require("./request-budget");
+const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -124,6 +125,7 @@ function createDiscoveryEngine({
   }
 
   const coalescer = new RequestCoalescer();
+  const outcomes = intelligence.db ? initTokenOutcomes(intelligence.db) : null;
 
   async function processToken({ tokenAddress, tokenInfo = {}, traders = [], source = "discovery" }) {
     if (!tokenAddress) throw new Error("tokenAddress is required");
@@ -176,6 +178,36 @@ function createDiscoveryEngine({
       });
     }
 
+    let tokenOutcome = null;
+    let outcomeFeedback = null;
+    if (outcomes && hasSnapshotData(tokenInfo)) {
+      tokenOutcome = outcomes.recordSnapshot({ tokenAddress, tokenInfo });
+      const mature = tokenOutcome.outcome_score != null &&
+        !["unknown", "immature"].includes(String(tokenOutcome.outcome_status));
+      if (mature && typeof intelligence.applyTokenOutcome === "function") {
+        // applyTokenOutcome stores the outcome separately from the raw trader score,
+        // so this is safe to repeat and also updates wallets first seen on this rescan.
+        outcomeFeedback = intelligence.applyTokenOutcome({
+          tokenAddress,
+          outcomeScore: tokenOutcome.outcome_score,
+          status: tokenOutcome.outcome_status,
+        });
+      }
+    }
+
+    // Outcome feedback may have changed reputation on this same scan; refresh the
+    // candidate profiles before prioritization and consensus threshold checks.
+    for (const candidate of candidates) {
+      candidate.profile = intelligence.getProfile(candidate.walletAddress) || candidate.profile;
+      candidate.priority = candidatePriority({
+        evidence: candidate.evidence,
+        profile: candidate.profile,
+        tags: [
+          ...(Array.isArray(candidate.trader?.tags) ? candidate.trader.tags : []),
+          ...(Array.isArray(candidate.trader?.maker_token_tags) ? candidate.trader.maker_token_tags : []),
+        ],
+      });
+    }
     candidates.sort((a, b) => b.priority - a.priority);
 
     let enrichments = 0;
@@ -223,6 +255,8 @@ function createDiscoveryEngine({
       rejected,
       trusted,
       consensus,
+      tokenOutcome,
+      outcomeFeedback,
       budget: budget.snapshot(),
     };
   }
