@@ -4,6 +4,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const Database = require("better-sqlite3");
+const { resolveDbPath } = require("./runtime-config");
 
 function int(value, fallback = 0) {
   const n = Number(value);
@@ -18,7 +19,24 @@ function trustedThresholds(env = process.env) {
   };
 }
 
-function createProgressStore(db, { env = process.env } = {}) {
+function gmgnBudgetSnapshot(value = {}) {
+  const configured = int(value.maxFreshCalls);
+  const effective = int(value.effectiveMaxFreshCalls, configured);
+  return {
+    freshCalls: int(value.freshCalls),
+    configuredMax: configured,
+    effectiveMax: effective,
+    remaining: int(value.remaining),
+    cacheHits: int(value.cacheHits),
+    coalesced: int(value.coalesced),
+    rejected: int(value.rejected),
+    rateLimitEvents: int(value.rateLimitEvents),
+    cooldownRemainingMs: int(value.cooldownRemainingMs),
+    persistenceErrors: int(value.persistenceErrors),
+  };
+}
+
+function createProgressStore(db, { env = process.env, gmgnGuard = null } = {}) {
   const thresholds = trustedThresholds(env);
   const totalsStmt = db.prepare(`
     SELECT
@@ -41,6 +59,7 @@ function createProgressStore(db, { env = process.env } = {}) {
     LIMIT ?
   `);
   const cycleStmt = db.prepare("SELECT value FROM meta WHERE key = 'discovery_cycle_number'");
+  const blockedUntilStmt = db.prepare("SELECT value FROM meta WHERE key = 'gmgn_blocked_until'");
 
   return {
     snapshot({ recentLimit = 8 } = {}) {
@@ -49,10 +68,19 @@ function createProgressStore(db, { env = process.env } = {}) {
         thresholds.confidence,
         thresholds.distinctTokens
       ) || {};
+      const gmgn = gmgnBudgetSnapshot(
+        typeof gmgnGuard?.snapshot === "function" ? gmgnGuard.snapshot() : {}
+      );
+      const persistedBlockedUntil = int(blockedUntilStmt.get()?.value);
+      gmgn.cooldownRemainingMs = Math.max(
+        gmgn.cooldownRemainingMs,
+        persistedBlockedUntil > Date.now() ? persistedBlockedUntil - Date.now() : 0
+      );
       return {
         generatedAt: Date.now(),
         discoveryCycle: int(cycleStmt.get()?.value, 0),
         thresholds,
+        gmgn,
         totals: {
           tokensScanned: int(totals.tokens_scanned),
           totalScans: int(totals.total_scans),
@@ -90,11 +118,18 @@ function renderDashboard(snapshot) {
   const t = snapshot.totals;
   const cards = [
     ["Tokens scanned", t.tokensScanned],
+    ["Wallets observed", t.walletsObserved],
     ["Smart wallets found", t.smartWalletsFound],
     ["Evidence saved", t.evidenceObservations],
     ["Consensus alerts", t.consensusAlerts],
     ["Queued tokens", t.queuedTokens],
     ["Discovery cycles", snapshot.discoveryCycle],
+    ["GMGN calls / window", `${snapshot.gmgn.freshCalls}/${snapshot.gmgn.effectiveMax}`],
+    ["GMGN cache + dedupe", snapshot.gmgn.cacheHits + snapshot.gmgn.coalesced],
+    ["GMGN rate limits", snapshot.gmgn.rateLimitEvents],
+    ["GMGN cooldown", snapshot.gmgn.cooldownRemainingMs > 0
+      ? `${Math.ceil(snapshot.gmgn.cooldownRemainingMs / 1000)}s`
+      : "clear"],
   ];
   const activity = snapshot.recent.length
     ? snapshot.recent.map((item) => `
@@ -136,7 +171,7 @@ function renderDashboard(snapshot) {
   <h1>Consensus V1</h1>
   <p class="muted">Live progress only. Wallet identities are deliberately not exposed here. Auto-refreshes every 30 seconds.</p>
   <div class="grid">
-    ${cards.map(([label, value]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${value}</div></div>`).join("")}
+    ${cards.map(([label, value]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`).join("")}
   </div>
   <section>
     <h2>Recent activity</h2>
@@ -152,14 +187,15 @@ function renderDashboard(snapshot) {
 }
 
 function startProgressDashboard({
-  dbPath = String(process.env.DB_PATH || path.join(process.cwd(), "data", "wallets.db")).trim(),
+  dbPath = resolveDbPath(),
   port = int(process.env.DASHBOARD_PORT || process.env.PORT, 3000),
   host = process.env.DASHBOARD_HOST || "0.0.0.0",
   env = process.env,
+  gmgnGuard = null,
 } = {}) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
-  const store = createProgressStore(db, { env });
+  const store = createProgressStore(db, { env, gmgnGuard });
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -187,6 +223,7 @@ function startProgressDashboard({
 
 module.exports = {
   createProgressStore,
+  gmgnBudgetSnapshot,
   renderDashboard,
   startProgressDashboard,
   trustedThresholds,

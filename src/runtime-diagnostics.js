@@ -3,12 +3,18 @@
 function formatBudgetSnapshot(snapshot = {}) {
   const fresh = Number(snapshot.freshCalls || 0);
   const max = Number(snapshot.maxFreshCalls || 0);
+  const effectiveMax = Number(snapshot.effectiveMaxFreshCalls ?? max);
   const remaining = Number(snapshot.remaining || 0);
   const cacheHits = Number(snapshot.cacheHits || 0);
   const coalesced = Number(snapshot.coalesced || 0);
   const rejected = Number(snapshot.rejected || 0);
+  const rateLimits = Number(snapshot.rateLimitEvents || 0);
+  const cooldownSeconds = Math.ceil(Number(snapshot.cooldownRemainingMs || 0) / 1000);
+  const persistenceErrors = Number(snapshot.persistenceErrors || 0);
   const windowMinutes = Math.max(1, Math.round(Number(snapshot.windowMs || 0) / 60000));
-  return `fresh=${fresh}/${max} remaining=${remaining} cache=${cacheHits} coalesced=${coalesced} rejected=${rejected} window=${windowMinutes}m`;
+  return `fresh=${fresh}/${effectiveMax} configured=${max} remaining=${remaining} cache=${cacheHits} ` +
+    `coalesced=${coalesced} rejected=${rejected} rateLimits=${rateLimits} cooldown=${cooldownSeconds}s ` +
+    `persistenceErrors=${persistenceErrors} window=${windowMinutes}m`;
 }
 
 function createRuntimeDiagnostics({ gmgnGuard, logger = console, intervalMs = 20 * 60 * 1000 } = {}) {

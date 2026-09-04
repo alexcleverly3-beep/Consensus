@@ -34,6 +34,7 @@ test("traderTokenEvidence recognises early profitable entries", () => {
   assert.equal(evidence.isEarly, true);
   assert.equal(evidence.isProfitable, true);
   assert.equal(evidence.entryDelaySec, 900);
+  assert.equal(evidence.profitChange, 1.4);
   assert.ok(evidence.tokenScore >= 70);
 });
 
@@ -167,6 +168,66 @@ test("trusted wallets require evidence across at least four distinct tokens", as
   assert.equal(intelligence.getProfile(WALLET_A).distinct_tokens, 3);
   assert.equal(result.trusted.length, 0);
   assert.equal(result.consensus, null);
+  db.close();
+});
+
+test("the current token cannot make its own wallet historically trusted", async () => {
+  const { db, intelligence } = makeStore();
+  for (let i = 0; i < 3; i += 1) {
+    intelligence.recordObservation({
+      walletAddress: WALLET_A,
+      tokenAddress: `history-${i}`,
+      source: "history",
+      tokenScore: 95,
+      profitChange: 1.5,
+      entryDelaySec: 300,
+      isEarly: true,
+      isProfitable: true,
+    });
+  }
+
+  const engine = createDiscoveryEngine({
+    intelligence,
+    minTokenScore: 1,
+    minTrustedReputation: 1,
+    minTrustedConfidence: 1,
+    minTrustedDistinctTokens: 4,
+    minConsensusWallets: 1,
+  });
+  const trader = {
+    address: WALLET_A,
+    profit: 5000,
+    profit_change: 2,
+    start_holding_at: 1200,
+  };
+
+  const first = await engine.processToken({
+    tokenAddress: TOKEN,
+    tokenInfo: { open_timestamp: 1000 },
+    traders: [trader],
+  });
+  assert.equal(intelligence.getProfile(WALLET_A).distinct_tokens, 4);
+  assert.equal(first.trusted.length, 0);
+  assert.equal(first.consensus, null);
+
+  intelligence.recordObservation({
+    walletAddress: WALLET_A,
+    tokenAddress: "history-3",
+    source: "history",
+    tokenScore: 95,
+    profitChange: 1.5,
+    entryDelaySec: 300,
+    isEarly: true,
+    isProfitable: true,
+  });
+  const second = await engine.processToken({
+    tokenAddress: TOKEN,
+    tokenInfo: { open_timestamp: 1000 },
+    traders: [trader],
+  });
+  assert.equal(second.trusted.length, 1);
+  assert.equal(second.consensus.walletCount, 1);
+  assert.equal(second.consensus.wallets[0].distinctTokens, 4);
   db.close();
 });
 

@@ -51,6 +51,8 @@ function makeDb() {
 test("progress snapshot counts trusted wallets without exposing their identities", () => {
   const db = makeDb();
   db.prepare("INSERT INTO meta(key, value) VALUES ('discovery_cycle_number', '14')").run();
+  db.prepare("INSERT INTO meta(key, value) VALUES ('gmgn_blocked_until', ?)")
+    .run(String(Date.now() + 60_000));
   db.prepare(`
     INSERT INTO token_discovery_state(
       token_address, first_seen_at, last_seen_at, last_scanned_at,
@@ -77,6 +79,18 @@ test("progress snapshot counts trusted wallets without exposing their identities
       TRUSTED_CONFIDENCE: "50",
       TRUSTED_DISTINCT_TOKENS: "4",
     },
+    gmgnGuard: {
+      snapshot: () => ({
+        freshCalls: 3,
+        maxFreshCalls: 5,
+        effectiveMaxFreshCalls: 4,
+        remaining: 1,
+        cacheHits: 6,
+        coalesced: 2,
+        rateLimitEvents: 1,
+        cooldownRemainingMs: 1500,
+      }),
+    },
   });
   const snapshot = store.snapshot();
 
@@ -92,10 +106,15 @@ test("progress snapshot counts trusted wallets without exposing their identities
   });
   assert.equal(snapshot.recent[0].scannedAt, 2000);
   assert.equal(snapshot.recent[1].candidatesFound, 5);
+  assert.equal(snapshot.gmgn.effectiveMax, 4);
+  assert.equal(snapshot.gmgn.cacheHits + snapshot.gmgn.coalesced, 8);
+  assert.ok(snapshot.gmgn.cooldownRemainingMs > 50_000);
 
   const html = renderDashboard(snapshot);
   assert.match(html, /Smart wallets found/);
   assert.match(html, /Recent activity/);
+  assert.match(html, /GMGN calls \/ window/);
+  assert.match(html, /GMGN cooldown/);
   assert.doesNotMatch(html, /secret-smart-wallet|not-yet-trusted|seed-secret|token-a|token-b/);
   db.close();
 });

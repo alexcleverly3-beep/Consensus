@@ -8,17 +8,23 @@ test("formatBudgetSnapshot exposes request pressure and savings", () => {
   const text = formatBudgetSnapshot({
     freshCalls: 3,
     maxFreshCalls: 5,
+    effectiveMaxFreshCalls: 3,
     remaining: 2,
     cacheHits: 4,
     coalesced: 1,
     rejected: 2,
+    rateLimitEvents: 3,
+    cooldownRemainingMs: 2500,
     windowMs: 20 * 60 * 1000,
   });
-  assert.match(text, /fresh=3\/5/);
+  assert.match(text, /fresh=3\/3/);
+  assert.match(text, /configured=5/);
   assert.match(text, /remaining=2/);
   assert.match(text, /cache=4/);
   assert.match(text, /coalesced=1/);
   assert.match(text, /rejected=2/);
+  assert.match(text, /rateLimits=3/);
+  assert.match(text, /cooldown=3s/);
   assert.match(text, /window=20m/);
 });
 

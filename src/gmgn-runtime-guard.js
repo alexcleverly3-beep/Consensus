@@ -83,6 +83,8 @@ function createGmgnExecGuard({
   adaptive = true,
   now = () => Date.now(),
   ttlForKind = defaultTtlMs,
+  initialState = {},
+  onStateChange = null,
 } = {}) {
   if (typeof execFile !== "function") throw new Error("execFile is required");
 
@@ -93,16 +95,46 @@ function createGmgnExecGuard({
   const cleanWindowsNeeded = clampInt(recoveryWindows, 2, 1, 20);
   const cache = new Map();
   const inflight = new Map();
-  let windowStartedAt = now();
-  let freshCalls = 0;
+  const startedAt = Number(initialState.windowStartedAt);
+  let windowStartedAt = Number.isFinite(startedAt) && startedAt >= 0 && startedAt <= now()
+    ? startedAt
+    : now();
+  let freshCalls = Math.max(0, Math.floor(Number(initialState.freshCalls) || 0));
   let cacheHits = 0;
   let coalesced = 0;
   let rejected = 0;
-  let rateLimitEvents = 0;
-  let windowRateLimits = 0;
-  let cleanWindows = 0;
-  let effectiveMaxFreshCalls = maxCalls;
-  let blockedUntil = 0;
+  let rateLimitEvents = Math.max(0, Math.floor(Number(initialState.rateLimitEvents) || 0));
+  let windowRateLimits = Math.max(0, Math.floor(Number(initialState.windowRateLimits) || 0));
+  let cleanWindows = Math.max(0, Math.floor(Number(initialState.cleanWindows) || 0));
+  let effectiveMaxFreshCalls = clampInt(
+    initialState.effectiveMaxFreshCalls,
+    maxCalls,
+    minCalls,
+    maxCalls
+  );
+  let blockedUntil = Math.max(0, Math.floor(Number(initialState.blockedUntil) || 0));
+  let persistenceErrors = 0;
+
+  function persistentState() {
+    return {
+      windowStartedAt,
+      freshCalls,
+      effectiveMaxFreshCalls,
+      rateLimitEvents,
+      cleanWindows,
+      windowRateLimits,
+      blockedUntil,
+    };
+  }
+
+  function persistState() {
+    if (typeof onStateChange !== "function") return;
+    try {
+      onStateChange(persistentState());
+    } catch {
+      persistenceErrors += 1;
+    }
+  }
 
   function rollWindow(at) {
     if (at - windowStartedAt < safeWindowMs) return;
@@ -121,6 +153,7 @@ function createGmgnExecGuard({
     windowStartedAt += elapsedWindows * safeWindowMs;
     freshCalls = 0;
     windowRateLimits = 0;
+    persistState();
   }
 
   function keyFor(file, args) {
@@ -143,6 +176,7 @@ function createGmgnExecGuard({
       cleanWindows,
       blockedUntil,
       cooldownRemainingMs: Math.max(0, blockedUntil - at),
+      persistenceErrors,
       windowStartedAt,
       windowMs: safeWindowMs,
       adaptive: Boolean(adaptive),
@@ -191,6 +225,7 @@ function createGmgnExecGuard({
     }
 
     freshCalls += 1;
+    persistState();
     inflight.set(key, [callback]);
     return execFile(file, effectiveArgs, options, (error, stdout, stderr) => {
       const callbacks = inflight.get(key) || [];
@@ -202,6 +237,7 @@ function createGmgnExecGuard({
         cleanWindows = 0;
         effectiveMaxFreshCalls = Math.max(minCalls, Math.floor(effectiveMaxFreshCalls / 2));
         blockedUntil = Math.max(blockedUntil, now() + safeCooldownMs);
+        persistState();
       } else if (!error) {
         const ttlMs = Math.max(0, Number(ttlForKind(kind)) || 0);
         if (ttlMs > 0) cache.set(key, { stdout, stderr, expiresAt: now() + ttlMs });
@@ -212,6 +248,7 @@ function createGmgnExecGuard({
   }
 
   guardedExecFile.snapshot = snapshot;
+  guardedExecFile.persistentState = persistentState;
   guardedExecFile.clearCache = () => cache.clear();
   return guardedExecFile;
 }

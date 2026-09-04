@@ -10,16 +10,17 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const { initIntelligence } = require("./intelligence");
 const { createDiscoveryEngine } = require("./discovery-engine");
 const { extractTokenCandidates, shouldScanToken } = require("./market-discovery");
-const { parseSeedWallets } = require("./seed-discovery");
+const { boundedSeedQueueSelection, nextDueSeedWallet, parseSeedWallets } = require("./seed-discovery");
 const { collectSeedHistory } = require("./seed-history");
 const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
 const { initOutcomeRescan } = require("./outcome-rescan");
+const { resolveDbPath } = require("./runtime-config");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
 const DEFAULT_SEED_WALLETS = ["CaHbjM1AGhDPBR6JwiNHaUZAJBykqvj9LPxDouxXbiWB"];
 
-const DB_PATH = String(process.env.DB_PATH || path.join(process.cwd(), "data", "wallets.db")).trim();
+const DB_PATH = resolveDbPath();
 const DISCORD_CHANNEL_ID = String(process.env.DISCORD_CHANNEL_ID || "").trim();
 const MIN_GMGN_GAP_MS = clampInt(process.env.GMGN_MIN_REQUEST_GAP_MS, 12000, 3000, 60000);
 const DISCOVERY_INTERVAL_MS = clampInt(process.env.DISCOVERY_INTERVAL_MINUTES, 20, 5, 180) * 60 * 1000;
@@ -29,17 +30,26 @@ const TRENDING_LIMIT = clampInt(process.env.TRENDING_LIMIT, 12, 5, 50);
 const CONSENSUS_WALLETS = clampInt(process.env.CONSENSUS_WALLETS, 2, 2, 5);
 const TRUSTED_REPUTATION = clampInt(process.env.TRUSTED_REPUTATION, 65, 40, 95);
 const TRUSTED_CONFIDENCE = clampInt(process.env.TRUSTED_CONFIDENCE, 50, 20, 95);
+const TRUSTED_DISTINCT_TOKENS = clampInt(process.env.TRUSTED_DISTINCT_TOKENS, 4, 2, 100);
+const TRUSTED_SEED_LIMIT = clampInt(process.env.TRUSTED_SEED_LIMIT, 20, 1, 100);
+const TRUSTED_SEED_MAX_BAD_RATE = clampNumber(process.env.TRUSTED_SEED_MAX_BAD_RATE, 0.25, 0, 1);
 const SEED_WALLETS = parseSeedWallets(process.env.SEED_WALLETS, DEFAULT_SEED_WALLETS);
 const SEED_REFRESH_MS = clampInt(process.env.SEED_REFRESH_HOURS, 6, 6, 168) * 60 * 60 * 1000;
 const SEED_ACTIVITY_LIMIT = clampInt(process.env.SEED_ACTIVITY_LIMIT, 100, 20, 100);
 const SEED_TOKEN_LIMIT = clampInt(process.env.SEED_TOKEN_LIMIT, 250, 10, 1000);
 const SEED_HISTORY_PAGES = clampInt(process.env.SEED_HISTORY_PAGES, 1, 1, 3);
 const SEED_SCAN_EVERY_CYCLES = clampInt(process.env.SEED_SCAN_EVERY_CYCLES, 2, 1, 12);
+const MAX_PENDING_SEED_TOKENS = clampInt(process.env.MAX_PENDING_SEED_TOKENS, 1000, 100, 10000);
 const OUTCOME_RESCAN_EVERY_CYCLES = clampInt(process.env.OUTCOME_RESCAN_EVERY_CYCLES, 3, 1, 12);
 
 function clampInt(value, fallback, min, max) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
+}
+
+function clampNumber(value, fallback, min, max) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
 }
 
 function short(address) {
@@ -154,6 +164,10 @@ const enqueueSeedTokenStmt = db.prepare(`
   VALUES (?, ?, ?, ?, 'pending')
   ON CONFLICT(token_address, source_wallet) DO UPDATE SET
     activity_at = MAX(seed_token_queue.activity_at, excluded.activity_at)
+`);
+const getSeedTokenStmt = db.prepare(`
+  SELECT status FROM seed_token_queue
+  WHERE token_address = ? AND source_wallet = ?
 `);
 const nextSeedTokenStmt = db.prepare(`
   SELECT * FROM seed_token_queue
@@ -297,6 +311,7 @@ const engine = createDiscoveryEngine({
   maxEnrichments: 0,
   minTrustedReputation: TRUSTED_REPUTATION,
   minTrustedConfidence: TRUSTED_CONFIDENCE,
+  minTrustedDistinctTokens: TRUSTED_DISTINCT_TOKENS,
   minConsensusWallets: CONSENSUS_WALLETS,
 });
 
@@ -407,11 +422,26 @@ async function maybeSendConsensus(result) {
 
 async function refreshOneSeedWallet() {
   const now = Date.now();
-  const wallet = SEED_WALLETS.find((address) => {
-    const state = getSeedStateStmt.get(address);
-    return !state?.last_refreshed_at || now - state.last_refreshed_at >= SEED_REFRESH_MS;
+  const selected = nextDueSeedWallet({
+    configuredWallets: SEED_WALLETS,
+    trustedProfiles: intelligence.getTopProfiles({
+      limit: Math.min(500, TRUSTED_SEED_LIMIT * 5),
+      minObservations: 1,
+    }),
+    stateByWallet: (walletAddress) => getSeedStateStmt.get(walletAddress),
+    now,
+    refreshMs: SEED_REFRESH_MS,
+    trustedOptions: {
+      minReputation: TRUSTED_REPUTATION,
+      minConfidence: TRUSTED_CONFIDENCE,
+      minDistinctTokens: TRUSTED_DISTINCT_TOKENS,
+      maxBadTokenRate: TRUSTED_SEED_MAX_BAD_RATE,
+      limit: TRUSTED_SEED_LIMIT,
+    },
   });
-  if (!wallet) return null;
+  if (!selected) return null;
+
+  const wallet = selected.walletAddress;
 
   const previous = getSeedStateStmt.get(wallet);
   const historyAlreadyExhausted = Number(previous?.history_exhausted || 0) === 1;
@@ -426,11 +456,18 @@ async function refreshOneSeedWallet() {
       fetchPage: ({ walletAddress, cursor }) => getWalletActivity(walletAddress, cursor),
     });
     const insert = db.transaction((items) => {
-      for (const token of items) {
+      const queue = seedQueueCountStmt.get() || {};
+      const selection = boundedSeedQueueSelection(items, {
+        pendingCount: Number(queue.pending || 0),
+        maxPending: MAX_PENDING_SEED_TOKENS,
+        exists: (token) => Boolean(getSeedTokenStmt.get(token.address, wallet)),
+      });
+      for (const token of selection.selected) {
         enqueueSeedTokenStmt.run(token.address, wallet, now, token.lastActivityAt || 0);
       }
+      return selection;
     });
-    insert(history.tokens);
+    const queued = insert(history.tokens);
 
     const nextHistoryCursor = historyAlreadyExhausted ? null : history.nextCursor;
     const historyExhausted = historyAlreadyExhausted || history.exhausted ? 1 : 0;
@@ -444,11 +481,13 @@ async function refreshOneSeedWallet() {
       now
     );
     console.log(
-      `[seed] ${short(wallet)} history pages=${history.pagesFetched} tokens=${history.tokens.length} ` +
+      `[seed:${selected.source}] ${short(wallet)} history pages=${history.pagesFetched} tokens=${history.tokens.length} ` +
+      `queued=${queued.selected.length} queue-skipped=${queued.skipped} ` +
       `backfill=${historyExhausted ? "complete" : "continuing"}`
     );
     return {
       wallet,
+      source: selected.source,
       tokenCount: history.tokens.length,
       pagesFetched: history.pagesFetched,
       historyExhausted: Boolean(historyExhausted),
@@ -539,7 +578,7 @@ async function discoveryCycle() {
       if (followedUp) return;
     }
 
-    const seedTurn = SEED_WALLETS.length > 0 && cycleNumber % SEED_SCAN_EVERY_CYCLES === 0;
+    const seedTurn = cycleNumber % SEED_SCAN_EVERY_CYCLES === 0;
     if (seedTurn) {
       const scannedSeed = await processOneSeedToken();
       if (scannedSeed) return;
@@ -564,7 +603,7 @@ function statusEmbed() {
     .setDescription(rows)
     .addFields({
       name: "Seed backfill",
-      value: `${SEED_WALLETS.length} seed wallet(s) • ${Number(queue.pending || 0)} pending • ${Number(queue.done || 0)} scanned`,
+      value: `${SEED_WALLETS.length} configured seed wallet(s) • learned trusted seeds enabled • ${Number(queue.pending || 0)} pending • ${Number(queue.done || 0)} scanned`,
     })
     .setFooter({
       text: `Discovery every ${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m • max ${TOKEN_SCANS_PER_CYCLE} trader scan/cycle • outcome follow-up every ${OUTCOME_RESCAN_EVERY_CYCLES} cycles`,
@@ -611,7 +650,7 @@ async function start() {
   }
 
   console.log(
-    `[startup] ${SEED_WALLETS.length} seed wallet(s); GMGN gap=${MIN_GMGN_GAP_MS}ms; ` +
+    `[startup] ${SEED_WALLETS.length} configured seed wallet(s); trusted seed feedback enabled; GMGN gap=${MIN_GMGN_GAP_MS}ms; ` +
     `cycle=${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m; seed refresh=${Math.round(SEED_REFRESH_MS / 3600000)}h; ` +
     `outcome follow-up every ${OUTCOME_RESCAN_EVERY_CYCLES} cycles`
   );

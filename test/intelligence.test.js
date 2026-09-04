@@ -282,3 +282,30 @@ test("four independent winners build materially more confidence than four source
   assert.ok(broad.confidence_score > repeated.confidence_score);
   db.close();
 });
+
+test("profile aggregation can exclude the current token from historical trust", () => {
+  const db = new Database(":memory:");
+  const intelligence = initIntelligence(db);
+
+  for (let i = 0; i < 4; i += 1) {
+    intelligence.recordObservation({
+      walletAddress: "wallet-history-boundary",
+      tokenAddress: `token-${i}`,
+      source: "discovery",
+      tokenScore: 90,
+      profitChange: 1.2,
+      isEarly: true,
+      isProfitable: true,
+    });
+  }
+
+  const full = intelligence.getProfile("wallet-history-boundary");
+  const historical = intelligence.getProfileExcludingToken(
+    "wallet-history-boundary",
+    "token-3"
+  );
+  assert.equal(full.distinct_tokens, 4);
+  assert.equal(historical.distinct_tokens, 3);
+  assert.ok(historical.confidence_score < full.confidence_score);
+  db.close();
+});

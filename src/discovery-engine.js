@@ -14,7 +14,9 @@ function num(value, fallback = 0) {
 
 function normalizeFraction(value) {
   const n = num(value);
-  if (n > 1 && n <= 100) return n / 100;
+  // GMGN reports profit_change/realized_pnl as multiplier ratios: 1.5 means
+  // +150%, not 1.5%. Dividing values above 1 silently erased strong current-
+  // token evidence and could prevent genuinely early winners from qualifying.
   return clamp(n, -10, 10);
 }
 
@@ -165,6 +167,10 @@ function createDiscoveryEngine({
         continue;
       }
 
+      const historicalProfile = typeof intelligence.getProfileExcludingToken === "function"
+        ? intelligence.getProfileExcludingToken(walletAddress, tokenAddress)
+        : intelligence.getProfile(walletAddress);
+
       const profile = intelligence.recordObservation({
         walletAddress,
         tokenAddress,
@@ -188,6 +194,7 @@ function createDiscoveryEngine({
         trader,
         evidence,
         profile,
+        historicalProfile,
         priority: candidatePriority({ evidence, profile, tags }),
       });
     }
@@ -240,8 +247,8 @@ function createDiscoveryEngine({
     }
 
     const trusted = candidates.filter((candidate) => {
-      const profile = intelligence.getProfile(candidate.walletAddress) || candidate.profile;
-      candidate.profile = profile;
+      const profile = candidate.historicalProfile;
+      candidate.trustedProfile = profile;
       return currentConsensusEligible(candidate.evidence, minConsensusTokenScore) &&
         num(profile?.reputation_score) >= minTrustedReputation &&
         num(profile?.confidence_score) >= minTrustedConfidence &&
@@ -254,9 +261,9 @@ function createDiscoveryEngine({
           walletCount: trusted.length,
           wallets: trusted.map((candidate) => ({
             walletAddress: candidate.walletAddress,
-            reputation: num(candidate.profile?.reputation_score),
-            confidence: num(candidate.profile?.confidence_score),
-            distinctTokens: num(candidate.profile?.distinct_tokens),
+            reputation: num(candidate.trustedProfile?.reputation_score),
+            confidence: num(candidate.trustedProfile?.confidence_score),
+            distinctTokens: num(candidate.trustedProfile?.distinct_tokens),
             tokenScore: candidate.evidence.tokenScore,
           })),
         }

@@ -134,6 +134,7 @@ function initIntelligence(db) {
         MAX(observed_at) AS last_seen_at
       FROM wallet_evidence
       WHERE wallet_address = ?
+        AND (? IS NULL OR token_address <> ?)
       GROUP BY token_address
     ), scored AS (
       SELECT *,
@@ -236,8 +237,7 @@ function initIntelligence(db) {
     WHERE token_address = ?
   `);
 
-  function refreshProfile(walletAddress, now = Date.now()) {
-    const aggregate = aggregateWallet.get(walletAddress) || {};
+  function profileFromAggregate(walletAddress, aggregate = {}, now = Date.now()) {
     const observations = num(aggregate.observations);
     const distinctTokens = num(aggregate.distinct_tokens);
     const positiveSignals = num(aggregate.positive_signals);
@@ -278,23 +278,50 @@ function initIntelligence(db) {
       matureTokens
     );
 
-    upsertProfile.run(
-      walletAddress,
-      num(aggregate.first_seen_at, now),
-      num(aggregate.last_seen_at, now),
+    return {
+      wallet_address: walletAddress,
+      first_seen_at: num(aggregate.first_seen_at, now),
+      last_seen_at: num(aggregate.last_seen_at, now),
       observations,
-      distinctTokens,
-      positiveSignals,
-      negativeSignals,
-      earlyEntries,
-      profitableEntries,
-      badHits,
-      aggregate.avg_entry_delay_sec,
-      aggregate.avg_hold_sec,
-      aggregate.avg_token_score,
-      reputationScore,
-      confidence.score,
-      confidence.label
+      distinct_tokens: distinctTokens,
+      positive_signals: positiveSignals,
+      negative_signals: negativeSignals,
+      early_entries: earlyEntries,
+      profitable_entries: profitableEntries,
+      rug_or_bad_token_hits: badHits,
+      avg_entry_delay_sec: aggregate.avg_entry_delay_sec,
+      avg_hold_sec: aggregate.avg_hold_sec,
+      avg_token_score: aggregate.avg_token_score,
+      reputation_score: reputationScore,
+      confidence_score: confidence.score,
+      confidence_label: confidence.label,
+    };
+  }
+
+  function refreshProfile(walletAddress, now = Date.now()) {
+    const profile = profileFromAggregate(
+      walletAddress,
+      aggregateWallet.get(walletAddress, null, null) || {},
+      now
+    );
+
+    upsertProfile.run(
+      profile.wallet_address,
+      profile.first_seen_at,
+      profile.last_seen_at,
+      profile.observations,
+      profile.distinct_tokens,
+      profile.positive_signals,
+      profile.negative_signals,
+      profile.early_entries,
+      profile.profitable_entries,
+      profile.rug_or_bad_token_hits,
+      profile.avg_entry_delay_sec,
+      profile.avg_hold_sec,
+      profile.avg_token_score,
+      profile.reputation_score,
+      profile.confidence_score,
+      profile.confidence_label
     );
 
     return getProfileStmt.get(walletAddress);
@@ -350,6 +377,12 @@ function initIntelligence(db) {
     applyTokenOutcome,
     getProfile(walletAddress) {
       return getProfileStmt.get(walletAddress) || null;
+    },
+    getProfileExcludingToken(walletAddress, tokenAddress) {
+      if (!walletAddress || !tokenAddress) return null;
+      const aggregate = aggregateWallet.get(walletAddress, tokenAddress, tokenAddress) || {};
+      if (num(aggregate.distinct_tokens) === 0) return null;
+      return profileFromAggregate(walletAddress, aggregate);
     },
     getTopProfiles({ limit = 25, minObservations = 2 } = {}) {
       return topProfilesStmt.all(

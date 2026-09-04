@@ -217,3 +217,56 @@ test("adaptive budget recovers one call after clean windows", async () => {
   time = 120_002;
   assert.equal(guarded.snapshot().effectiveMaxFreshCalls, 4);
 });
+
+test("rolling budget and adaptive cooldown survive a guard restart", async () => {
+  let time = 1_000;
+  let persisted = {};
+  const rateLimited = (file, args, options, cb) => {
+    queueMicrotask(() => cb(new Error("429 rate limit exceeded"), "", ""));
+    return {};
+  };
+  const first = createGmgnExecGuard({
+    execFile: rateLimited,
+    maxFreshCalls: 8,
+    minFreshCalls: 2,
+    windowMs: 60_000,
+    cooldownMs: 5_000,
+    now: () => time,
+    ttlForKind: () => 0,
+    onStateChange: (state) => { persisted = state; },
+  });
+
+  await assert.rejects(call(first, ["token", "info", "--address", "a"]));
+  assert.equal(persisted.freshCalls, 1);
+  assert.equal(persisted.effectiveMaxFreshCalls, 4);
+  assert.equal(persisted.blockedUntil, 6_000);
+
+  let callsAfterRestart = 0;
+  const restarted = createGmgnExecGuard({
+    execFile(file, args, options, cb) {
+      callsAfterRestart += 1;
+      queueMicrotask(() => cb(null, "ok", ""));
+      return {};
+    },
+    maxFreshCalls: 8,
+    minFreshCalls: 2,
+    windowMs: 60_000,
+    cooldownMs: 5_000,
+    now: () => time,
+    ttlForKind: () => 0,
+    initialState: persisted,
+  });
+
+  assert.equal(restarted.snapshot().freshCalls, 1);
+  assert.equal(restarted.snapshot().effectiveMaxFreshCalls, 4);
+  await assert.rejects(
+    call(restarted, ["token", "info", "--address", "b"]),
+    (error) => error.code === "GMGN_COOLDOWN_ACTIVE"
+  );
+  assert.equal(callsAfterRestart, 0);
+
+  time = 6_001;
+  await call(restarted, ["token", "info", "--address", "b"]);
+  assert.equal(callsAfterRestart, 1);
+  assert.equal(restarted.snapshot().freshCalls, 2);
+});

@@ -1,0 +1,10 @@
+node_modules/
+.npm-cache/
+.node-gyp/
+.tmp/
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+
