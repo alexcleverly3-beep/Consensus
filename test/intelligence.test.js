@@ -142,3 +142,69 @@ test("strong mature outcome boosts token quality without duplicating evidence", 
   assert.ok(after.avg_token_score > before.avg_token_score);
   assert.ok(after.reputation_score >= before.reputation_score);
 });
+
+test("higher-quality evidence weight materially affects longitudinal reputation", () => {
+  const db = new Database(":memory:");
+  const intelligence = initIntelligence(db);
+
+  for (const walletAddress of ["wallet-normal", "wallet-weighted"]) {
+    intelligence.recordObservation({
+      walletAddress,
+      tokenAddress: "winner",
+      tokenScore: 90,
+      profitChange: 1.1,
+      isEarly: true,
+      isProfitable: true,
+      evidenceWeight: walletAddress === "wallet-weighted" ? 2 : 1,
+    });
+    intelligence.recordObservation({
+      walletAddress,
+      tokenAddress: "loser",
+      tokenScore: 20,
+      profitChange: -0.8,
+      isBadToken: true,
+      evidenceWeight: 1,
+    });
+  }
+
+  const normal = intelligence.getProfile("wallet-normal");
+  const weighted = intelligence.getProfile("wallet-weighted");
+
+  assert.equal(normal.observations, weighted.observations);
+  assert.equal(normal.distinct_tokens, weighted.distinct_tokens);
+  assert.ok(weighted.avg_token_score > normal.avg_token_score);
+  assert.ok(weighted.reputation_score > normal.reputation_score);
+  assert.ok(weighted.confidence_score > normal.confidence_score);
+});
+
+test("mature outcome weights are consumed by profile aggregation", () => {
+  const db = new Database(":memory:");
+  const intelligence = initIntelligence(db);
+
+  intelligence.recordObservation({
+    walletAddress: "wallet-outcome-weight",
+    tokenAddress: "winner",
+    tokenScore: 70,
+    profitChange: 0.7,
+    isEarly: true,
+  });
+  intelligence.recordObservation({
+    walletAddress: "wallet-outcome-weight",
+    tokenAddress: "neutral",
+    tokenScore: 40,
+    profitChange: 0,
+  });
+
+  const before = intelligence.getProfile("wallet-outcome-weight");
+  intelligence.applyTokenOutcome({
+    tokenAddress: "winner",
+    outcomeScore: 100,
+    status: "excellent",
+  });
+  const after = intelligence.getProfile("wallet-outcome-weight");
+
+  assert.equal(after.observations, 2);
+  assert.equal(after.distinct_tokens, 2);
+  assert.ok(after.avg_token_score > before.avg_token_score);
+  assert.ok(after.reputation_score > before.reputation_score);
+});
