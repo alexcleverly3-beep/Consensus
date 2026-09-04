@@ -79,9 +79,81 @@ function parseSeedWallets(value, fallback = []) {
   return [...new Set(combined.filter((wallet) => SOL_ADDR.test(wallet)))];
 }
 
+function trustedWalletSeeds(profiles, {
+  minReputation = 65,
+  minConfidence = 50,
+  minDistinctTokens = 4,
+  maxBadTokenRate = 0.25,
+  limit = 20,
+  exclude = [],
+} = {}) {
+  const excluded = new Set(exclude.map(String));
+  const candidates = [];
+
+  for (const profile of Array.isArray(profiles) ? profiles : []) {
+    const walletAddress = String(profile?.wallet_address || profile?.walletAddress || "");
+    if (!SOL_ADDR.test(walletAddress) || excluded.has(walletAddress)) continue;
+
+    const reputation = num(profile?.reputation_score ?? profile?.reputationScore);
+    const confidence = num(profile?.confidence_score ?? profile?.confidenceScore);
+    const distinctTokens = Math.max(0, Math.floor(num(profile?.distinct_tokens ?? profile?.distinctTokens)));
+    const badHits = Math.max(0, num(profile?.rug_or_bad_token_hits ?? profile?.badTokenHits));
+    const badTokenRate = distinctTokens > 0 ? badHits / distinctTokens : 1;
+
+    if (reputation < minReputation) continue;
+    if (confidence < minConfidence) continue;
+    if (distinctTokens < minDistinctTokens) continue;
+    if (badTokenRate > maxBadTokenRate) continue;
+
+    candidates.push({
+      walletAddress,
+      reputation,
+      confidence,
+      distinctTokens,
+      badTokenRate,
+    });
+  }
+
+  return candidates
+    .sort((a, b) =>
+      b.confidence - a.confidence ||
+      b.reputation - a.reputation ||
+      b.distinctTokens - a.distinctTokens ||
+      a.walletAddress.localeCompare(b.walletAddress)
+    )
+    .slice(0, Math.max(1, Math.floor(num(limit, 20))));
+}
+
+function nextDueSeedWallet({
+  configuredWallets = [],
+  trustedProfiles = [],
+  stateByWallet = () => null,
+  now = Date.now(),
+  refreshMs = 6 * 60 * 60 * 1000,
+  trustedOptions = {},
+} = {}) {
+  const configured = parseSeedWallets(configuredWallets.join(" "));
+  const trusted = trustedWalletSeeds(trustedProfiles, {
+    ...trustedOptions,
+    exclude: [...configured, ...(trustedOptions.exclude || [])],
+  });
+  const ordered = [
+    ...configured.map((walletAddress) => ({ walletAddress, source: "configured" })),
+    ...trusted.map((profile) => ({ ...profile, source: "trusted" })),
+  ];
+
+  return ordered.find((candidate) => {
+    const state = stateByWallet(candidate.walletAddress);
+    const lastRefreshedAt = num(state?.last_refreshed_at ?? state?.lastRefreshedAt, 0);
+    return !lastRefreshedAt || now - lastRefreshedAt >= refreshMs;
+  }) || null;
+}
+
 module.exports = {
   extractBoughtTokens,
+  nextDueSeedWallet,
   parseSeedWallets,
   tokenAddress,
+  trustedWalletSeeds,
   isBuy,
 };
