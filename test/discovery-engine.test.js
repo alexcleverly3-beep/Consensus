@@ -84,6 +84,44 @@ test("processToken saves free evidence before spending enrichment budget", async
   db.close();
 });
 
+test("trusted wallets require evidence across at least four distinct tokens", async () => {
+  const { db, intelligence } = makeStore();
+
+  for (let i = 0; i < 2; i += 1) {
+    intelligence.recordObservation({
+      walletAddress: WALLET_A,
+      tokenAddress: `${i + 70}`.repeat(32).slice(0, 32),
+      source: "history",
+      tokenScore: 98,
+      profitChange: 3,
+      entryDelaySec: 300,
+      isEarly: true,
+      isProfitable: true,
+    });
+  }
+
+  const engine = createDiscoveryEngine({
+    intelligence,
+    minTokenScore: 1,
+    minTrustedReputation: 1,
+    minTrustedConfidence: 1,
+    minConsensusWallets: 2,
+  });
+
+  const result = await engine.processToken({
+    tokenAddress: TOKEN,
+    tokenInfo: { open_timestamp: 1000 },
+    traders: [
+      { address: WALLET_A, profit: 5000, profit_change: 2, start_holding_at: 1200 },
+    ],
+  });
+
+  assert.equal(intelligence.getProfile(WALLET_A).distinct_tokens, 3);
+  assert.equal(result.trusted.length, 0);
+  assert.equal(result.consensus, null);
+  db.close();
+});
+
 test("known strong wallets are prioritised and can form consensus", async () => {
   const { db, intelligence } = makeStore();
 
@@ -130,6 +168,7 @@ test("known strong wallets are prioritised and can form consensus", async () => 
 
   assert.ok(result.consensus);
   assert.equal(result.consensus.walletCount, 2);
+  assert.ok(result.consensus.wallets.every((wallet) => wallet.distinctTokens >= 4));
   assert.equal(result.candidates[0].profile.confidence_label !== "low", true);
   db.close();
 });
