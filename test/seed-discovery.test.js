@@ -121,7 +121,7 @@ test("nextDueSeedWallet shares one refresh slot between configured and trusted s
   assert.equal(next.source, "trusted");
 });
 
-test("nextDueSeedWallet keeps due configured seeds ahead of learned seeds", () => {
+test("nextDueSeedWallet keeps due configured seeds ahead of learned seeds on equal staleness", () => {
   const next = nextDueSeedWallet({
     configuredWallets: [WALLET],
     trustedProfiles: [{
@@ -138,6 +138,32 @@ test("nextDueSeedWallet keeps due configured seeds ahead of learned seeds", () =
 
   assert.equal(next.walletAddress, WALLET);
   assert.equal(next.source, "configured");
+});
+
+test("nextDueSeedWallet prevents configured seeds from starving older learned seeds", () => {
+  const now = 50_000;
+  const refreshMs = 1_000;
+  const state = new Map([
+    [WALLET, { last_refreshed_at: now - 1_500 }],
+    [TRUSTED_A, { last_refreshed_at: now - 8_000 }],
+  ]);
+
+  const next = nextDueSeedWallet({
+    configuredWallets: [WALLET],
+    trustedProfiles: [{
+      wallet_address: TRUSTED_A,
+      reputation_score: 88,
+      confidence_score: 80,
+      distinct_tokens: 9,
+      rug_or_bad_token_hits: 0,
+    }],
+    stateByWallet: (walletAddress) => state.get(walletAddress),
+    now,
+    refreshMs,
+  });
+
+  assert.equal(next.walletAddress, TRUSTED_A);
+  assert.equal(next.source, "trusted");
 });
 
 test("boundedSeedQueueSelection caps new pending work but still updates existing rows", () => {
