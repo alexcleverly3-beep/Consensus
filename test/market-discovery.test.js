@@ -3,7 +3,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  analyzeTokenCandidates,
   extractTokenCandidates,
+  formatDiscoveryDiagnostics,
   shouldScanToken,
   qualityGate,
   launchedAt,
@@ -50,7 +52,7 @@ test("extractTokenCandidates rejects young pumps and prioritizes mature durable 
       ],
     },
   };
-  const rows = extractTokenCandidates(response, { limit: 10, now: NOW });
+  const rows = extractTokenCandidates(response, { limit: 10, now: NOW, diagnosticsLogger: false });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].address, B);
   assert.ok(rows[0].quality.ageMs >= 5 * DAY);
@@ -86,6 +88,35 @@ test("qualityGate rejects thinly-backed and hyperactive mature tokens", () => {
 test("qualityGate uses holder breadth when GMGN supplies it but tolerates missing holder data", () => {
   assert.equal(qualityGate(mature({ holder_count: 75 }), { now: NOW }).reason, "low-holder-count");
   assert.equal(qualityGate(mature({ holder_count: undefined }), { now: NOW }).ok, true);
+});
+
+test("qualityGate accepts interval-specific 24h volume payloads", () => {
+  const row = mature({ volume: undefined, volume_24h: 75000 });
+  const gate = qualityGate(row, { now: NOW });
+  assert.equal(gate.ok, true);
+  assert.equal(gate.volume, 75000);
+});
+
+test("candidate analysis explains quality rejection and deduplication without extra requests", () => {
+  const response = { data: { list: [
+    { address: A, ...mature({ creation_timestamp: Math.floor((NOW - 3 * 60 * 60 * 1000) / 1000) }) },
+    { address: B, ...mature() },
+    { address: B, ...mature({ liquidity: 90000 }) },
+    { address: "not-a-solana-address", ...mature() },
+  ] } };
+  const analysis = analyzeTokenCandidates(response, { now: NOW, limit: 10 });
+  assert.equal(analysis.candidates.length, 1);
+  assert.equal(analysis.candidates[0].address, B);
+  assert.deepEqual(analysis.diagnostics, {
+    rows: 4,
+    uniqueAddresses: 2,
+    accepted: 1,
+    selected: 1,
+    invalidAddress: 1,
+    duplicateAddress: 1,
+    rejected: { "too-young": 1 },
+  });
+  assert.match(formatDiscoveryDiagnostics(analysis.diagnostics), /rejected\[too-young=1\]/);
 });
 
 test("launchedAt normalizes second and millisecond timestamps", () => {
