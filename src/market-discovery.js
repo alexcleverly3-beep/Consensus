@@ -1,5 +1,7 @@
 "use strict";
 
+const DEFAULT_MIN_AGE_MS = 48 * 60 * 60 * 1000;
+
 function num(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -18,29 +20,96 @@ function unwrapRows(response) {
   return [];
 }
 
-function riskScore(row) {
-  const liquidity = num(row?.liquidity ?? row?.liquidity_usd);
-  const marketCap = num(row?.market_cap ?? row?.marketcap ?? row?.fdv);
-  const volume = num(row?.volume ?? row?.volume_usd ?? row?.volume_1h);
-  const smart = num(row?.smart_degen_count ?? row?.smart_money_count);
-  const insider = num(row?.insider_rate);
-  const bundler = num(row?.bundler_rate);
+function normalizeTimestamp(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n < 1e12 ? n * 1000 : n;
+}
 
+function launchedAt(row) {
+  const candidates = [
+    row?.open_timestamp,
+    row?.creation_timestamp,
+    row?.created_at,
+    row?.launch_timestamp,
+    row?.launch_time,
+    row?.pool_creation_timestamp,
+    row?.pair_created_at,
+    row?.token?.open_timestamp,
+    row?.token?.creation_timestamp,
+    row?.base_token?.open_timestamp,
+    row?.base_token?.creation_timestamp,
+  ];
+  for (const value of candidates) {
+    const timestamp = normalizeTimestamp(value);
+    if (timestamp) return timestamp;
+  }
+  return null;
+}
+
+function marketMetrics(row) {
+  return {
+    liquidity: num(row?.liquidity ?? row?.liquidity_usd),
+    marketCap: num(row?.market_cap ?? row?.marketcap ?? row?.fdv),
+    volume: num(row?.volume ?? row?.volume_usd ?? row?.volume_1h),
+    insider: num(row?.insider_rate),
+    bundler: num(row?.bundler_rate),
+    smart: num(row?.smart_degen_count ?? row?.smart_money_count),
+  };
+}
+
+function qualityGate(row, {
+  now = Date.now(),
+  minAgeMs = DEFAULT_MIN_AGE_MS,
+  minLiquidity = 20_000,
+  minMarketCap = 100_000,
+  minVolume = 10_000,
+  maxInsiderRate = 0.35,
+  maxBundlerRate = 0.35,
+  requireKnownAge = true,
+} = {}) {
+  const launch = launchedAt(row);
+  const ageMs = launch ? Math.max(0, now - launch) : null;
+  const metrics = marketMetrics(row);
+
+  if (requireKnownAge && ageMs == null) return { ok: false, reason: "unknown-age", ageMs, ...metrics };
+  if (ageMs != null && ageMs < minAgeMs) return { ok: false, reason: "too-young", ageMs, ...metrics };
+  if (metrics.liquidity < minLiquidity) return { ok: false, reason: "low-liquidity", ageMs, ...metrics };
+  if (metrics.marketCap < minMarketCap) return { ok: false, reason: "low-market-cap", ageMs, ...metrics };
+  if (metrics.volume < minVolume) return { ok: false, reason: "low-volume", ageMs, ...metrics };
+  if (metrics.insider > maxInsiderRate) return { ok: false, reason: "high-insider-rate", ageMs, ...metrics };
+  if (metrics.bundler > maxBundlerRate) return { ok: false, reason: "high-bundler-rate", ageMs, ...metrics };
+  return { ok: true, reason: null, ageMs, ...metrics };
+}
+
+function qualityScore(row, gate) {
+  const metrics = gate || marketMetrics(row);
+  const ageDays = Number.isFinite(metrics.ageMs) ? metrics.ageMs / 86_400_000 : 0;
   let score = 0;
-  if (liquidity >= 10000) score += 2;
-  if (marketCap >= 50000) score += 1;
-  if (volume >= 25000) score += 1;
-  if (smart > 0) score += 1;
-  if (insider > 0.35) score -= 2;
-  if (bundler > 0.35) score -= 2;
+
+  // Survival is deliberately valuable: a token that remains liquid and active for
+  // several days is a better training example than a fresh one-hour pump.
+  score += Math.min(5, ageDays / 2);
+  if (metrics.liquidity >= 50_000) score += 2;
+  else if (metrics.liquidity >= 20_000) score += 1;
+  if (metrics.marketCap >= 500_000) score += 2;
+  else if (metrics.marketCap >= 100_000) score += 1;
+  if (metrics.volume >= 100_000) score += 2;
+  else if (metrics.volume >= 25_000) score += 1;
+  if (metrics.smart > 0) score += 1;
+  if (metrics.insider > 0.25) score -= 1;
+  if (metrics.bundler > 0.25) score -= 1;
   return score;
 }
 
-function extractTokenCandidates(response, { limit = 8 } = {}) {
+function extractTokenCandidates(response, { limit = 8, ...qualityOptions } = {}) {
   const seen = new Set();
   return unwrapRows(response)
-    .map((row) => ({ row, address: tokenAddress(row), score: riskScore(row) }))
-    .filter(({ address }) => typeof address === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
+    .map((row) => {
+      const gate = qualityGate(row, qualityOptions);
+      return { row, address: tokenAddress(row), quality: gate, score: gate.ok ? qualityScore(row, gate) : -Infinity };
+    })
+    .filter(({ address, quality }) => quality.ok && typeof address === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
     .filter(({ address }) => {
       if (seen.has(address)) return false;
       seen.add(address);
@@ -54,4 +123,13 @@ function shouldScanToken(lastScannedAt, now = Date.now(), cooldownMs = 6 * 60 * 
   return !lastScannedAt || now - Number(lastScannedAt) >= cooldownMs;
 }
 
-module.exports = { extractTokenCandidates, shouldScanToken, tokenAddress, unwrapRows };
+module.exports = {
+  DEFAULT_MIN_AGE_MS,
+  extractTokenCandidates,
+  shouldScanToken,
+  tokenAddress,
+  unwrapRows,
+  launchedAt,
+  qualityGate,
+  qualityScore,
+};
