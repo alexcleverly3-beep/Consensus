@@ -14,7 +14,7 @@ const { boundedSeedQueueSelection, nextDueSeedWallet, parseSeedWallets } = requi
 const { collectSeedHistory } = require("./seed-history");
 const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
 const { initOutcomeRescan } = require("./outcome-rescan");
-const { resolveDbPath } = require("./runtime-config");
+const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
@@ -23,7 +23,7 @@ const DEFAULT_SEED_WALLETS = ["CaHbjM1AGhDPBR6JwiNHaUZAJBykqvj9LPxDouxXbiWB"];
 const DB_PATH = resolveDbPath();
 const DISCORD_CHANNEL_ID = String(process.env.DISCORD_CHANNEL_ID || "").trim();
 const MIN_GMGN_GAP_MS = clampInt(process.env.GMGN_MIN_REQUEST_GAP_MS, 12000, 3000, 60000);
-const DISCOVERY_INTERVAL_MS = clampInt(process.env.DISCOVERY_INTERVAL_MINUTES, 20, 5, 180) * 60 * 1000;
+const DISCOVERY_INTERVAL_MS = resolveDiscoveryIntervalMinutes() * 60 * 1000;
 const TOKEN_RESCAN_MS = clampInt(process.env.TOKEN_RESCAN_HOURS, 12, 1, 168) * 60 * 60 * 1000;
 const TOKEN_SCANS_PER_CYCLE = clampInt(process.env.TOKENS_PER_CYCLE, 1, 1, 3);
 const TRENDING_LIMIT = clampInt(process.env.TRENDING_LIMIT, 12, 5, 50);

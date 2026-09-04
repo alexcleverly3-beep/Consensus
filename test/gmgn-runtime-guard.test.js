@@ -4,6 +4,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createGmgnExecGuard, hardenTrendingArgs } = require("../src/gmgn-runtime-guard");
 
+test("default guard capacity permits eight carefully spaced calls per window", () => {
+  const guarded = createGmgnExecGuard({ execFile: () => {} });
+  assert.equal(guarded.snapshot().maxFreshCalls, 8);
+  assert.equal(guarded.snapshot().effectiveMaxFreshCalls, 8);
+});
+
 function call(execFile, args) {
   return new Promise((resolve, reject) => {
     execFile("gmgn-cli", args, {}, (error, stdout) => {

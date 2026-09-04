@@ -75,7 +75,7 @@ function hardenTrendingArgs(args = []) {
 
 function createGmgnExecGuard({
   execFile,
-  maxFreshCalls = 5,
+  maxFreshCalls = 8,
   minFreshCalls = 1,
   windowMs = 20 * 60 * 1000,
   cooldownMs = 30 * 1000,
@@ -88,7 +88,7 @@ function createGmgnExecGuard({
 } = {}) {
   if (typeof execFile !== "function") throw new Error("execFile is required");
 
-  const maxCalls = clampInt(maxFreshCalls, 5, 1, 100);
+  const maxCalls = clampInt(maxFreshCalls, 8, 1, 100);
   const minCalls = clampInt(minFreshCalls, 1, 1, maxCalls);
   const safeWindowMs = clampInt(windowMs, 20 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000);
   const safeCooldownMs = clampInt(cooldownMs, 30 * 1000, 1000, 60 * 60 * 1000);
@@ -258,7 +258,7 @@ function install(options = {}) {
   if (childProcess.execFile?.__consensusGmgnGuard) return childProcess.execFile;
 
   const original = childProcess.execFile;
-  const maxFreshCalls = clampInt(process.env.GMGN_MAX_FRESH_CALLS_PER_WINDOW, 5, 1, 100);
+  const maxFreshCalls = clampInt(process.env.GMGN_MAX_FRESH_CALLS_PER_WINDOW, 8, 1, 100);
   const minFreshCalls = clampInt(process.env.GMGN_MIN_FRESH_CALLS_PER_WINDOW, 1, 1, maxFreshCalls);
   const windowMinutes = clampInt(process.env.GMGN_BUDGET_WINDOW_MINUTES, 20, 1, 1440);
   const cooldownSeconds = clampInt(process.env.GMGN_ADAPTIVE_COOLDOWN_SECONDS, 30, 1, 3600);

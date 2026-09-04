@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("path");
-const { resolveDbPath } = require("../src/runtime-config");
+const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("../src/runtime-config");
 const railway = require("../railway.json");
 
 test("Railway uses its supported Railpack builder and health endpoint", () => {
@@ -41,4 +41,10 @@ test("Railway refuses to start without persistent database storage", () => {
     () => resolveDbPath({ RAILWAY_DEPLOYMENT_ID: "deployment-id" }, cwd),
     /Persistent database storage is required/
   );
+});
+
+test("discovery defaults to a conservative ten-minute cycle", () => {
+  assert.equal(resolveDiscoveryIntervalMinutes({}), 10);
+  assert.equal(resolveDiscoveryIntervalMinutes({ DISCOVERY_INTERVAL_MINUTES: "15" }), 15);
+  assert.equal(resolveDiscoveryIntervalMinutes({ DISCOVERY_INTERVAL_MINUTES: "1" }), 5);
 });

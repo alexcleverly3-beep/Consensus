@@ -2,6 +2,17 @@
 
 const path = require("path");
 
+function clampInt(value, fallback, min, max) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.max(min, Math.min(max, Math.floor(parsed)))
+    : fallback;
+}
+
+function resolveDiscoveryIntervalMinutes(env = process.env) {
+  return clampInt(env.DISCOVERY_INTERVAL_MINUTES, 10, 5, 180);
+}
+
 function resolveDbPath(env = process.env, cwd = process.cwd()) {
   const configured = String(env.DB_PATH || "").trim();
   if (configured) return path.resolve(cwd, configured);
@@ -23,4 +34,4 @@ function resolveDbPath(env = process.env, cwd = process.cwd()) {
   return path.join(dataDirectory, "wallets.db");
 }
 
-module.exports = { resolveDbPath };
+module.exports = { resolveDbPath, resolveDiscoveryIntervalMinutes };
