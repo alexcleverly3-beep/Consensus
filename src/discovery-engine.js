@@ -108,7 +108,17 @@ function defaultTraderFilter(trader, creatorAddress) {
   ].map((tag) => String(tag).toLowerCase());
   const blocked = ["rat_trader", "bundler", "dex_bot", "dev", "arbitrager", "mev_bot"];
   const bad = tags.find((tag) => blocked.includes(tag));
-  return bad ? `tag:${bad}` : null;
+  if (bad) return `tag:${bad}`;
+
+  // Explicit GMGN labels are useful but incomplete. Very high transaction churn
+  // on one token is not a copyable discretionary-wallet pattern and can otherwise
+  // dominate the top-profit list with market-making / execution bots. Reject only
+  // an extreme threshold so ordinary scaling in/out remains eligible.
+  const buyCount = Math.max(0, num(trader?.buy_tx_count_cur));
+  const sellCount = Math.max(0, num(trader?.sell_tx_count_cur));
+  if (buyCount + sellCount >= 80) return "high-frequency-trading";
+
+  return null;
 }
 
 function currentConsensusEligible(evidence, minConsensusTokenScore = 45) {
