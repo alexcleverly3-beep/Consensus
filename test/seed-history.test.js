@@ -60,3 +60,22 @@ test("collectSeedHistory obeys the page budget and exposes the continuation curs
   assert.equal(result.exhausted, false);
   assert.ok(result.nextCursor);
 });
+
+test("collectSeedHistory resumes from a persisted cursor without rereading page one", async () => {
+  const calls = [];
+  const result = await collectSeedHistory({
+    walletAddress: WALLET,
+    startCursor: "older-page",
+    maxPages: 1,
+    fetchPage: async ({ cursor }) => {
+      calls.push(cursor);
+      return { data: { list: [buy(TOKEN_B, 50)], next_cursor: "even-older" } };
+    },
+  });
+
+  assert.deepEqual(calls, ["older-page"]);
+  assert.equal(result.startCursor, "older-page");
+  assert.equal(result.nextCursor, "even-older");
+  assert.equal(result.exhausted, false);
+  assert.equal(result.tokens[0].address, TOKEN_B);
+});
