@@ -24,6 +24,13 @@ function confidenceFromEvidence(observations, distinctTokens, positiveSignals) {
   };
 }
 
+function ensureColumn(db, tableName, columnName, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (!columns.some((column) => column.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
 function initIntelligence(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS wallet_profiles (
@@ -53,6 +60,7 @@ function initIntelligence(db) {
       observed_at INTEGER NOT NULL,
       source TEXT NOT NULL DEFAULT 'scan',
       token_score REAL,
+      outcome_score REAL,
       entry_delay_sec REAL,
       hold_sec REAL,
       profit_change REAL,
@@ -70,6 +78,8 @@ function initIntelligence(db) {
     CREATE INDEX IF NOT EXISTS idx_wallet_evidence_token
       ON wallet_evidence(token_address, observed_at DESC);
   `);
+
+  ensureColumn(db, "wallet_evidence", "outcome_score", "REAL");
 
   const insertEvidence = db.prepare(`
     INSERT INTO wallet_evidence (
@@ -112,7 +122,11 @@ function initIntelligence(db) {
       SUM(is_bad_token) AS rug_or_bad_token_hits,
       AVG(CASE WHEN entry_delay_sec IS NOT NULL AND entry_delay_sec >= 0 THEN entry_delay_sec END) AS avg_entry_delay_sec,
       AVG(CASE WHEN hold_sec IS NOT NULL AND hold_sec >= 0 THEN hold_sec END) AS avg_hold_sec,
-      AVG(token_score) AS avg_token_score,
+      AVG(CASE
+        WHEN outcome_score IS NULL THEN token_score
+        WHEN token_score IS NULL THEN outcome_score
+        ELSE token_score * 0.55 + outcome_score * 0.45
+      END) AS avg_token_score,
       MIN(observed_at) AS first_seen_at,
       MAX(observed_at) AS last_seen_at
     FROM wallet_evidence
@@ -177,11 +191,7 @@ function initIntelligence(db) {
 
   const applyOutcomeStmt = db.prepare(`
     UPDATE wallet_evidence
-    SET token_score = CASE
-          WHEN ? IS NULL THEN token_score
-          WHEN token_score IS NULL THEN ?
-          ELSE ROUND(token_score * 0.55 + ? * 0.45, 2)
-        END,
+    SET outcome_score = ?,
         is_bad_token = CASE WHEN ? = 1 THEN 1 ELSE is_bad_token END,
         evidence_weight = CASE
           WHEN ? = 1 THEN MAX(evidence_weight, 1.35)
@@ -284,7 +294,7 @@ function initIntelligence(db) {
     const wallets = walletsForTokenStmt.all(tokenAddress).map((row) => row.wallet_address);
     if (!wallets.length) return { tokenAddress, updatedWallets: 0, profiles: [] };
 
-    applyOutcomeStmt.run(score, score, score, isBad, isBad, score == null ? 0 : score, tokenAddress);
+    applyOutcomeStmt.run(score, isBad, isBad, score == null ? 0 : score, tokenAddress);
     const profiles = wallets.map((walletAddress) => refreshProfile(walletAddress));
     return { tokenAddress, updatedWallets: profiles.length, profiles };
   });
