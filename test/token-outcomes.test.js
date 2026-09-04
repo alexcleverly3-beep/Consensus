@@ -3,13 +3,20 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
-const { initTokenOutcomes, classifyOutcome, normalizeTokenSnapshot } = require("../src/token-outcomes");
+const {
+  initTokenOutcomes,
+  classifyOutcome,
+  normalizeTokenSnapshot,
+  hasSnapshotData,
+} = require("../src/token-outcomes");
 
 test("normalizes common GMGN token fields", () => {
   assert.deepEqual(
     normalizeTokenSnapshot({ price_usd: "0.002", market_cap: "500000", liquidity_usd: "75000" }),
     { price: 0.002, marketCap: 500000, liquidity: 75000 }
   );
+  assert.equal(hasSnapshotData({ symbol: "TOKEN" }), false);
+  assert.equal(hasSnapshotData({ market_cap: "500000" }), true);
 });
 
 test("classifies a mature 3x token as strong", () => {
@@ -58,4 +65,24 @@ test("persists baseline and later outcome without losing the original reference 
   assert.equal(row.snapshot_count, 2);
   assert.equal(row.outcome_status, "strong");
   assert.ok(row.best_multiple >= 4);
+  db.close();
+});
+
+test("fills a missing baseline from the first later snapshot that contains market data", () => {
+  const db = new Database(":memory:");
+  const outcomes = initTokenOutcomes(db);
+  const start = 1_700_000_000_000;
+
+  outcomes.recordSnapshot({ tokenAddress: "token-sparse", observedAt: start, tokenInfo: {} });
+  const row = outcomes.recordSnapshot({
+    tokenAddress: "token-sparse",
+    observedAt: start + 60 * 60 * 1000,
+    tokenInfo: { price: 2, market_cap: 200000, liquidity: 60000 },
+  });
+
+  assert.equal(row.first_price, 2);
+  assert.equal(row.first_market_cap, 200000);
+  assert.equal(row.first_liquidity, 60000);
+  assert.equal(row.outcome_status, "immature");
+  db.close();
 });
