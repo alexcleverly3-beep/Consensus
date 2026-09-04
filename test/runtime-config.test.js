@@ -23,7 +23,22 @@ test("database defaults to the Railway volume when one is attached", () => {
 test("explicit DB_PATH wins over Railway and local defaults", () => {
   const cwd = path.resolve("service-root");
   assert.equal(
-    resolveDbPath({ DB_PATH: "custom/consensus.db", RAILWAY_VOLUME_MOUNT_PATH: "volume" }, cwd),
+    resolveDbPath(
+      {
+        DB_PATH: "custom/consensus.db",
+        RAILWAY_DEPLOYMENT_ID: "deployment-id",
+        RAILWAY_VOLUME_MOUNT_PATH: "volume",
+      },
+      cwd
+    ),
     path.join(cwd, "custom", "consensus.db")
+  );
+});
+
+test("Railway refuses to start without persistent database storage", () => {
+  const cwd = path.resolve("service-root");
+  assert.throws(
+    () => resolveDbPath({ RAILWAY_DEPLOYMENT_ID: "deployment-id" }, cwd),
+    /Persistent database storage is required/
   );
 });
