@@ -83,3 +83,62 @@ test("re-observing the same wallet/token/source updates rather than double count
   assert.equal(profile.early_entries, 1);
   assert.equal(profile.profitable_entries, 1);
 });
+
+test("mature bad token outcome penalizes every wallet exposed to that token", () => {
+  const db = new Database(":memory:");
+  const intelligence = initIntelligence(db);
+
+  const beforeA = intelligence.recordObservation({
+    walletAddress: "wallet-a",
+    tokenAddress: "token-rug",
+    tokenScore: 78,
+    profitChange: 0.8,
+    isEarly: true,
+  });
+  const beforeB = intelligence.recordObservation({
+    walletAddress: "wallet-b",
+    tokenAddress: "token-rug",
+    tokenScore: 74,
+    profitChange: 0.5,
+    isEarly: true,
+  });
+
+  const applied = intelligence.applyTokenOutcome({
+    tokenAddress: "token-rug",
+    outcomeScore: 0,
+    status: "bad",
+  });
+
+  assert.equal(applied.updatedWallets, 2);
+  const afterA = intelligence.getProfile("wallet-a");
+  const afterB = intelligence.getProfile("wallet-b");
+  assert.equal(afterA.rug_or_bad_token_hits, 1);
+  assert.equal(afterB.rug_or_bad_token_hits, 1);
+  assert.ok(afterA.reputation_score < beforeA.reputation_score);
+  assert.ok(afterB.reputation_score < beforeB.reputation_score);
+});
+
+test("strong mature outcome boosts token quality without duplicating evidence", () => {
+  const db = new Database(":memory:");
+  const intelligence = initIntelligence(db);
+
+  const before = intelligence.recordObservation({
+    walletAddress: "wallet-strong",
+    tokenAddress: "token-winner",
+    tokenScore: 50,
+    profitChange: 0.2,
+    isEarly: true,
+  });
+
+  intelligence.applyTokenOutcome({
+    tokenAddress: "token-winner",
+    outcomeScore: 100,
+    status: "excellent",
+  });
+
+  const after = intelligence.getProfile("wallet-strong");
+  assert.equal(after.observations, 1);
+  assert.equal(after.distinct_tokens, 1);
+  assert.ok(after.avg_token_score > before.avg_token_score);
+  assert.ok(after.reputation_score >= before.reputation_score);
+});
