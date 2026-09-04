@@ -12,6 +12,8 @@ const { createDiscoveryEngine } = require("./discovery-engine");
 const { extractTokenCandidates, shouldScanToken } = require("./market-discovery");
 const { parseSeedWallets } = require("./seed-discovery");
 const { collectSeedHistory } = require("./seed-history");
+const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
+const { initOutcomeRescan } = require("./outcome-rescan");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
@@ -33,6 +35,7 @@ const SEED_ACTIVITY_LIMIT = clampInt(process.env.SEED_ACTIVITY_LIMIT, 100, 20, 1
 const SEED_TOKEN_LIMIT = clampInt(process.env.SEED_TOKEN_LIMIT, 250, 10, 1000);
 const SEED_HISTORY_PAGES = clampInt(process.env.SEED_HISTORY_PAGES, 1, 1, 3);
 const SEED_SCAN_EVERY_CYCLES = clampInt(process.env.SEED_SCAN_EVERY_CYCLES, 2, 1, 12);
+const OUTCOME_RESCAN_EVERY_CYCLES = clampInt(process.env.OUTCOME_RESCAN_EVERY_CYCLES, 3, 1, 12);
 
 function clampInt(value, fallback, min, max) {
   const n = Number(value);
@@ -102,8 +105,6 @@ function ensureColumn(tableName, columnName, definition) {
   }
 }
 
-// Existing Railway databases predate resumable history state. These additive
-// migrations preserve all accumulated wallet evidence and seed queue progress.
 ensureColumn("seed_wallet_state", "history_cursor", "TEXT");
 ensureColumn("seed_wallet_state", "history_exhausted", "INTEGER NOT NULL DEFAULT 0");
 ensureColumn("seed_wallet_state", "last_history_at", "INTEGER");
@@ -288,6 +289,8 @@ async function getWalletActivity(walletAddress, cursor = null) {
 }
 
 const intelligence = initIntelligence(db);
+const outcomes = initTokenOutcomes(db);
+const outcomeRescan = initOutcomeRescan(db);
 const engine = createDiscoveryEngine({
   intelligence,
   maxFreshCalls: 0,
@@ -327,6 +330,48 @@ async function processToken(tokenAddress, source = "autonomous") {
   const result = await engine.processToken({ tokenAddress, tokenInfo, traders, source });
   markTokenScannedStmt.run(now, result.candidates.length, result.trusted.length, tokenAddress);
   return { ...result, tokenInfo, skipped: false };
+}
+
+async function processOneOutcomeFollowup() {
+  const due = outcomeRescan.nextDue();
+  if (!due) return false;
+  const attemptedAt = Date.now();
+
+  try {
+    const tokenInfo = await getTokenInfo(due.token_address);
+    if (!hasSnapshotData(tokenInfo)) {
+      throw new Error("token info contained no price, market-cap, or liquidity data");
+    }
+    const tokenOutcome = outcomes.recordSnapshot({
+      tokenAddress: due.token_address,
+      tokenInfo,
+      observedAt: attemptedAt,
+    });
+    let feedback = null;
+    if (tokenOutcome.outcome_score != null &&
+        !["unknown", "immature"].includes(String(tokenOutcome.outcome_status))) {
+      feedback = intelligence.applyTokenOutcome({
+        tokenAddress: due.token_address,
+        outcomeScore: tokenOutcome.outcome_score,
+        status: tokenOutcome.outcome_status,
+      });
+    }
+    outcomeRescan.markAttempt(due.token_address, { attemptedAt });
+    console.log(
+      `[outcome] ${short(due.token_address)} stage=${due.stage} status=${tokenOutcome.outcome_status} ` +
+      `multiple=${tokenOutcome.best_multiple == null ? "n/a" : Number(tokenOutcome.best_multiple).toFixed(2)} ` +
+      `wallets=${feedback?.updatedWallets || 0}`
+    );
+    return true;
+  } catch (error) {
+    outcomeRescan.markAttempt(due.token_address, {
+      attemptedAt,
+      error: String(error.message || error),
+    });
+    if (isRateLimitError(error)) throw error;
+    console.warn(`[outcome] ${short(due.token_address)} follow-up failed: ${error.message}`);
+    return false;
+  }
 }
 
 function consensusEmbed(result) {
@@ -387,8 +432,6 @@ async function refreshOneSeedWallet() {
     });
     insert(history.tokens);
 
-    // Once the historical cursor is exhausted, future refreshes intentionally read
-    // only the newest page. This catches new buys without restarting old pagination.
     const nextHistoryCursor = historyAlreadyExhausted ? null : history.nextCursor;
     const historyExhausted = historyAlreadyExhausted || history.exhausted ? 1 : 0;
     putSeedStateStmt.run(
@@ -488,8 +531,14 @@ async function discoveryCycle() {
   try {
     await refreshOneSeedWallet();
 
-    // Seed history and live market discovery alternate. This prevents a large
-    // historical backfill from starving live discovery while keeping GMGN use bounded.
+    // Outcome follow-ups intentionally replace, rather than add to, a normal token
+    // scan on their turn. Each costs only one token-info request and is bounded to
+    // at most one due token every configured number of cycles.
+    if (cycleNumber % OUTCOME_RESCAN_EVERY_CYCLES === 0) {
+      const followedUp = await processOneOutcomeFollowup();
+      if (followedUp) return;
+    }
+
     const seedTurn = SEED_WALLETS.length > 0 && cycleNumber % SEED_SCAN_EVERY_CYCLES === 0;
     if (seedTurn) {
       const scannedSeed = await processOneSeedToken();
@@ -518,7 +567,7 @@ function statusEmbed() {
       value: `${SEED_WALLETS.length} seed wallet(s) • ${Number(queue.pending || 0)} pending • ${Number(queue.done || 0)} scanned`,
     })
     .setFooter({
-      text: `Discovery every ${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m • max ${TOKEN_SCANS_PER_CYCLE} token scan/cycle`,
+      text: `Discovery every ${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m • max ${TOKEN_SCANS_PER_CYCLE} trader scan/cycle • outcome follow-up every ${OUTCOME_RESCAN_EVERY_CYCLES} cycles`,
     })
     .setTimestamp(new Date());
 }
@@ -563,7 +612,8 @@ async function start() {
 
   console.log(
     `[startup] ${SEED_WALLETS.length} seed wallet(s); GMGN gap=${MIN_GMGN_GAP_MS}ms; ` +
-    `cycle=${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m; seed refresh=${Math.round(SEED_REFRESH_MS / 3600000)}h`
+    `cycle=${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m; seed refresh=${Math.round(SEED_REFRESH_MS / 3600000)}h; ` +
+    `outcome follow-up every ${OUTCOME_RESCAN_EVERY_CYCLES} cycles`
   );
   await discoveryCycle();
   setInterval(discoveryCycle, DISCOVERY_INTERVAL_MS).unref();
