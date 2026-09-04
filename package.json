@@ -5,7 +5,7 @@
   "main": "src/start.js",
   "scripts": {
     "start": "node src/start.js",
-    "check": "node --check src/start.js && node --check src/app.js && node --check src/discovery-engine.js && node --check src/intelligence.js && node --check src/request-budget.js && node --check src/market-discovery.js && node --check src/seed-discovery.js && node --check src/seed-history.js",
+    "check": "node --check src/start.js && node --check src/app.js && node --check src/discovery-engine.js && node --check src/intelligence.js && node --check src/request-budget.js && node --check src/market-discovery.js && node --check src/seed-discovery.js && node --check src/seed-history.js && node --check src/token-outcomes.js",
     "test": "node --test"
   },
   "engines": {
