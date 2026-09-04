@@ -137,16 +137,33 @@ function nextDueSeedWallet({
     ...trustedOptions,
     exclude: [...configured, ...(trustedOptions.exclude || [])],
   });
-  const ordered = [
-    ...configured.map((walletAddress) => ({ walletAddress, source: "configured" })),
-    ...trusted.map((profile) => ({ ...profile, source: "trusted" })),
-  ];
-
-  return ordered.find((candidate) => {
+  const candidates = [
+    ...configured.map((walletAddress, index) => ({ walletAddress, source: "configured", sourceRank: 0, rank: index })),
+    ...trusted.map((profile, index) => ({ ...profile, source: "trusted", sourceRank: 1, rank: index })),
+  ].map((candidate) => {
     const state = stateByWallet(candidate.walletAddress);
     const lastRefreshedAt = num(state?.last_refreshed_at ?? state?.lastRefreshedAt, 0);
-    return !lastRefreshedAt || now - lastRefreshedAt >= refreshMs;
-  }) || null;
+    return { ...candidate, lastRefreshedAt };
+  }).filter((candidate) =>
+    !candidate.lastRefreshedAt || now - candidate.lastRefreshedAt >= refreshMs
+  );
+
+  // Share one GMGN refresh slot fairly. Once a wallet has been refreshed, an
+  // older due wallet should get the next slot regardless of whether it was
+  // manually configured or learned. Configured seeds only win exact ties (for
+  // example, multiple never-refreshed wallets), preserving deterministic boot
+  // order without allowing a large configured set to starve learned seeds.
+  candidates.sort((a, b) =>
+    a.lastRefreshedAt - b.lastRefreshedAt ||
+    a.sourceRank - b.sourceRank ||
+    a.rank - b.rank ||
+    a.walletAddress.localeCompare(b.walletAddress)
+  );
+
+  const selected = candidates[0];
+  if (!selected) return null;
+  const { sourceRank, rank, lastRefreshedAt, ...result } = selected;
+  return result;
 }
 
 function boundedSeedQueueSelection(tokens, {
