@@ -52,10 +52,18 @@ function launchedAt(row) {
 }
 
 function marketMetrics(row) {
+  const liquidity = num(row?.liquidity ?? row?.liquidity_usd);
+  const marketCap = num(row?.market_cap ?? row?.marketcap ?? row?.fdv);
+  const volume = num(row?.volume ?? row?.volume_usd ?? row?.volume_1h);
+  const holderCount = num(row?.holder_count ?? row?.holders ?? row?.holders_count);
+
   return {
-    liquidity: num(row?.liquidity ?? row?.liquidity_usd),
-    marketCap: num(row?.market_cap ?? row?.marketcap ?? row?.fdv),
-    volume: num(row?.volume ?? row?.volume_usd ?? row?.volume_1h),
+    liquidity,
+    marketCap,
+    volume,
+    holderCount,
+    liquidityToMarketCap: marketCap > 0 ? liquidity / marketCap : 0,
+    volumeToLiquidity: liquidity > 0 ? volume / liquidity : 0,
     insider: num(row?.insider_rate ?? row?.rat_trader_amount_rate),
     bundler: num(row?.bundler_rate),
     smart: num(row?.smart_degen_count ?? row?.smart_money_count),
@@ -73,6 +81,9 @@ function qualityGate(row, {
   minLiquidity = 20_000,
   minMarketCap = 100_000,
   minVolume = 10_000,
+  minHolderCount = 200,
+  minLiquidityToMarketCap = 0.01,
+  maxVolumeToLiquidity = 25,
   maxInsiderRate = 0.35,
   maxBundlerRate = 0.35,
   maxRugRatio = 0.30,
@@ -90,6 +101,24 @@ function qualityGate(row, {
   if (metrics.liquidity < minLiquidity) return { ok: false, reason: "low-liquidity", ageMs, ...metrics };
   if (metrics.marketCap < minMarketCap) return { ok: false, reason: "low-market-cap", ageMs, ...metrics };
   if (metrics.volume < minVolume) return { ok: false, reason: "low-volume", ageMs, ...metrics };
+
+  // If GMGN supplies holder count, require a minimum breadth of ownership. Missing
+  // holder data is tolerated because some trending payloads omit the field.
+  if (metrics.holderCount > 0 && metrics.holderCount < minHolderCount) {
+    return { ok: false, reason: "low-holder-count", ageMs, ...metrics };
+  }
+
+  // Thin liquidity relative to valuation is easy to manipulate even when the raw
+  // liquidity floor is met. Conversely, extreme volume relative to liquidity is a
+  // conservative pump/churn warning. These use fields already present in trending,
+  // so they cost no extra GMGN calls.
+  if (metrics.marketCap > 0 && metrics.liquidityToMarketCap < minLiquidityToMarketCap) {
+    return { ok: false, reason: "thin-liquidity", ageMs, ...metrics };
+  }
+  if (metrics.liquidity > 0 && metrics.volumeToLiquidity > maxVolumeToLiquidity) {
+    return { ok: false, reason: "extreme-turnover", ageMs, ...metrics };
+  }
+
   if (metrics.washTrading) return { ok: false, reason: "wash-trading", ageMs, ...metrics };
   if (metrics.rugRatio > maxRugRatio) return { ok: false, reason: "high-rug-risk", ageMs, ...metrics };
   if (metrics.top10HolderRate > maxTop10HolderRate) return { ok: false, reason: "concentrated-holders", ageMs, ...metrics };
@@ -114,6 +143,8 @@ function qualityScore(row, gate) {
   else if (metrics.marketCap >= 100_000) score += 1;
   if (metrics.volume >= 100_000) score += 2;
   else if (metrics.volume >= 25_000) score += 1;
+  if (metrics.holderCount >= 1_000) score += 1;
+  if (metrics.liquidityToMarketCap >= 0.05) score += 1;
   if (metrics.smart >= 3) score += 2;
   else if (metrics.smart > 0) score += 1;
   if (metrics.rugRatio > 0.15) score -= 1;
