@@ -169,36 +169,30 @@ function initIntelligence(db) {
     LIMIT ?
   `);
 
-  const recordObservation = db.transaction((observation) => {
-    const now = num(observation.observedAt, Date.now());
-    const source = String(observation.source || "scan");
-    const profitChange = observation.profitChange == null ? null : num(observation.profitChange);
-    const tokenScore = observation.tokenScore == null ? null : num(observation.tokenScore);
-    const entryDelaySec = observation.entryDelaySec == null ? null : num(observation.entryDelaySec);
-    const holdSec = observation.holdSec == null ? null : num(observation.holdSec);
-    const realizedProfit = observation.realizedProfit == null ? null : num(observation.realizedProfit);
-    const isEarly = observation.isEarly ? 1 : 0;
-    const isProfitable = observation.isProfitable ?? (profitChange != null && profitChange > 0.15) ? 1 : 0;
-    const isBadToken = observation.isBadToken ? 1 : 0;
-    const evidenceWeight = clamp(num(observation.evidenceWeight, 1), 0.1, 5);
+  const walletsForTokenStmt = db.prepare(`
+    SELECT DISTINCT wallet_address
+    FROM wallet_evidence
+    WHERE token_address = ?
+  `);
 
-    insertEvidence.run(
-      observation.walletAddress,
-      observation.tokenAddress,
-      now,
-      source,
-      tokenScore,
-      entryDelaySec,
-      holdSec,
-      profitChange,
-      realizedProfit,
-      isEarly,
-      isProfitable,
-      isBadToken,
-      evidenceWeight
-    );
+  const applyOutcomeStmt = db.prepare(`
+    UPDATE wallet_evidence
+    SET token_score = CASE
+          WHEN ? IS NULL THEN token_score
+          WHEN token_score IS NULL THEN ?
+          ELSE ROUND(token_score * 0.55 + ? * 0.45, 2)
+        END,
+        is_bad_token = CASE WHEN ? = 1 THEN 1 ELSE is_bad_token END,
+        evidence_weight = CASE
+          WHEN ? = 1 THEN MAX(evidence_weight, 1.35)
+          WHEN ? >= 85 THEN MAX(evidence_weight, 1.2)
+          ELSE evidence_weight
+        END
+    WHERE token_address = ?
+  `);
 
-    const aggregate = aggregateWallet.get(observation.walletAddress);
+  function refreshProfile(walletAddress, now = Date.now()) {
+    const aggregate = aggregateWallet.get(walletAddress);
     const observations = num(aggregate.observations);
     const distinctTokens = num(aggregate.distinct_tokens);
     const positiveSignals = num(aggregate.positive_signals);
@@ -230,7 +224,7 @@ function initIntelligence(db) {
     );
 
     upsertProfile.run(
-      observation.walletAddress,
+      walletAddress,
       num(aggregate.first_seen_at, now),
       num(aggregate.last_seen_at, now),
       observations,
@@ -248,11 +242,56 @@ function initIntelligence(db) {
       confidence.label
     );
 
-    return getProfileStmt.get(observation.walletAddress);
+    return getProfileStmt.get(walletAddress);
+  }
+
+  const recordObservation = db.transaction((observation) => {
+    const now = num(observation.observedAt, Date.now());
+    const source = String(observation.source || "scan");
+    const profitChange = observation.profitChange == null ? null : num(observation.profitChange);
+    const tokenScore = observation.tokenScore == null ? null : num(observation.tokenScore);
+    const entryDelaySec = observation.entryDelaySec == null ? null : num(observation.entryDelaySec);
+    const holdSec = observation.holdSec == null ? null : num(observation.holdSec);
+    const realizedProfit = observation.realizedProfit == null ? null : num(observation.realizedProfit);
+    const isEarly = observation.isEarly ? 1 : 0;
+    const isProfitable = observation.isProfitable ?? (profitChange != null && profitChange > 0.15) ? 1 : 0;
+    const isBadToken = observation.isBadToken ? 1 : 0;
+    const evidenceWeight = clamp(num(observation.evidenceWeight, 1), 0.1, 5);
+
+    insertEvidence.run(
+      observation.walletAddress,
+      observation.tokenAddress,
+      now,
+      source,
+      tokenScore,
+      entryDelaySec,
+      holdSec,
+      profitChange,
+      realizedProfit,
+      isEarly,
+      isProfitable,
+      isBadToken,
+      evidenceWeight
+    );
+
+    return refreshProfile(observation.walletAddress, now);
+  });
+
+  const applyTokenOutcome = db.transaction(({ tokenAddress, outcomeScore, status } = {}) => {
+    if (!tokenAddress) throw new Error("tokenAddress is required");
+    const score = outcomeScore == null ? null : clamp(num(outcomeScore), 0, 100);
+    const isBad = status === "bad" || (score != null && score <= 10) ? 1 : 0;
+    const wallets = walletsForTokenStmt.all(tokenAddress).map((row) => row.wallet_address);
+    if (!wallets.length) return { tokenAddress, updatedWallets: 0, profiles: [] };
+
+    applyOutcomeStmt.run(score, score, score, isBad, isBad, score == null ? 0 : score, tokenAddress);
+    const profiles = wallets.map((walletAddress) => refreshProfile(walletAddress));
+    return { tokenAddress, updatedWallets: profiles.length, profiles };
   });
 
   return {
     recordObservation,
+    applyTokenOutcome,
     getProfile(walletAddress) {
       return getProfileStmt.get(walletAddress) || null;
     },
