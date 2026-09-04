@@ -10,7 +10,8 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const { initIntelligence } = require("./intelligence");
 const { createDiscoveryEngine } = require("./discovery-engine");
 const { extractTokenCandidates, shouldScanToken } = require("./market-discovery");
-const { extractBoughtTokens, parseSeedWallets } = require("./seed-discovery");
+const { parseSeedWallets } = require("./seed-discovery");
+const { collectSeedHistory } = require("./seed-history");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
@@ -27,9 +28,10 @@ const CONSENSUS_WALLETS = clampInt(process.env.CONSENSUS_WALLETS, 2, 2, 5);
 const TRUSTED_REPUTATION = clampInt(process.env.TRUSTED_REPUTATION, 65, 40, 95);
 const TRUSTED_CONFIDENCE = clampInt(process.env.TRUSTED_CONFIDENCE, 50, 20, 95);
 const SEED_WALLETS = parseSeedWallets(process.env.SEED_WALLETS, DEFAULT_SEED_WALLETS);
-const SEED_REFRESH_MS = clampInt(process.env.SEED_REFRESH_HOURS, 24, 6, 168) * 60 * 60 * 1000;
+const SEED_REFRESH_MS = clampInt(process.env.SEED_REFRESH_HOURS, 6, 6, 168) * 60 * 60 * 1000;
 const SEED_ACTIVITY_LIMIT = clampInt(process.env.SEED_ACTIVITY_LIMIT, 100, 20, 100);
-const SEED_TOKEN_LIMIT = clampInt(process.env.SEED_TOKEN_LIMIT, 100, 10, 250);
+const SEED_TOKEN_LIMIT = clampInt(process.env.SEED_TOKEN_LIMIT, 250, 10, 1000);
+const SEED_HISTORY_PAGES = clampInt(process.env.SEED_HISTORY_PAGES, 1, 1, 3);
 const SEED_SCAN_EVERY_CYCLES = clampInt(process.env.SEED_SCAN_EVERY_CYCLES, 2, 1, 12);
 
 function clampInt(value, fallback, min, max) {
@@ -73,7 +75,10 @@ db.exec(`
     wallet_address TEXT PRIMARY KEY,
     last_refreshed_at INTEGER,
     last_token_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    history_cursor TEXT,
+    history_exhausted INTEGER NOT NULL DEFAULT 0,
+    last_history_at INTEGER
   );
   CREATE TABLE IF NOT EXISTS seed_token_queue (
     token_address TEXT NOT NULL,
@@ -89,6 +94,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_seed_token_queue_status
     ON seed_token_queue(status, activity_at DESC);
 `);
+
+function ensureColumn(tableName, columnName, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (!columns.some((column) => column.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
+// Existing Railway databases predate resumable history state. These additive
+// migrations preserve all accumulated wallet evidence and seed queue progress.
+ensureColumn("seed_wallet_state", "history_cursor", "TEXT");
+ensureColumn("seed_wallet_state", "history_exhausted", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("seed_wallet_state", "last_history_at", "INTEGER");
 
 const getMetaStmt = db.prepare("SELECT value FROM meta WHERE key = ?");
 const putMetaStmt = db.prepare(`
@@ -118,12 +136,17 @@ const putConsensusAlertStmt = db.prepare(`
 `);
 const getSeedStateStmt = db.prepare("SELECT * FROM seed_wallet_state WHERE wallet_address = ?");
 const putSeedStateStmt = db.prepare(`
-  INSERT INTO seed_wallet_state(wallet_address, last_refreshed_at, last_token_count, last_error)
-  VALUES (?, ?, ?, ?)
+  INSERT INTO seed_wallet_state(
+    wallet_address, last_refreshed_at, last_token_count, last_error,
+    history_cursor, history_exhausted, last_history_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(wallet_address) DO UPDATE SET
     last_refreshed_at = excluded.last_refreshed_at,
     last_token_count = excluded.last_token_count,
-    last_error = excluded.last_error
+    last_error = excluded.last_error,
+    history_cursor = excluded.history_cursor,
+    history_exhausted = excluded.history_exhausted,
+    last_history_at = excluded.last_history_at
 `);
 const enqueueSeedTokenStmt = db.prepare(`
   INSERT INTO seed_token_queue(token_address, source_wallet, discovered_at, activity_at, status)
@@ -254,11 +277,14 @@ async function getTrending() {
   ]);
 }
 
-async function getWalletActivity(walletAddress) {
-  return cli([
+async function getWalletActivity(walletAddress, cursor = null) {
+  const args = [
     "portfolio", "activity", "--chain", "sol", "--wallet", walletAddress,
-    "--limit", String(SEED_ACTIVITY_LIMIT), "--raw",
-  ]);
+    "--limit", String(SEED_ACTIVITY_LIMIT),
+  ];
+  if (cursor) args.push("--cursor", String(cursor));
+  args.push("--raw");
+  return cli(args);
 }
 
 const intelligence = initIntelligence(db);
@@ -342,21 +368,59 @@ async function refreshOneSeedWallet() {
   });
   if (!wallet) return null;
 
+  const previous = getSeedStateStmt.get(wallet);
+  const historyAlreadyExhausted = Number(previous?.history_exhausted || 0) === 1;
+  const startCursor = historyAlreadyExhausted ? null : previous?.history_cursor || null;
+
   try {
-    const activity = await getWalletActivity(wallet);
-    const tokens = extractBoughtTokens(activity, { walletAddress: wallet, limit: SEED_TOKEN_LIMIT });
+    const history = await collectSeedHistory({
+      walletAddress: wallet,
+      startCursor,
+      maxPages: historyAlreadyExhausted ? 1 : SEED_HISTORY_PAGES,
+      tokenLimit: SEED_TOKEN_LIMIT,
+      fetchPage: ({ walletAddress, cursor }) => getWalletActivity(walletAddress, cursor),
+    });
     const insert = db.transaction((items) => {
       for (const token of items) {
         enqueueSeedTokenStmt.run(token.address, wallet, now, token.lastActivityAt || 0);
       }
     });
-    insert(tokens);
-    putSeedStateStmt.run(wallet, now, tokens.length, null);
-    console.log(`[seed] ${short(wallet)} refreshed; ${tokens.length} bought tokens available for gradual backfill`);
-    return { wallet, tokenCount: tokens.length };
+    insert(history.tokens);
+
+    // Once the historical cursor is exhausted, future refreshes intentionally read
+    // only the newest page. This catches new buys without restarting old pagination.
+    const nextHistoryCursor = historyAlreadyExhausted ? null : history.nextCursor;
+    const historyExhausted = historyAlreadyExhausted || history.exhausted ? 1 : 0;
+    putSeedStateStmt.run(
+      wallet,
+      now,
+      history.tokens.length,
+      null,
+      nextHistoryCursor,
+      historyExhausted,
+      now
+    );
+    console.log(
+      `[seed] ${short(wallet)} history pages=${history.pagesFetched} tokens=${history.tokens.length} ` +
+      `backfill=${historyExhausted ? "complete" : "continuing"}`
+    );
+    return {
+      wallet,
+      tokenCount: history.tokens.length,
+      pagesFetched: history.pagesFetched,
+      historyExhausted: Boolean(historyExhausted),
+    };
   } catch (error) {
     const message = String(error.message || error).slice(0, 1000);
-    putSeedStateStmt.run(wallet, now, 0, message);
+    putSeedStateStmt.run(
+      wallet,
+      now,
+      Number(previous?.last_token_count || 0),
+      message,
+      previous?.history_cursor || null,
+      Number(previous?.history_exhausted || 0),
+      previous?.last_history_at || null
+    );
     if (isRateLimitError(error)) throw error;
     console.warn(`[seed] ${short(wallet)} refresh failed: ${message}`);
     return { wallet, tokenCount: 0, error: message };
@@ -497,7 +561,10 @@ async function start() {
     console.warn("DISCORD_TOKEN is not set; autonomous discovery will run without Discord alerts.");
   }
 
-  console.log(`[startup] ${SEED_WALLETS.length} seed wallet(s); GMGN gap=${MIN_GMGN_GAP_MS}ms; cycle=${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m`);
+  console.log(
+    `[startup] ${SEED_WALLETS.length} seed wallet(s); GMGN gap=${MIN_GMGN_GAP_MS}ms; ` +
+    `cycle=${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m; seed refresh=${Math.round(SEED_REFRESH_MS / 3600000)}h`
+  );
   await discoveryCycle();
   setInterval(discoveryCycle, DISCOVERY_INTERVAL_MS).unref();
 }
