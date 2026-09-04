@@ -7,6 +7,10 @@ function num(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function boolFlag(value) {
+  return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true";
+}
+
 function tokenAddress(row) {
   return row?.address || row?.token_address || row?.token?.address || row?.base_token?.address || row?.base_token_address || null;
 }
@@ -52,9 +56,14 @@ function marketMetrics(row) {
     liquidity: num(row?.liquidity ?? row?.liquidity_usd),
     marketCap: num(row?.market_cap ?? row?.marketcap ?? row?.fdv),
     volume: num(row?.volume ?? row?.volume_usd ?? row?.volume_1h),
-    insider: num(row?.insider_rate),
+    insider: num(row?.insider_rate ?? row?.rat_trader_amount_rate),
     bundler: num(row?.bundler_rate),
     smart: num(row?.smart_degen_count ?? row?.smart_money_count),
+    rugRatio: num(row?.rug_ratio),
+    top10HolderRate: num(row?.top_10_holder_rate ?? row?.top10_holder_rate),
+    devTeamHoldRate: num(row?.dev_team_hold_rate),
+    washTrading: boolFlag(row?.is_wash_trading),
+    creatorStatus: String(row?.creator_token_status || "").toLowerCase(),
   };
 }
 
@@ -66,6 +75,10 @@ function qualityGate(row, {
   minVolume = 10_000,
   maxInsiderRate = 0.35,
   maxBundlerRate = 0.35,
+  maxRugRatio = 0.30,
+  maxTop10HolderRate = 0.50,
+  maxDevTeamHoldRate = 0.20,
+  rejectCreatorHolding = true,
   requireKnownAge = true,
 } = {}) {
   const launch = launchedAt(row);
@@ -77,6 +90,11 @@ function qualityGate(row, {
   if (metrics.liquidity < minLiquidity) return { ok: false, reason: "low-liquidity", ageMs, ...metrics };
   if (metrics.marketCap < minMarketCap) return { ok: false, reason: "low-market-cap", ageMs, ...metrics };
   if (metrics.volume < minVolume) return { ok: false, reason: "low-volume", ageMs, ...metrics };
+  if (metrics.washTrading) return { ok: false, reason: "wash-trading", ageMs, ...metrics };
+  if (metrics.rugRatio > maxRugRatio) return { ok: false, reason: "high-rug-risk", ageMs, ...metrics };
+  if (metrics.top10HolderRate > maxTop10HolderRate) return { ok: false, reason: "concentrated-holders", ageMs, ...metrics };
+  if (metrics.devTeamHoldRate > maxDevTeamHoldRate) return { ok: false, reason: "high-dev-hold", ageMs, ...metrics };
+  if (rejectCreatorHolding && metrics.creatorStatus === "creator_hold") return { ok: false, reason: "creator-still-holding", ageMs, ...metrics };
   if (metrics.insider > maxInsiderRate) return { ok: false, reason: "high-insider-rate", ageMs, ...metrics };
   if (metrics.bundler > maxBundlerRate) return { ok: false, reason: "high-bundler-rate", ageMs, ...metrics };
   return { ok: true, reason: null, ageMs, ...metrics };
@@ -96,7 +114,10 @@ function qualityScore(row, gate) {
   else if (metrics.marketCap >= 100_000) score += 1;
   if (metrics.volume >= 100_000) score += 2;
   else if (metrics.volume >= 25_000) score += 1;
-  if (metrics.smart > 0) score += 1;
+  if (metrics.smart >= 3) score += 2;
+  else if (metrics.smart > 0) score += 1;
+  if (metrics.rugRatio > 0.15) score -= 1;
+  if (metrics.top10HolderRate > 0.35) score -= 1;
   if (metrics.insider > 0.25) score -= 1;
   if (metrics.bundler > 0.25) score -= 1;
   return score;
@@ -130,6 +151,7 @@ module.exports = {
   tokenAddress,
   unwrapRows,
   launchedAt,
+  marketMetrics,
   qualityGate,
   qualityScore,
 };
