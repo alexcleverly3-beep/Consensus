@@ -254,7 +254,7 @@ function initIntelligence(db) {
     const holdSec = observation.holdSec == null ? null : num(observation.holdSec);
     const realizedProfit = observation.realizedProfit == null ? null : num(observation.realizedProfit);
     const isEarly = observation.isEarly ? 1 : 0;
-    const isProfitable = observation.isProfitable ?? (profitChange != null && profitChange > 0.15) ? 1 : 0;
+    const isProfitable = (observation.isProfitable ?? (profitChange != null && profitChange > 0.15)) ? 1 : 0;
     const isBadToken = observation.isBadToken ? 1 : 0;
     const evidenceWeight = clamp(num(observation.evidenceWeight, 1), 0.1, 5);
 
@@ -290,6 +290,7 @@ function initIntelligence(db) {
   });
 
   return {
+    db,
     recordObservation,
     applyTokenOutcome,
     getProfile(walletAddress) {
