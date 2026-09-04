@@ -144,6 +144,7 @@ function createDiscoveryEngine({
     const creatorAddress = tokenInfo?.dev?.creator_address || null;
     const candidates = [];
     const rejected = [];
+    const seenWallets = new Set();
 
     for (const trader of traders) {
       const walletAddress = traderAddress(trader);
@@ -152,6 +153,11 @@ function createDiscoveryEngine({
         rejected.push({ walletAddress, reason: exclusion });
         continue;
       }
+      if (seenWallets.has(walletAddress)) {
+        rejected.push({ walletAddress, reason: "duplicate-wallet" });
+        continue;
+      }
+      seenWallets.add(walletAddress);
 
       const evidence = traderTokenEvidence(trader, tokenInfo);
       if (evidence.tokenScore < minTokenScore && !evidence.isProfitable) {
