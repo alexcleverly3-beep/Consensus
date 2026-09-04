@@ -24,4 +24,9 @@ require("./runtime-diagnostics")
   .createRuntimeDiagnostics({ gmgnGuard })
   .start();
 
+// app.js initializes the persistent SQLite schema synchronously before its
+// asynchronous discovery loop begins. Starting the dashboard immediately after
+// it means Railway can expose live progress from that same database without a
+// second service or any wallet-identifying UI.
 require("./app");
+require("./progress-dashboard").startProgressDashboard();
