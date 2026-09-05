@@ -16,6 +16,7 @@ const STRONG_WALLET_FLOORS = Object.freeze({
   minPositiveOutcomeRate: 0.75,
   minStrongOutcomeRate: 0.25,
   minGuaranteedValidatedTokens: 2,
+  minGuaranteedValidatedRate: 0.20,
   minHoldEvidenceRate: 0.50,
   minMeaningfulHoldRate: 0.75,
   minAverageHoldSec: 60 * 60,
@@ -55,6 +56,7 @@ function trustedProfileQuality(profile, {
   minPositiveOutcomeRate = STRONG_WALLET_FLOORS.minPositiveOutcomeRate,
   minStrongOutcomeRate = STRONG_WALLET_FLOORS.minStrongOutcomeRate,
   minGuaranteedValidatedTokens = STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens,
+  minGuaranteedValidatedRate = STRONG_WALLET_FLOORS.minGuaranteedValidatedRate,
   minHoldEvidenceRate = STRONG_WALLET_FLOORS.minHoldEvidenceRate,
   minMeaningfulHoldRate = STRONG_WALLET_FLOORS.minMeaningfulHoldRate,
   minAverageHoldSec = STRONG_WALLET_FLOORS.minAverageHoldSec,
@@ -113,6 +115,9 @@ function trustedProfileQuality(profile, {
   const guaranteedValidatedTokens = distinctTokens > 0
     ? Math.max(0, earlyEntries + profitableEntries + positiveOutcomeTokens - (2 * distinctTokens))
     : 0;
+  const guaranteedValidatedRate = matureTokens > 0
+    ? clamp(guaranteedValidatedTokens / matureTokens, 0, 1)
+    : 0;
 
   const holdEvidenceRate = distinctTokens > 0
     ? clamp(holdEvidenceTokens / distinctTokens, 0, 1)
@@ -142,6 +147,10 @@ function trustedProfileQuality(profile, {
       minGuaranteedValidatedTokens,
       STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens
     )),
+    minGuaranteedValidatedRate: atLeast(
+      minGuaranteedValidatedRate,
+      STRONG_WALLET_FLOORS.minGuaranteedValidatedRate
+    ),
     minHoldEvidenceRate: atLeast(minHoldEvidenceRate, STRONG_WALLET_FLOORS.minHoldEvidenceRate),
     minMeaningfulHoldRate: atLeast(minMeaningfulHoldRate, STRONG_WALLET_FLOORS.minMeaningfulHoldRate),
     minAverageHoldSec: atLeast(minAverageHoldSec, STRONG_WALLET_FLOORS.minAverageHoldSec),
@@ -166,7 +175,10 @@ function trustedProfileQuality(profile, {
   if (outcomeCoverageRate < thresholds.minOutcomeCoverageRate) reasons.push("insufficient-outcome-coverage");
   if (positiveOutcomeRate < thresholds.minPositiveOutcomeRate) reasons.push("weak-mature-outcome-rate");
   if (strongOutcomeRate < thresholds.minStrongOutcomeRate) reasons.push("weak-strong-outcome-rate");
-  if (guaranteedValidatedTokens < thresholds.minGuaranteedValidatedTokens) {
+  if (
+    guaranteedValidatedTokens < thresholds.minGuaranteedValidatedTokens ||
+    guaranteedValidatedRate < thresholds.minGuaranteedValidatedRate
+  ) {
     reasons.push("insufficient-aligned-winner-evidence");
   }
   if (holdEvidenceRate < thresholds.minHoldEvidenceRate) reasons.push("insufficient-hold-evidence");
@@ -205,6 +217,7 @@ function trustedProfileQuality(profile, {
       positiveOutcomeRate,
       strongOutcomeRate,
       guaranteedValidatedTokens,
+      guaranteedValidatedRate,
       holdEvidenceRate,
       meaningfulHoldRate,
       averageEntryDelaySec,
