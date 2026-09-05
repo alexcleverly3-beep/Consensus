@@ -33,6 +33,7 @@ test("trustedProfileQuality accepts repeatable early profitable behaviour", () =
   assert.equal(result.metrics.earlyRate, 0.8);
   assert.equal(result.metrics.profitableRate, 0.8);
   assert.equal(result.metrics.positiveOutcomeRate, 0.8);
+  assert.equal(result.metrics.guaranteedValidatedTokens, 2);
 });
 
 test("trustedProfileQuality keeps a twelve-token hard floor even with a low override", () => {
@@ -85,6 +86,30 @@ test("trustedProfileQuality requires several genuinely positive mature outcomes"
   assert.ok(weakOutcomes.reasons.includes("weak-average-outcome-score"));
 });
 
+test("trustedProfileQuality rejects disjoint early/profitable/outcome headline rates", () => {
+  const result = trustedProfileQuality(profile({
+    distinct_tokens: 15,
+    early_entries: 10,
+    profitable_entries: 10,
+    mature_tokens: 10,
+    positive_outcome_tokens: 8,
+    strong_outcome_tokens: 3,
+    avg_entry_delay_sec: 1800,
+    avg_hold_sec: 7200,
+    avg_token_score: 82,
+    avg_outcome_score: 84,
+  }));
+
+  // Each headline rate independently clears its floor, but the counts do not
+  // guarantee that even two tokens were early + profitable + eventual winners.
+  assert.ok(result.metrics.earlyRate >= 2 / 3);
+  assert.ok(result.metrics.profitableRate >= 2 / 3);
+  assert.ok(result.metrics.positiveOutcomeRate >= 0.75);
+  assert.equal(result.metrics.guaranteedValidatedTokens, 0);
+  assert.equal(result.eligible, false);
+  assert.ok(result.reasons.includes("insufficient-aligned-winner-evidence"));
+});
+
 test("trustedProfileQuality rejects fast-flip or poorly measured holding behaviour", () => {
   const fastFlipper = trustedProfileQuality(profile({
     hold_evidence_tokens: 12,
@@ -92,8 +117,8 @@ test("trustedProfileQuality rejects fast-flip or poorly measured holding behavio
     avg_hold_sec: 300,
   }));
   assert.equal(fastFlipper.eligible, false);
-  assert.ok(fastFlipper.reasons.includes("short-hold-pattern"));
-  assert.ok(fastFlipper.reasons.includes("short-average-hold"));
+  assert.ok(resultHas(fastFlipper, "short-hold-pattern"));
+  assert.ok(resultHas(fastFlipper, "short-average-hold"));
 
   const unmeasured = trustedProfileQuality(profile({
     hold_evidence_tokens: 2,
@@ -101,5 +126,9 @@ test("trustedProfileQuality rejects fast-flip or poorly measured holding behavio
     avg_hold_sec: 7200,
   }));
   assert.equal(unmeasured.eligible, false);
-  assert.ok(unmeasured.reasons.includes("insufficient-hold-evidence"));
+  assert.ok(resultHas(unmeasured, "insufficient-hold-evidence"));
 });
+
+function resultHas(result, reason) {
+  return result.reasons.includes(reason);
+}
