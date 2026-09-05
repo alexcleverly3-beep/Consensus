@@ -10,6 +10,7 @@ function profile(overrides = {}) {
     early_entries: 8,
     profitable_entries: 8,
     rug_or_bad_token_hits: 1,
+    negative_signals: 1,
     avg_entry_delay_sec: 1800,
     avg_token_score: 78,
     ...overrides,
@@ -22,6 +23,7 @@ test("trustedProfileQuality accepts repeatable early profitable behaviour", () =
   assert.deepEqual(result.reasons, []);
   assert.equal(result.metrics.earlyRate, 0.8);
   assert.equal(result.metrics.profitableRate, 0.8);
+  assert.equal(result.metrics.negativeSignalRate, 0.1);
 });
 
 test("trustedProfileQuality keeps a six-token hard floor even with a low override", () => {
@@ -30,6 +32,7 @@ test("trustedProfileQuality keeps a six-token hard floor even with a low overrid
     early_entries: 5,
     profitable_entries: 5,
     rug_or_bad_token_hits: 0,
+    negative_signals: 0,
   }), { minDistinctTokens: 2 });
 
   assert.equal(result.eligible, false);
@@ -42,6 +45,7 @@ test("trustedProfileQuality rejects jackpot-looking wallets with poor repeatabil
     early_entries: 3,
     profitable_entries: 5,
     rug_or_bad_token_hits: 3,
+    negative_signals: 4,
     avg_entry_delay_sec: 15_000,
     avg_token_score: 91,
   }));
@@ -50,5 +54,23 @@ test("trustedProfileQuality rejects jackpot-looking wallets with poor repeatabil
   assert.ok(result.reasons.includes("weak-early-entry-rate"));
   assert.ok(result.reasons.includes("weak-profitability-rate"));
   assert.ok(result.reasons.includes("high-bad-token-rate"));
+  assert.ok(result.reasons.includes("high-negative-signal-rate"));
   assert.ok(result.reasons.includes("late-average-entry"));
+});
+
+test("trustedProfileQuality rejects boom-bust wallets even when bad-token rate is low", () => {
+  const result = trustedProfileQuality(profile({
+    distinct_tokens: 10,
+    early_entries: 8,
+    profitable_entries: 7,
+    rug_or_bad_token_hits: 1,
+    negative_signals: 3,
+    avg_entry_delay_sec: 1200,
+    avg_token_score: 82,
+  }));
+
+  assert.equal(result.eligible, false);
+  assert.ok(result.reasons.includes("high-negative-signal-rate"));
+  assert.equal(result.metrics.badTokenRate, 0.1);
+  assert.equal(result.metrics.negativeSignalRate, 0.3);
 });
