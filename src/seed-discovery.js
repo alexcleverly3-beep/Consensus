@@ -1,5 +1,7 @@
 "use strict";
 
+const { trustedProfileQuality } = require("./wallet-quality");
+
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 function num(value, fallback = 0) {
@@ -52,7 +54,11 @@ function isBuy(row) {
   const sellAmount = num(row?.sell_amount ?? row?.sellAmount, 0);
   if (buyAmount > 0 && sellAmount <= 0) return true;
 
-  return row?.is_buy === true || row?.isBuy === true;
+  // GMGN payload typing is not always stable across endpoints/versions. Treat
+  // common serialized/numeric true values as buys so seed-history discovery does
+  // not silently discard valid purchases merely because is_buy arrived as "1".
+  const flag = row?.is_buy ?? row?.isBuy;
+  return flag === true || flag === 1 || String(flag).toLowerCase() === "true" || String(flag) === "1";
 }
 
 function extractBoughtTokens(response, { walletAddress = null, limit = 100 } = {}) {
@@ -82,8 +88,12 @@ function parseSeedWallets(value, fallback = []) {
 function trustedWalletSeeds(profiles, {
   minReputation = 65,
   minConfidence = 50,
-  minDistinctTokens = 4,
-  maxBadTokenRate = 0.25,
+  minDistinctTokens = 6,
+  maxBadTokenRate = 0.2,
+  minEarlyRate = 0.5,
+  minProfitableRate = 0.6,
+  maxAverageEntryDelaySec = 2 * 60 * 60,
+  minAverageTokenScore = 60,
   limit = 20,
   exclude = [],
 } = {}) {
@@ -96,21 +106,29 @@ function trustedWalletSeeds(profiles, {
 
     const reputation = num(profile?.reputation_score ?? profile?.reputationScore);
     const confidence = num(profile?.confidence_score ?? profile?.confidenceScore);
-    const distinctTokens = Math.max(0, Math.floor(num(profile?.distinct_tokens ?? profile?.distinctTokens)));
-    const badHits = Math.max(0, num(profile?.rug_or_bad_token_hits ?? profile?.badTokenHits));
-    const badTokenRate = distinctTokens > 0 ? badHits / distinctTokens : 1;
-
     if (reputation < minReputation) continue;
     if (confidence < minConfidence) continue;
-    if (distinctTokens < minDistinctTokens) continue;
-    if (badTokenRate > maxBadTokenRate) continue;
+
+    const quality = trustedProfileQuality(profile, {
+      minDistinctTokens,
+      maxBadTokenRate,
+      minEarlyRate,
+      minProfitableRate,
+      maxAverageEntryDelaySec,
+      minAverageTokenScore,
+    });
+    if (!quality.eligible) continue;
 
     candidates.push({
       walletAddress,
       reputation,
       confidence,
-      distinctTokens,
-      badTokenRate,
+      distinctTokens: quality.metrics.distinctTokens,
+      badTokenRate: quality.metrics.badTokenRate,
+      earlyRate: quality.metrics.earlyRate,
+      profitableRate: quality.metrics.profitableRate,
+      averageEntryDelaySec: quality.metrics.averageEntryDelaySec,
+      averageTokenScore: quality.metrics.averageTokenScore,
     });
   }
 
