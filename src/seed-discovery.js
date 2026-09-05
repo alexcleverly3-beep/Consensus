@@ -54,9 +54,6 @@ function isBuy(row) {
   const sellAmount = num(row?.sell_amount ?? row?.sellAmount, 0);
   if (buyAmount > 0 && sellAmount <= 0) return true;
 
-  // GMGN payload typing is not always stable across endpoints/versions. Treat
-  // common serialized/numeric true values as buys so seed-history discovery does
-  // not silently discard valid purchases merely because is_buy arrived as "1".
   const flag = row?.is_buy ?? row?.isBuy;
   return flag === true || flag === 1 || String(flag).toLowerCase() === "true" || String(flag) === "1";
 }
@@ -141,6 +138,8 @@ function trustedWalletSeeds(profiles, {
       distinctTokens: quality.metrics.distinctTokens,
       matureTokens: quality.metrics.matureTokens,
       strongOutcomeTokens: quality.metrics.strongOutcomeTokens,
+      validatedWinnerTokens: quality.metrics.validatedWinnerTokens,
+      validatedWinnerRate: quality.metrics.validatedWinnerRate,
       badTokenRate: quality.metrics.badTokenRate,
       negativeSignalRate: quality.metrics.negativeSignalRate,
       earlyRate: quality.metrics.earlyRate,
@@ -148,6 +147,7 @@ function trustedWalletSeeds(profiles, {
       averageEntryDelaySec: quality.metrics.averageEntryDelaySec,
       averageTokenScore: quality.metrics.averageTokenScore,
       positiveOutcomeRate: quality.metrics.positiveOutcomeRate,
+      strongOutcomeRate: quality.metrics.strongOutcomeRate,
       averageOutcomeScore: quality.metrics.averageOutcomeScore,
       holdEvidenceRate: quality.metrics.holdEvidenceRate,
       meaningfulHoldRate: quality.metrics.meaningfulHoldRate,
@@ -155,8 +155,17 @@ function trustedWalletSeeds(profiles, {
     });
   }
 
+  // Learned seeds are a scarce recursive-discovery resource. Once wallets clear
+  // the same strict trust gate, prefer repeatable exact winners rather than the
+  // old confidence-first ordering. This makes the limited learned-seed pool
+  // favour wallets that repeatedly bought early, made meaningful profit, and
+  // were later validated on the same token. No extra GMGN request is required.
   return candidates
     .sort((a, b) =>
+      b.validatedWinnerRate - a.validatedWinnerRate ||
+      b.validatedWinnerTokens - a.validatedWinnerTokens ||
+      b.strongOutcomeRate - a.strongOutcomeRate ||
+      b.positiveOutcomeRate - a.positiveOutcomeRate ||
       b.confidence - a.confidence ||
       b.reputation - a.reputation ||
       b.distinctTokens - a.distinctTokens ||
@@ -189,11 +198,6 @@ function nextDueSeedWallet({
     !candidate.lastRefreshedAt || now - candidate.lastRefreshedAt >= refreshMs
   );
 
-  // Share one GMGN refresh slot fairly. Once a wallet has been refreshed, an
-  // older due wallet should get the next slot regardless of whether it was
-  // manually configured or learned. Configured seeds only win exact ties (for
-  // example, multiple never-refreshed wallets), preserving deterministic boot
-  // order without allowing a large configured set to starve learned seeds.
   candidates.sort((a, b) =>
     a.lastRefreshedAt - b.lastRefreshedAt ||
     a.sourceRank - b.sourceRank ||

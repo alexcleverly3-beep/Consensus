@@ -37,33 +37,23 @@ function qualityFields(distinctTokens) {
 }
 
 test("extractBoughtTokens keeps unique buys ordered by most recent activity", () => {
-  const response = {
-    data: {
-      list: [
-        { event_type: "buy", token_address: A, timestamp: 100 },
-        { event_type: "sell", token_address: B, timestamp: 400 },
-        { side: "buy", token_address: B, timestamp: 200 },
-        { event_type: "buy", token_address: A, timestamp: 300 },
-      ],
-    },
-  };
-
+  const response = { data: { list: [
+    { event_type: "buy", token_address: A, timestamp: 100 },
+    { event_type: "sell", token_address: B, timestamp: 400 },
+    { side: "buy", token_address: B, timestamp: 200 },
+    { event_type: "buy", token_address: A, timestamp: 300 },
+  ] } };
   const tokens = extractBoughtTokens(response, { walletAddress: WALLET });
   assert.deepEqual(tokens.map((x) => x.address), [A, B]);
   assert.equal(tokens[0].lastActivityAt, 300000);
 });
 
 test("extractBoughtTokens accepts serialized GMGN buy flags but explicit sells still win", () => {
-  const response = {
-    data: {
-      list: [
-        { is_buy: "1", token_address: A, timestamp: 100 },
-        { isBuy: "true", token_address: B, timestamp: 200 },
-        { event_type: "sell", is_buy: "1", token_address: A, timestamp: 300 },
-      ],
-    },
-  };
-
+  const response = { data: { list: [
+    { is_buy: "1", token_address: A, timestamp: 100 },
+    { isBuy: "true", token_address: B, timestamp: 200 },
+    { event_type: "sell", is_buy: "1", token_address: A, timestamp: 300 },
+  ] } };
   const tokens = extractBoughtTokens(response, { walletAddress: WALLET });
   assert.deepEqual(tokens.map((x) => x.address), [B, A]);
   assert.equal(tokens.find((x) => x.address === A).lastActivityAt, 100000);
@@ -76,32 +66,10 @@ test("parseSeedWallets accepts comma/space separated wallets and removes duplica
 
 test("trustedWalletSeeds only promotes repeatably early, profitable wallets", () => {
   const seeds = trustedWalletSeeds([
-    {
-      wallet_address: TRUSTED_A,
-      reputation_score: 82,
-      confidence_score: 80,
-      distinct_tokens: 15,
-      rug_or_bad_token_hits: 1,
-      ...qualityFields(15),
-    },
-    {
-      wallet_address: TRUSTED_B,
-      reputation_score: 91,
-      confidence_score: 72,
-      distinct_tokens: 11,
-      rug_or_bad_token_hits: 0,
-      ...qualityFields(11),
-    },
-    {
-      wallet_address: WALLET,
-      reputation_score: 78,
-      confidence_score: 80,
-      distinct_tokens: 15,
-      rug_or_bad_token_hits: 3,
-      ...qualityFields(15),
-    },
+    { wallet_address: TRUSTED_A, reputation_score: 82, confidence_score: 80, distinct_tokens: 15, rug_or_bad_token_hits: 1, ...qualityFields(15) },
+    { wallet_address: TRUSTED_B, reputation_score: 91, confidence_score: 72, distinct_tokens: 11, rug_or_bad_token_hits: 0, ...qualityFields(11) },
+    { wallet_address: WALLET, reputation_score: 78, confidence_score: 80, distinct_tokens: 15, rug_or_bad_token_hits: 3, ...qualityFields(15) },
   ]);
-
   assert.deepEqual(seeds.map((seed) => seed.walletAddress), [TRUSTED_A]);
   assert.equal(seeds[0].distinctTokens, 15);
 });
@@ -118,39 +86,44 @@ test("trustedWalletSeeds rejects high-scoring wallets with weak consistency", ()
     avg_entry_delay_sec: 14_000,
     avg_token_score: 88,
   }]);
-
   assert.deepEqual(seeds, []);
 });
 
-test("trustedWalletSeeds excludes configured seeds and ranks confidence before reputation", () => {
+test("trustedWalletSeeds excludes configured seeds and ranks exact validated winners before confidence", () => {
+  const aQuality = qualityFields(15);
+  const bQuality = qualityFields(12);
+  aQuality.validated_winner_tokens = 3;
+  bQuality.validated_winner_tokens = 4;
+
   const seeds = trustedWalletSeeds([
-    {
-      wallet_address: TRUSTED_A,
-      reputation_score: 99,
-      confidence_score: 80,
-      distinct_tokens: 15,
-      rug_or_bad_token_hits: 0,
-      ...qualityFields(15),
-    },
-    {
-      wallet_address: TRUSTED_B,
-      reputation_score: 75,
-      confidence_score: 85,
-      distinct_tokens: 12,
-      rug_or_bad_token_hits: 0,
-      ...qualityFields(12),
-    },
-    {
-      wallet_address: WALLET,
-      reputation_score: 90,
-      confidence_score: 90,
-      distinct_tokens: 15,
-      rug_or_bad_token_hits: 0,
-      ...qualityFields(15),
-    },
+    { wallet_address: TRUSTED_A, reputation_score: 99, confidence_score: 95, distinct_tokens: 15, rug_or_bad_token_hits: 0, ...aQuality },
+    { wallet_address: TRUSTED_B, reputation_score: 75, confidence_score: 80, distinct_tokens: 12, rug_or_bad_token_hits: 0, ...bQuality },
+    { wallet_address: WALLET, reputation_score: 90, confidence_score: 90, distinct_tokens: 15, rug_or_bad_token_hits: 0, ...qualityFields(15) },
   ], { exclude: [WALLET] });
 
   assert.deepEqual(seeds.map((seed) => seed.walletAddress), [TRUSTED_B, TRUSTED_A]);
+  assert.ok(seeds[0].validatedWinnerRate > seeds[1].validatedWinnerRate);
+});
+
+test("trustedWalletSeeds uses exact winner count as tie-breaker when validated rates match", () => {
+  const aQuality = qualityFields(15);
+  const bQuality = qualityFields(15);
+  aQuality.mature_tokens = 10;
+  aQuality.positive_outcome_tokens = 9;
+  aQuality.strong_outcome_tokens = 3;
+  aQuality.validated_winner_tokens = 3;
+  bQuality.mature_tokens = 15;
+  bQuality.positive_outcome_tokens = 13;
+  bQuality.strong_outcome_tokens = 4;
+  bQuality.validated_winner_tokens = 4;
+
+  const seeds = trustedWalletSeeds([
+    { wallet_address: TRUSTED_A, reputation_score: 99, confidence_score: 99, distinct_tokens: 15, rug_or_bad_token_hits: 0, ...aQuality },
+    { wallet_address: TRUSTED_B, reputation_score: 75, confidence_score: 75, distinct_tokens: 15, rug_or_bad_token_hits: 0, ...bQuality },
+  ]);
+
+  assert.equal(seeds[0].walletAddress, TRUSTED_A);
+  assert.ok(seeds[0].validatedWinnerRate > seeds[1].validatedWinnerRate);
 });
 
 test("nextDueSeedWallet shares one refresh slot between configured and trusted seeds", () => {
@@ -160,22 +133,13 @@ test("nextDueSeedWallet shares one refresh slot between configured and trusted s
     [WALLET, { last_refreshed_at: now - 100 }],
     [TRUSTED_A, { last_refreshed_at: now - 2_000 }],
   ]);
-
   const next = nextDueSeedWallet({
     configuredWallets: [WALLET],
-    trustedProfiles: [{
-      wallet_address: TRUSTED_A,
-      reputation_score: 82,
-      confidence_score: 80,
-      distinct_tokens: 15,
-      rug_or_bad_token_hits: 0,
-      ...qualityFields(15),
-    }],
+    trustedProfiles: [{ wallet_address: TRUSTED_A, reputation_score: 82, confidence_score: 80, distinct_tokens: 15, rug_or_bad_token_hits: 0, ...qualityFields(15) }],
     stateByWallet: (walletAddress) => state.get(walletAddress),
     now,
     refreshMs,
   });
-
   assert.equal(next.walletAddress, TRUSTED_A);
   assert.equal(next.source, "trusted");
 });
@@ -183,19 +147,11 @@ test("nextDueSeedWallet shares one refresh slot between configured and trusted s
 test("nextDueSeedWallet keeps due configured seeds ahead of learned seeds on equal staleness", () => {
   const next = nextDueSeedWallet({
     configuredWallets: [WALLET],
-    trustedProfiles: [{
-      wallet_address: TRUSTED_A,
-      reputation_score: 90,
-      confidence_score: 90,
-      distinct_tokens: 15,
-      rug_or_bad_token_hits: 0,
-      ...qualityFields(15),
-    }],
+    trustedProfiles: [{ wallet_address: TRUSTED_A, reputation_score: 90, confidence_score: 90, distinct_tokens: 15, rug_or_bad_token_hits: 0, ...qualityFields(15) }],
     stateByWallet: () => null,
     now: 5_000,
     refreshMs: 1_000,
   });
-
   assert.equal(next.walletAddress, WALLET);
   assert.equal(next.source, "configured");
 });
@@ -207,22 +163,13 @@ test("nextDueSeedWallet prevents configured seeds from starving older learned se
     [WALLET, { last_refreshed_at: now - 1_500 }],
     [TRUSTED_A, { last_refreshed_at: now - 8_000 }],
   ]);
-
   const next = nextDueSeedWallet({
     configuredWallets: [WALLET],
-    trustedProfiles: [{
-      wallet_address: TRUSTED_A,
-      reputation_score: 88,
-      confidence_score: 80,
-      distinct_tokens: 15,
-      rug_or_bad_token_hits: 0,
-      ...qualityFields(15),
-    }],
+    trustedProfiles: [{ wallet_address: TRUSTED_A, reputation_score: 88, confidence_score: 80, distinct_tokens: 15, rug_or_bad_token_hits: 0, ...qualityFields(15) }],
     stateByWallet: (walletAddress) => state.get(walletAddress),
     now,
     refreshMs,
   });
-
   assert.equal(next.walletAddress, TRUSTED_A);
   assert.equal(next.source, "trusted");
 });
@@ -234,7 +181,6 @@ test("boundedSeedQueueSelection caps new pending work but still updates existing
     maxPending: 3,
     exists: (token) => token.address === A,
   });
-
   assert.deepEqual(result.selected.map((token) => token.address), [A, B]);
   assert.equal(result.skipped, 1);
 });
