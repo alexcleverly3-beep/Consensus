@@ -217,18 +217,32 @@ function renderDashboard(snapshot) {
 }
 function startProgressDashboard({ dbPath = resolveDbPath(), port = int(process.env.DASHBOARD_PORT || process.env.PORT,3000), host = process.env.DASHBOARD_HOST || "0.0.0.0", env = process.env, gmgnGuard = null }={}) {
   fs.mkdirSync(path.dirname(dbPath),{recursive:true}); const db = new Database(dbPath,{fileMustExist:true}); db.pragma("busy_timeout = 5000"); const store = createProgressStore(db,{env,gmgnGuard});
+  let review = null;
+  try { review = require("./selection-review").initSelectionReview(db); }
+  catch (error) { console.warn(`[selection-review] dashboard unavailable: ${error.message}`); }
+  function reviewProgress() { try { return review?.progress() || null; } catch { return null; } }
   store.snapshot({recentLimit:1}); const changeTimer=setInterval(()=>{try{store.snapshot({recentLimit:1});}catch(error){console.warn(`[dashboard] change checkpoint failed: ${error.message}`);}},60*1000); changeTimer.unref?.();
   const server=http.createServer((req,res)=>{let requestUrl;let pathname;try{requestUrl=new URL(req.url,"http://dashboard.local");pathname=requestUrl.pathname;}catch{pathname=req.url;}
     if(pathname==="/health"){res.writeHead(200,{"content-type":"application/json; charset=utf-8","cache-control":"no-store"});res.end(JSON.stringify({ok:true}));return;}
+    if(pathname==="/api/review-progress"){const progress=reviewProgress();res.writeHead(progress?200:503,{"content-type":"application/json; charset=utf-8","cache-control":"no-store"});res.end(JSON.stringify(progress?{...progress,enabled:env.SELECTION_REVIEW_ENABLED!=="0"}:{available:false}));return;}
     if(pathname==="/api/progress"){res.writeHead(200,{"content-type":"application/json; charset=utf-8","cache-control":"no-store"});res.end(JSON.stringify(store.snapshot()));return;}
-    if(pathname==="/wallets"||pathname==="/api/wallets"){const credentials=privateDashboardCredentials(env);const securityHeaders={"cache-control":"no-store","content-security-policy":"default-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'","referrer-policy":"no-referrer","x-content-type-options":"nosniff","x-frame-options":"DENY"};
+    if(pathname==="/wallets"||pathname==="/api/wallets"||pathname==="/review"||pathname==="/api/review-wallets"){const credentials=privateDashboardCredentials(env);const securityHeaders={"cache-control":"no-store","content-security-policy":"default-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'","referrer-policy":"no-referrer","x-content-type-options":"nosniff","x-frame-options":"DENY"};
       if(!credentials.password){res.writeHead(503,{...securityHeaders,"content-type":"text/plain; charset=utf-8"});res.end("Private wallet review is disabled. Set DASHBOARD_PASSWORD in Railway.");return;}
       if(!isPrivateRequestAuthorized(req,env)){res.writeHead(401,{...securityHeaders,"content-type":"text/plain; charset=utf-8","www-authenticate":'Basic realm="Consensus private wallet review", charset="UTF-8"'});res.end("Authentication required");return;}
+      if(pathname==="/review"||pathname==="/api/review-wallets"){
+        if(!review){res.writeHead(503,{...securityHeaders,"content-type":"text/plain"});res.end("Selection review unavailable; existing scanner is unchanged.");return;}
+        try {
+        const progress=review.progress(),wallets=review.shortlist();
+        if(pathname==="/api/review-wallets"){res.writeHead(200,{...securityHeaders,"content-type":"application/json; charset=utf-8","content-disposition":'attachment; filename="consensus-selection-review.json"'});res.end(JSON.stringify({progress,policy:require("./selection-review").POLICY,wallets},null,2));return;}
+        res.writeHead(200,{...securityHeaders,"content-type":"text/html; charset=utf-8"});res.end(require("./selection-review-page").renderReviewPage(progress,wallets,review.diagnostics()));return;
+        } catch { if(!res.headersSent)res.writeHead(503,{...securityHeaders,"content-type":"text/plain"});res.end("Selection review temporarily unavailable; existing scanner is unchanged.");return; }
+      }
       const allWallets=store.wallets();const showAll=requestUrl?.searchParams.get("view")==="all";const wallets=showAll?allWallets:allWallets.filter((wallet)=>wallet.trusted);
       if(pathname==="/api/wallets"){res.writeHead(200,{...securityHeaders,"content-type":"application/json; charset=utf-8"});res.end(JSON.stringify({generatedAt:Date.now(),thresholds:trustedThresholds(env),view:showAll?"all":"trusted",totalCandidates:allWallets.length,wallets}));return;}
-      res.writeHead(200,{...securityHeaders,"content-type":"text/html; charset=utf-8"});res.end(renderWalletsPage(wallets,trustedThresholds(env),{showAll,totalCandidates:allWallets.length}));return;}
+      res.writeHead(200,{...securityHeaders,"content-type":"text/html; charset=utf-8"});res.end(renderWalletsPage(wallets,trustedThresholds(env),{showAll,totalCandidates:allWallets.length}).replace("<h1>",'<p><a href="/review">New: selection-first manual review queue</a></p><h1>'));return;}
     if(pathname!=="/"&&pathname!=="/index.html"){res.writeHead(404,{"content-type":"text/plain; charset=utf-8"});res.end("Not found");return;}
-    res.writeHead(200,{"content-type":"text/html; charset=utf-8","cache-control":"no-store"});res.end(renderDashboard(store.snapshot()));});
+    const reviewStatus=reviewProgress();const reviewSection=reviewStatus?`<section><h2>Selection-first manual review</h2><p>${reviewStatus.saved} / 10 candidates saved for your review. Assessed in 100-wallet discovery groups; existing Consensus continues unchanged.</p><p><a href="/review">Open private manual review queue</a></p></section>`:"";
+    res.writeHead(200,{"content-type":"text/html; charset=utf-8","cache-control":"no-store"});res.end(renderDashboard(store.snapshot()).replace("</main>",reviewSection+"</main>"));});
   server.listen(port,host,()=>console.log(`[dashboard] listening on ${host}:${port}; wallet identities are hidden`)); server.once("close",()=>clearInterval(changeTimer)); return {server,db,store};
 }
 module.exports={createProgressStore,gmgnBudgetSnapshot,isPrivateRequestAuthorized,renderDashboard,renderWalletsPage,startProgressDashboard,trustedThresholds,walletVerdict};
