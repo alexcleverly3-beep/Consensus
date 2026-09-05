@@ -26,6 +26,7 @@ function qualityFields(distinctTokens) {
     mature_tokens: matureTokens,
     positive_outcome_tokens: Math.ceil(matureTokens * 0.8),
     strong_outcome_tokens: 3,
+    validated_winner_tokens: Math.ceil(matureTokens * 0.3),
     hold_evidence_tokens: holdEvidenceTokens,
     meaningful_hold_tokens: Math.ceil(holdEvidenceTokens * 0.8),
     avg_entry_delay_sec: 1800,
