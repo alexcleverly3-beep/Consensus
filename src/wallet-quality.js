@@ -15,8 +15,8 @@ const STRONG_WALLET_FLOORS = Object.freeze({
   minOutcomeCoverageRate: 2 / 3,
   minPositiveOutcomeRate: 0.75,
   minStrongOutcomeRate: 0.25,
-  minGuaranteedValidatedTokens: 2,
-  minGuaranteedValidatedRate: 0.20,
+  minValidatedWinnerTokens: 2,
+  minValidatedWinnerRate: 0.20,
   minHoldEvidenceRate: 0.50,
   minMeaningfulHoldRate: 0.75,
   minAverageHoldSec: 60 * 60,
@@ -55,8 +55,8 @@ function trustedProfileQuality(profile, {
   minOutcomeCoverageRate = STRONG_WALLET_FLOORS.minOutcomeCoverageRate,
   minPositiveOutcomeRate = STRONG_WALLET_FLOORS.minPositiveOutcomeRate,
   minStrongOutcomeRate = STRONG_WALLET_FLOORS.minStrongOutcomeRate,
-  minGuaranteedValidatedTokens = STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens,
-  minGuaranteedValidatedRate = STRONG_WALLET_FLOORS.minGuaranteedValidatedRate,
+  minValidatedWinnerTokens = STRONG_WALLET_FLOORS.minValidatedWinnerTokens,
+  minValidatedWinnerRate = STRONG_WALLET_FLOORS.minValidatedWinnerRate,
   minHoldEvidenceRate = STRONG_WALLET_FLOORS.minHoldEvidenceRate,
   minMeaningfulHoldRate = STRONG_WALLET_FLOORS.minMeaningfulHoldRate,
   minAverageHoldSec = STRONG_WALLET_FLOORS.minAverageHoldSec,
@@ -82,6 +82,9 @@ function trustedProfileQuality(profile, {
   const strongOutcomeTokens = Math.max(0, Math.floor(num(
     profile?.strong_outcome_tokens ?? profile?.strongOutcomeTokens
   )));
+  const validatedWinnerTokens = Math.max(0, Math.floor(num(
+    profile?.validated_winner_tokens ?? profile?.validatedWinnerTokens
+  )));
   const holdEvidenceTokens = Math.max(0, Math.floor(num(
     profile?.hold_evidence_tokens ?? profile?.holdEvidenceTokens
   )));
@@ -106,17 +109,11 @@ function trustedProfileQuality(profile, {
   const strongOutcomeRate = matureTokens > 0
     ? clamp(strongOutcomeTokens / matureTokens, 0, 1)
     : 0;
-
-  // Inclusion-exclusion gives a conservative lower bound for how many token
-  // observations MUST simultaneously belong to all three sets: early entries,
-  // meaningful profitable entries, and tokens with a positive mature outcome.
-  // This prevents three individually-good headline rates from qualifying a
-  // wallet when those signals could all have occurred on different trades.
-  const guaranteedValidatedTokens = distinctTokens > 0
-    ? Math.max(0, earlyEntries + profitableEntries + positiveOutcomeTokens - (2 * distinctTokens))
-    : 0;
-  const guaranteedValidatedRate = matureTokens > 0
-    ? clamp(guaranteedValidatedTokens / matureTokens, 0, 1)
+  // This is an exact longitudinal intersection, not an aggregate overlap proxy:
+  // each counted token must itself be early, meaningfully profitable, and later
+  // validated as a positive mature outcome.
+  const validatedWinnerRate = matureTokens > 0
+    ? clamp(validatedWinnerTokens / matureTokens, 0, 1)
     : 0;
 
   const holdEvidenceRate = distinctTokens > 0
@@ -143,13 +140,13 @@ function trustedProfileQuality(profile, {
     minOutcomeCoverageRate: atLeast(minOutcomeCoverageRate, STRONG_WALLET_FLOORS.minOutcomeCoverageRate),
     minPositiveOutcomeRate: atLeast(minPositiveOutcomeRate, STRONG_WALLET_FLOORS.minPositiveOutcomeRate),
     minStrongOutcomeRate: atLeast(minStrongOutcomeRate, STRONG_WALLET_FLOORS.minStrongOutcomeRate),
-    minGuaranteedValidatedTokens: Math.floor(atLeast(
-      minGuaranteedValidatedTokens,
-      STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens
+    minValidatedWinnerTokens: Math.floor(atLeast(
+      minValidatedWinnerTokens,
+      STRONG_WALLET_FLOORS.minValidatedWinnerTokens
     )),
-    minGuaranteedValidatedRate: atLeast(
-      minGuaranteedValidatedRate,
-      STRONG_WALLET_FLOORS.minGuaranteedValidatedRate
+    minValidatedWinnerRate: atLeast(
+      minValidatedWinnerRate,
+      STRONG_WALLET_FLOORS.minValidatedWinnerRate
     ),
     minHoldEvidenceRate: atLeast(minHoldEvidenceRate, STRONG_WALLET_FLOORS.minHoldEvidenceRate),
     minMeaningfulHoldRate: atLeast(minMeaningfulHoldRate, STRONG_WALLET_FLOORS.minMeaningfulHoldRate),
@@ -176,8 +173,8 @@ function trustedProfileQuality(profile, {
   if (positiveOutcomeRate < thresholds.minPositiveOutcomeRate) reasons.push("weak-mature-outcome-rate");
   if (strongOutcomeRate < thresholds.minStrongOutcomeRate) reasons.push("weak-strong-outcome-rate");
   if (
-    guaranteedValidatedTokens < thresholds.minGuaranteedValidatedTokens ||
-    guaranteedValidatedRate < thresholds.minGuaranteedValidatedRate
+    validatedWinnerTokens < thresholds.minValidatedWinnerTokens ||
+    validatedWinnerRate < thresholds.minValidatedWinnerRate
   ) {
     reasons.push("insufficient-aligned-winner-evidence");
   }
@@ -207,6 +204,7 @@ function trustedProfileQuality(profile, {
       matureTokens,
       positiveOutcomeTokens,
       strongOutcomeTokens,
+      validatedWinnerTokens,
       holdEvidenceTokens,
       meaningfulHoldTokens,
       earlyRate,
@@ -216,8 +214,7 @@ function trustedProfileQuality(profile, {
       outcomeCoverageRate,
       positiveOutcomeRate,
       strongOutcomeRate,
-      guaranteedValidatedTokens,
-      guaranteedValidatedRate,
+      validatedWinnerRate,
       holdEvidenceRate,
       meaningfulHoldRate,
       averageEntryDelaySec,
