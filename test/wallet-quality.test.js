@@ -16,6 +16,7 @@ function profile(overrides = {}) {
     mature_tokens: 10,
     positive_outcome_tokens: 8,
     strong_outcome_tokens: 3,
+    validated_winner_tokens: 3,
     hold_evidence_tokens: 12,
     meaningful_hold_tokens: 9,
     avg_entry_delay_sec: 1800,
@@ -35,8 +36,8 @@ test("trustedProfileQuality accepts repeatable early profitable behaviour", () =
   assert.equal(result.metrics.positiveOutcomeRate, 0.8);
   assert.equal(result.metrics.outcomeCoverageRate, 2 / 3);
   assert.equal(result.metrics.strongOutcomeRate, 0.3);
-  assert.equal(result.metrics.guaranteedValidatedTokens, 2);
-  assert.equal(result.metrics.guaranteedValidatedRate, 0.2);
+  assert.equal(result.metrics.validatedWinnerTokens, 3);
+  assert.equal(result.metrics.validatedWinnerRate, 0.3);
 });
 
 test("trustedProfileQuality keeps a twelve-token hard floor even with a low override", () => {
@@ -97,12 +98,12 @@ test("trustedProfileQuality requires mature outcomes across most observed tokens
     mature_tokens: 10,
     positive_outcome_tokens: 9,
     strong_outcome_tokens: 3,
+    validated_winner_tokens: 3,
     hold_evidence_tokens: 15,
     meaningful_hold_tokens: 12,
   }));
 
   assert.equal(result.metrics.outcomeCoverageRate, 10 / 18);
-  assert.ok(result.metrics.guaranteedValidatedTokens >= 2);
   assert.equal(result.eligible, false);
   assert.ok(result.reasons.includes("insufficient-outcome-coverage"));
 });
@@ -115,6 +116,7 @@ test("trustedProfileQuality requires strong winners to repeat, not just exist", 
     mature_tokens: 12,
     positive_outcome_tokens: 10,
     strong_outcome_tokens: 2,
+    validated_winner_tokens: 4,
     hold_evidence_tokens: 12,
     meaningful_hold_tokens: 10,
   }));
@@ -125,31 +127,34 @@ test("trustedProfileQuality requires strong winners to repeat, not just exist", 
   assert.ok(result.reasons.includes("weak-strong-outcome-rate"));
 });
 
-test("trustedProfileQuality rejects disjoint early/profitable/outcome headline rates", () => {
+test("trustedProfileQuality uses exact validated winners instead of aggregate overlap", () => {
   const result = trustedProfileQuality(profile({
     distinct_tokens: 15,
-    early_entries: 10,
-    profitable_entries: 10,
+    early_entries: 12,
+    profitable_entries: 12,
     mature_tokens: 10,
-    positive_outcome_tokens: 8,
+    positive_outcome_tokens: 9,
     strong_outcome_tokens: 3,
+    validated_winner_tokens: 1,
     avg_entry_delay_sec: 1800,
     avg_hold_sec: 7200,
     avg_token_score: 82,
     avg_outcome_score: 84,
   }));
 
-  // Each headline rate independently clears its floor, but the counts do not
-  // guarantee that even two tokens were early + profitable + eventual winners.
+  // The aggregate headline counts look excellent and would imply several wins
+  // under the old overlap proxy, but the evidence store proves only one token
+  // actually satisfied early + profitable + positive mature outcome together.
   assert.ok(result.metrics.earlyRate >= 2 / 3);
   assert.ok(result.metrics.profitableRate >= 2 / 3);
   assert.ok(result.metrics.positiveOutcomeRate >= 0.75);
-  assert.equal(result.metrics.guaranteedValidatedTokens, 0);
+  assert.equal(result.metrics.validatedWinnerTokens, 1);
+  assert.equal(result.metrics.validatedWinnerRate, 0.1);
   assert.equal(result.eligible, false);
   assert.ok(result.reasons.includes("insufficient-aligned-winner-evidence"));
 });
 
-test("aligned winner evidence scales with mature wallet history", () => {
+test("exact validated winner evidence scales with mature wallet history", () => {
   const result = trustedProfileQuality(profile({
     distinct_tokens: 30,
     early_entries: 24,
@@ -157,6 +162,7 @@ test("aligned winner evidence scales with mature wallet history", () => {
     mature_tokens: 20,
     positive_outcome_tokens: 15,
     strong_outcome_tokens: 5,
+    validated_winner_tokens: 2,
     hold_evidence_tokens: 24,
     meaningful_hold_tokens: 20,
     avg_entry_delay_sec: 1800,
@@ -165,15 +171,22 @@ test("aligned winner evidence scales with mature wallet history", () => {
     avg_outcome_score: 80,
   }));
 
-  // This wallet clears all headline rates and the old fixed two-token aligned
-  // floor, but only 10% of its mature history is guaranteed to be an aligned
-  // early + profitable + eventual winner. A large history needs repeatability.
-  assert.equal(result.metrics.guaranteedValidatedTokens, 2);
-  assert.equal(result.metrics.guaranteedValidatedRate, 0.1);
+  assert.equal(result.metrics.validatedWinnerTokens, 2);
+  assert.equal(result.metrics.validatedWinnerRate, 0.1);
   assert.equal(result.metrics.outcomeCoverageRate, 2 / 3);
   assert.equal(result.metrics.positiveOutcomeRate, 0.75);
   assert.equal(result.metrics.strongOutcomeRate, 0.25);
   assert.equal(result.eligible, false);
+  assert.ok(result.reasons.includes("insufficient-aligned-winner-evidence"));
+});
+
+test("trustedProfileQuality rejects profiles that do not carry exact winner evidence", () => {
+  const withoutExactEvidence = profile();
+  delete withoutExactEvidence.validated_winner_tokens;
+
+  const result = trustedProfileQuality(withoutExactEvidence);
+  assert.equal(result.eligible, false);
+  assert.equal(result.metrics.validatedWinnerTokens, 0);
   assert.ok(result.reasons.includes("insufficient-aligned-winner-evidence"));
 });
 
