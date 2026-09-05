@@ -33,8 +33,15 @@ function normalizeFraction(value) {
   return clamp(n, -10, 10);
 }
 
+function canonicalAddress(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function traderAddress(trader) {
-  return trader?.address || trader?.wallet_address || trader?.wallet || null;
+  const wallet = canonicalAddress(
+    trader?.address || trader?.wallet_address || trader?.wallet || ""
+  );
+  return wallet || null;
 }
 
 function traderTokenEvidence(trader, tokenInfo = {}, now = Date.now()) {
@@ -121,10 +128,10 @@ function candidatePriority({ evidence, profile, tags = [] }) {
 }
 
 function defaultTraderFilter(trader, creatorAddress) {
-  const rawWallet = traderAddress(trader);
-  const wallet = typeof rawWallet === "string" ? rawWallet.trim() : "";
+  const wallet = traderAddress(trader) || "";
+  const creator = canonicalAddress(creatorAddress);
   if (!SOL_ADDR.test(wallet)) return "invalid-wallet";
-  if (creatorAddress && wallet === creatorAddress) return "creator";
+  if (creator && wallet === creator) return "creator";
   if (Number(trader?.addr_type) === 2) return "exchange-or-pool";
   if (boolFlag(trader?.transfer_in)) return "transfer-funded";
   if (
@@ -235,7 +242,7 @@ function createDiscoveryEngine({
     if (!tokenAddress) throw new Error("tokenAddress is required");
 
     const budget = new RequestBudget({ maxFreshCalls });
-    const creatorAddress = tokenInfo?.dev?.creator_address || null;
+    const creatorAddress = canonicalAddress(tokenInfo?.dev?.creator_address);
     const candidates = [];
     const rejected = [];
     const seenWallets = new Set();
