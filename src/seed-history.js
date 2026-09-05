@@ -26,6 +26,14 @@ function mergeTokens(target, tokens) {
   }
 }
 
+function pageFingerprint(tokens = []) {
+  if (!tokens.length) return null;
+  return tokens
+    .map((token) => `${token.address}:${Number(token.lastActivityAt || 0)}`)
+    .sort()
+    .join("|");
+}
+
 async function collectSeedHistory({
   walletAddress,
   fetchPage,
@@ -44,13 +52,24 @@ async function collectSeedHistory({
   let cursor = initialCursor;
   let continuation = null;
   let pagesFetched = 0;
+  let previousFingerprint = null;
+  let duplicatePageDetected = false;
 
   while (pagesFetched < boundedPages && tokens.size < boundedTokens) {
     const response = await fetchPage({ walletAddress, cursor });
     pagesFetched += 1;
-    mergeTokens(tokens, extractBoughtTokens(response, { walletAddress, limit: boundedTokens }));
+    const pageTokens = extractBoughtTokens(response, { walletAddress, limit: boundedTokens });
+    mergeTokens(tokens, pageTokens);
 
     const next = nextCursor(response);
+    const fingerprint = pageFingerprint(pageTokens);
+    if (fingerprint && fingerprint === previousFingerprint) {
+      duplicatePageDetected = true;
+      continuation = next && next !== cursor && !seenCursors.has(next) ? next : null;
+      break;
+    }
+    if (fingerprint) previousFingerprint = fingerprint;
+
     if (!next || next === cursor || seenCursors.has(next)) {
       continuation = null;
       break;
@@ -68,7 +87,8 @@ async function collectSeedHistory({
     startCursor: initialCursor,
     nextCursor: continuation,
     exhausted: continuation == null,
+    duplicatePageDetected,
   };
 }
 
-module.exports = { collectSeedHistory, nextCursor, mergeTokens };
+module.exports = { collectSeedHistory, nextCursor, mergeTokens, pageFingerprint };
