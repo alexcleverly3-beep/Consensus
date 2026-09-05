@@ -36,6 +36,7 @@ test("trustedProfileQuality accepts repeatable early profitable behaviour", () =
   assert.equal(result.metrics.outcomeCoverageRate, 2 / 3);
   assert.equal(result.metrics.strongOutcomeRate, 0.3);
   assert.equal(result.metrics.guaranteedValidatedTokens, 2);
+  assert.equal(result.metrics.guaranteedValidatedRate, 0.2);
 });
 
 test("trustedProfileQuality keeps a twelve-token hard floor even with a low override", () => {
@@ -144,6 +145,34 @@ test("trustedProfileQuality rejects disjoint early/profitable/outcome headline r
   assert.ok(result.metrics.profitableRate >= 2 / 3);
   assert.ok(result.metrics.positiveOutcomeRate >= 0.75);
   assert.equal(result.metrics.guaranteedValidatedTokens, 0);
+  assert.equal(result.eligible, false);
+  assert.ok(result.reasons.includes("insufficient-aligned-winner-evidence"));
+});
+
+test("aligned winner evidence scales with mature wallet history", () => {
+  const result = trustedProfileQuality(profile({
+    distinct_tokens: 30,
+    early_entries: 24,
+    profitable_entries: 23,
+    mature_tokens: 20,
+    positive_outcome_tokens: 15,
+    strong_outcome_tokens: 5,
+    hold_evidence_tokens: 24,
+    meaningful_hold_tokens: 20,
+    avg_entry_delay_sec: 1800,
+    avg_hold_sec: 7200,
+    avg_token_score: 80,
+    avg_outcome_score: 80,
+  }));
+
+  // This wallet clears all headline rates and the old fixed two-token aligned
+  // floor, but only 10% of its mature history is guaranteed to be an aligned
+  // early + profitable + eventual winner. A large history needs repeatability.
+  assert.equal(result.metrics.guaranteedValidatedTokens, 2);
+  assert.equal(result.metrics.guaranteedValidatedRate, 0.1);
+  assert.equal(result.metrics.outcomeCoverageRate, 2 / 3);
+  assert.equal(result.metrics.positiveOutcomeRate, 0.75);
+  assert.equal(result.metrics.strongOutcomeRate, 0.25);
   assert.equal(result.eligible, false);
   assert.ok(result.reasons.includes("insufficient-aligned-winner-evidence"));
 });
