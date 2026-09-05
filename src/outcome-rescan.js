@@ -12,12 +12,16 @@ function num(value, fallback = 0) {
 function followupStage(row, now = Date.now()) {
   if (!row?.token_address) return null;
   const firstObservedAt = num(row.first_observed_at);
-  const snapshots = Math.max(0, Math.floor(num(row.snapshot_count)));
+  const lastObservedAt = num(row.last_observed_at, firstObservedAt);
   if (!firstObservedAt) return null;
 
-  const ageMs = Math.max(0, num(now, Date.now()) - firstObservedAt);
-  if (ageMs >= DAY_MS && snapshots < 3) return "24h";
-  if (ageMs >= SIX_HOURS_MS && snapshots < 2) return "6h";
+  const timestamp = num(now, Date.now());
+  const ageMs = Math.max(0, timestamp - firstObservedAt);
+  const hasSixHourSnapshot = lastObservedAt >= firstObservedAt + SIX_HOURS_MS;
+  const hasDaySnapshot = lastObservedAt >= firstObservedAt + DAY_MS;
+
+  if (ageMs >= DAY_MS && !hasDaySnapshot) return "24h";
+  if (ageMs >= SIX_HOURS_MS && !hasSixHourSnapshot) return "6h";
   return null;
 }
 
@@ -33,13 +37,24 @@ function initOutcomeRescan(db, { retryCooldownMs = DEFAULT_RETRY_COOLDOWN_MS } =
     );
   `);
 
+  // Snapshot count is not a lifecycle milestone. A token can be scanned several
+  // times before six hours and those fresh observations must not accidentally
+  // suppress the dedicated 6h/24h outcome checks. Treat any snapshot at or after
+  // a milestone as satisfying that milestone, regardless of how many earlier
+  // snapshots were recorded.
   const candidateStmt = db.prepare(`
     SELECT o.*, s.last_attempt_at, s.attempt_count, s.last_error
     FROM token_outcomes o
     LEFT JOIN outcome_rescan_state s ON s.token_address = o.token_address
     WHERE
-      (o.first_observed_at <= ? AND o.snapshot_count < 2)
-      OR (o.first_observed_at <= ? AND o.snapshot_count < 3)
+      (
+        o.first_observed_at <= ?
+        AND COALESCE(o.last_observed_at, o.first_observed_at) < o.first_observed_at + ${SIX_HOURS_MS}
+      )
+      OR (
+        o.first_observed_at <= ?
+        AND COALESCE(o.last_observed_at, o.first_observed_at) < o.first_observed_at + ${DAY_MS}
+      )
     ORDER BY o.first_observed_at ASC, o.last_observed_at ASC
     LIMIT 50
   `);
