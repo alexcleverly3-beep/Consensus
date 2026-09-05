@@ -13,6 +13,7 @@ const STRONG_WALLET_FLOORS = Object.freeze({
   maxBadTokenRate: 0.10,
   maxNegativeSignalRate: 0.15,
   minPositiveOutcomeRate: 0.75,
+  minGuaranteedValidatedTokens: 2,
   minHoldEvidenceRate: 0.50,
   minMeaningfulHoldRate: 0.75,
   minAverageHoldSec: 60 * 60,
@@ -49,6 +50,7 @@ function trustedProfileQuality(profile, {
   maxBadTokenRate = STRONG_WALLET_FLOORS.maxBadTokenRate,
   maxNegativeSignalRate = STRONG_WALLET_FLOORS.maxNegativeSignalRate,
   minPositiveOutcomeRate = STRONG_WALLET_FLOORS.minPositiveOutcomeRate,
+  minGuaranteedValidatedTokens = STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens,
   minHoldEvidenceRate = STRONG_WALLET_FLOORS.minHoldEvidenceRate,
   minMeaningfulHoldRate = STRONG_WALLET_FLOORS.minMeaningfulHoldRate,
   minAverageHoldSec = STRONG_WALLET_FLOORS.minAverageHoldSec,
@@ -92,6 +94,16 @@ function trustedProfileQuality(profile, {
   const positiveOutcomeRate = matureTokens > 0
     ? clamp(positiveOutcomeTokens / matureTokens, 0, 1)
     : 0;
+
+  // Inclusion-exclusion gives a conservative lower bound for how many token
+  // observations MUST simultaneously belong to all three sets: early entries,
+  // meaningful profitable entries, and tokens with a positive mature outcome.
+  // This prevents three individually-good headline rates from qualifying a
+  // wallet when those signals could all have occurred on different trades.
+  const guaranteedValidatedTokens = distinctTokens > 0
+    ? Math.max(0, earlyEntries + profitableEntries + positiveOutcomeTokens - (2 * distinctTokens))
+    : 0;
+
   const holdEvidenceRate = distinctTokens > 0
     ? clamp(holdEvidenceTokens / distinctTokens, 0, 1)
     : 0;
@@ -114,6 +126,10 @@ function trustedProfileQuality(profile, {
     maxBadTokenRate: atMost(maxBadTokenRate, STRONG_WALLET_FLOORS.maxBadTokenRate),
     maxNegativeSignalRate: atMost(maxNegativeSignalRate, STRONG_WALLET_FLOORS.maxNegativeSignalRate),
     minPositiveOutcomeRate: atLeast(minPositiveOutcomeRate, STRONG_WALLET_FLOORS.minPositiveOutcomeRate),
+    minGuaranteedValidatedTokens: Math.floor(atLeast(
+      minGuaranteedValidatedTokens,
+      STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens
+    )),
     minHoldEvidenceRate: atLeast(minHoldEvidenceRate, STRONG_WALLET_FLOORS.minHoldEvidenceRate),
     minMeaningfulHoldRate: atLeast(minMeaningfulHoldRate, STRONG_WALLET_FLOORS.minMeaningfulHoldRate),
     minAverageHoldSec: atLeast(minAverageHoldSec, STRONG_WALLET_FLOORS.minAverageHoldSec),
@@ -136,6 +152,9 @@ function trustedProfileQuality(profile, {
   if (badTokenRate > thresholds.maxBadTokenRate) reasons.push("high-bad-token-rate");
   if (negativeSignalRate > thresholds.maxNegativeSignalRate) reasons.push("high-negative-signal-rate");
   if (positiveOutcomeRate < thresholds.minPositiveOutcomeRate) reasons.push("weak-mature-outcome-rate");
+  if (guaranteedValidatedTokens < thresholds.minGuaranteedValidatedTokens) {
+    reasons.push("insufficient-aligned-winner-evidence");
+  }
   if (holdEvidenceRate < thresholds.minHoldEvidenceRate) reasons.push("insufficient-hold-evidence");
   if (meaningfulHoldRate < thresholds.minMeaningfulHoldRate) reasons.push("short-hold-pattern");
   if (averageHoldSec == null || averageHoldSec < thresholds.minAverageHoldSec) {
@@ -169,6 +188,7 @@ function trustedProfileQuality(profile, {
       badTokenRate,
       negativeSignalRate,
       positiveOutcomeRate,
+      guaranteedValidatedTokens,
       holdEvidenceRate,
       meaningfulHoldRate,
       averageEntryDelaySec,
