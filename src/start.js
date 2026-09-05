@@ -37,10 +37,17 @@ require("./runtime-diagnostics")
   .start();
 
 // app.js initializes the persistent SQLite schema synchronously before its
-// asynchronous discovery loop begins. Starting the dashboard immediately after
-// it means Railway can expose live progress from that same database without a
-// second service. The public /health wrapper exposes only whitelisted aggregate
-// collection counters and never wallet/token identities.
+// asynchronous discovery loop begins. Immediately install the observation clock
+// so rescans cannot move a wallet's original first-seen timestamp forward while
+// the profile can still retain the true latest observation time.
 require("./app");
+try {
+  const result = require("./evidence-observation-integrity")
+    .installEvidenceObservationIntegrityAtPath();
+  console.log(`[evidence] observation clock active (${result.clockRows} existing row(s) seeded)`);
+} catch (error) {
+  console.warn(`[evidence] observation clock unavailable: ${error.message}`);
+}
+
 const dashboard = require("./progress-dashboard").startProgressDashboard({ gmgnGuard });
 require("./public-health").installPublicHealthEndpoint(dashboard);
