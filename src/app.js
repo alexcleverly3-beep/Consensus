@@ -16,6 +16,7 @@ const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
 const { initOutcomeRescan } = require("./outcome-rescan");
 const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
 const { STRONG_WALLET_FLOORS, trustedProfileQuality } = require("./wallet-quality");
+const { shouldEmitConsensusAlert } = require("./consensus-alert-policy");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
@@ -441,9 +442,7 @@ function consensusEmbed(result) {
 async function maybeSendConsensus(result) {
   if (!result?.consensus || !client || !DISCORD_CHANNEL_ID) return false;
   const previous = getConsensusAlertStmt.get(result.tokenAddress);
-  if (previous && Date.now() - previous.sent_at < 24 * 60 * 60 * 1000 && previous.wallet_count >= result.consensus.walletCount) {
-    return false;
-  }
+  if (!shouldEmitConsensusAlert(previous, result.consensus)) return false;
   const channel = await client.channels.fetch(DISCORD_CHANNEL_ID).catch(() => null);
   if (!channel?.send) return false;
   await channel.send({ embeds: [consensusEmbed(result)] });
