@@ -42,6 +42,7 @@ test("collectSeedHistory follows cursors, deduplicates tokens, and keeps newest 
   assert.equal(result.tokens[0].lastActivityAt, 200000);
   assert.equal(result.exhausted, true);
   assert.equal(result.nextCursor, null);
+  assert.equal(result.duplicatePageDetected, false);
 });
 
 test("collectSeedHistory obeys the page budget and exposes the continuation cursor", async () => {
@@ -78,4 +79,25 @@ test("collectSeedHistory resumes from a persisted cursor without rereading page 
   assert.equal(result.nextCursor, "even-older");
   assert.equal(result.exhausted, false);
   assert.equal(result.tokens[0].address, TOKEN_B);
+});
+
+test("collectSeedHistory stops a duplicate cursor page without spending the remaining page budget", async () => {
+  const calls = [];
+  const result = await collectSeedHistory({
+    walletAddress: WALLET,
+    maxPages: 5,
+    fetchPage: async ({ cursor }) => {
+      calls.push(cursor);
+      if (cursor == null) {
+        return { data: { list: [buy(TOKEN_A, 100)], next_cursor: "p2" } };
+      }
+      return { data: { list: [buy(TOKEN_A, 100)], next_cursor: "p3" } };
+    },
+  });
+
+  assert.deepEqual(calls, [null, "p2"]);
+  assert.equal(result.pagesFetched, 2);
+  assert.equal(result.duplicatePageDetected, true);
+  assert.equal(result.nextCursor, "p3");
+  assert.equal(result.exhausted, false);
 });
