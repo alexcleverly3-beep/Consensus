@@ -2,17 +2,36 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { consensusWalletCount, shouldEmitConsensusAlert } = require("../src/consensus-alert-policy");
+const {
+  DEFAULT_ATTEMPT_TTL_MS,
+  consensusWalletCount,
+  shouldEmitConsensusAlert,
+} = require("../src/consensus-alert-policy");
 
+let tokenId = 0;
 function consensus(...wallets) {
+  tokenId += 1;
   return {
+    tokenAddress: `token-${tokenId}`,
+    walletCount: wallets.length,
+    wallets: wallets.map((walletAddress) => ({ walletAddress })),
+  };
+}
+
+function consensusFor(tokenAddress, ...wallets) {
+  return {
+    tokenAddress,
     walletCount: wallets.length,
     wallets: wallets.map((walletAddress) => ({ walletAddress })),
   };
 }
 
 function previous(...wallets) {
-  const payload = consensus(...wallets);
+  const payload = {
+    tokenAddress: "persisted-token",
+    walletCount: wallets.length,
+    wallets: wallets.map((walletAddress) => ({ walletAddress })),
+  };
   return {
     wallet_count: wallets.length,
     sent_at: 1,
@@ -37,6 +56,7 @@ test("first multi-wallet consensus is alertable", () => {
 
 test("headline wallet count cannot manufacture consensus", () => {
   assert.equal(shouldEmitConsensusAlert(null, {
+    tokenAddress: "duplicate-wallet-token",
     walletCount: 2,
     wallets: [{ walletAddress: "wallet-a" }, { walletAddress: "wallet-a" }],
   }), false);
@@ -76,5 +96,39 @@ test("stored headline count must match persisted exact wallet evidence", () => {
   assert.equal(
     shouldEmitConsensusAlert(stored, consensus("wallet-a", "wallet-b", "wallet-c", "wallet-d")),
     false
+  );
+});
+
+test("concurrent same-token alert attempts are serialized", () => {
+  const current = consensusFor("race-token", "wallet-a", "wallet-b");
+  assert.equal(shouldEmitConsensusAlert(null, current, { now: 1000 }), true);
+  assert.equal(shouldEmitConsensusAlert(null, current, { now: 1001 }), false);
+});
+
+test("persisted alert releases the in-process reservation back to monotonic policy", () => {
+  const current = consensusFor("persist-token", "wallet-a", "wallet-b");
+  assert.equal(shouldEmitConsensusAlert(null, current, { now: 2000 }), true);
+
+  const stored = {
+    wallet_count: 2,
+    sent_at: 2001,
+    payload_json: JSON.stringify(current),
+  };
+  assert.equal(shouldEmitConsensusAlert(stored, current, { now: 2002 }), false);
+
+  const stronger = consensusFor("persist-token", "wallet-a", "wallet-b", "wallet-c");
+  assert.equal(shouldEmitConsensusAlert(stored, stronger, { now: 2003 }), true);
+});
+
+test("failed alert attempt becomes retryable after bounded reservation expiry", () => {
+  const current = consensusFor("retry-token", "wallet-a", "wallet-b");
+  assert.equal(shouldEmitConsensusAlert(null, current, { now: 3000 }), true);
+  assert.equal(
+    shouldEmitConsensusAlert(null, current, { now: 3000 + DEFAULT_ATTEMPT_TTL_MS - 1 }),
+    false
+  );
+  assert.equal(
+    shouldEmitConsensusAlert(null, current, { now: 3000 + DEFAULT_ATTEMPT_TTL_MS }),
+    true
   );
 });
