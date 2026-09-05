@@ -28,6 +28,7 @@ test("traderTokenEvidence recognises early profitable entries", () => {
     buy_tx_count_cur: 2,
     sell_tx_count_cur: 1,
     start_holding_at: 10_900,
+    end_holding_at: 14_500,
   }, {
     open_timestamp: 10_000,
   });
@@ -35,6 +36,7 @@ test("traderTokenEvidence recognises early profitable entries", () => {
   assert.equal(evidence.isEarly, true);
   assert.equal(evidence.isProfitable, true);
   assert.equal(evidence.entryDelaySec, 900);
+  assert.equal(evidence.holdSec, 3600);
   assert.equal(evidence.profitChange, 1.4);
   assert.ok(evidence.tokenScore >= 70);
 });
@@ -68,6 +70,12 @@ test("default trader filter rejects extreme single-token churn even without a bo
     buy_tx_count_cur: 12,
     sell_tx_count_cur: 10,
   }), null);
+
+  assert.equal(defaultTraderFilter({
+    address: WALLET_A,
+    transfer_in: "1",
+    buy_tx_count_cur: 2,
+  }), "transfer-funded");
 });
 
 test("processToken does not persist high-frequency bot-like wallets as evidence", async () => {
@@ -144,17 +152,22 @@ test("processToken saves free evidence before spending enrichment budget", async
 test("duplicate trader rows cannot inflate distinct-wallet consensus", async () => {
   const { db, intelligence } = makeStore();
 
-  for (let i = 0; i < 8; i += 1) {
+  for (let i = 0; i < 12; i += 1) {
+    const tokenAddress = `${i + 90}`.repeat(32).slice(0, 32);
     intelligence.recordObservation({
       walletAddress: WALLET_A,
-      tokenAddress: `${i + 90}`.repeat(32).slice(0, 32),
+      tokenAddress,
       source: "history",
       tokenScore: 95,
       profitChange: 1.5,
       entryDelaySec: 300,
+      holdSec: 7200,
       isEarly: true,
       isProfitable: true,
     });
+    if (i < 8) {
+      intelligence.applyTokenOutcome({ tokenAddress, outcomeScore: 85, status: "strong" });
+    }
   }
 
   const engine = createDiscoveryEngine({
@@ -185,14 +198,14 @@ test("duplicate trader rows cannot inflate distinct-wallet consensus", async () 
     result.rejected.some((entry) => entry.walletAddress === WALLET_A && entry.reason === "duplicate-wallet"),
     true
   );
-  assert.equal(intelligence.getProfile(WALLET_A).observations, 9);
+  assert.equal(intelligence.getProfile(WALLET_A).observations, 13);
   db.close();
 });
 
-test("trusted wallets require evidence across at least six distinct tokens", async () => {
+test("trusted wallets require evidence across at least twelve distinct tokens", async () => {
   const { db, intelligence } = makeStore();
 
-  for (let i = 0; i < 4; i += 1) {
+  for (let i = 0; i < 11; i += 1) {
     intelligence.recordObservation({
       walletAddress: WALLET_A,
       tokenAddress: `${i + 70}`.repeat(32).slice(0, 32),
@@ -200,6 +213,7 @@ test("trusted wallets require evidence across at least six distinct tokens", asy
       tokenScore: 98,
       profitChange: 3,
       entryDelaySec: 300,
+      holdSec: 7200,
       isEarly: true,
       isProfitable: true,
     });
@@ -222,7 +236,7 @@ test("trusted wallets require evidence across at least six distinct tokens", asy
     ],
   });
 
-  assert.equal(intelligence.getProfile(WALLET_A).distinct_tokens, 5);
+  assert.equal(intelligence.getProfile(WALLET_A).distinct_tokens, 12);
   assert.equal(result.trusted.length, 0);
   assert.equal(result.consensus, null);
   db.close();
@@ -230,17 +244,22 @@ test("trusted wallets require evidence across at least six distinct tokens", asy
 
 test("the current token cannot make its own wallet historically trusted", async () => {
   const { db, intelligence } = makeStore();
-  for (let i = 0; i < 5; i += 1) {
+  for (let i = 0; i < 11; i += 1) {
+    const tokenAddress = `history-${i}`;
     intelligence.recordObservation({
       walletAddress: WALLET_A,
-      tokenAddress: `history-${i}`,
+      tokenAddress,
       source: "history",
       tokenScore: 95,
       profitChange: 1.5,
       entryDelaySec: 300,
+      holdSec: 7200,
       isEarly: true,
       isProfitable: true,
     });
+    if (i < 8) {
+      intelligence.applyTokenOutcome({ tokenAddress, outcomeScore: 85, status: "strong" });
+    }
   }
 
   const engine = createDiscoveryEngine({
@@ -248,7 +267,7 @@ test("the current token cannot make its own wallet historically trusted", async 
     minTokenScore: 1,
     minTrustedReputation: 1,
     minTrustedConfidence: 1,
-    minTrustedDistinctTokens: 6,
+    minTrustedDistinctTokens: 12,
     minConsensusWallets: 1,
   });
   const trader = {
@@ -263,17 +282,18 @@ test("the current token cannot make its own wallet historically trusted", async 
     tokenInfo: { open_timestamp: 1000 },
     traders: [trader],
   });
-  assert.equal(intelligence.getProfile(WALLET_A).distinct_tokens, 6);
+  assert.equal(intelligence.getProfile(WALLET_A).distinct_tokens, 12);
   assert.equal(first.trusted.length, 0);
   assert.equal(first.consensus, null);
 
   intelligence.recordObservation({
     walletAddress: WALLET_A,
-    tokenAddress: "history-5",
+    tokenAddress: "history-11",
     source: "history",
     tokenScore: 95,
     profitChange: 1.5,
     entryDelaySec: 300,
+    holdSec: 7200,
     isEarly: true,
     isProfitable: true,
   });
@@ -284,13 +304,13 @@ test("the current token cannot make its own wallet historically trusted", async 
   });
   assert.equal(second.trusted.length, 1);
   assert.equal(second.consensus.walletCount, 1);
-  assert.equal(second.consensus.wallets[0].distinctTokens, 6);
+  assert.equal(second.consensus.wallets[0].distinctTokens, 12);
   db.close();
 });
 
 test("high reputation alone cannot promote a consistently late wallet", async () => {
   const { db, intelligence } = makeStore();
-  for (let i = 0; i < 10; i += 1) {
+  for (let i = 0; i < 12; i += 1) {
     intelligence.recordObservation({
       walletAddress: WALLET_A,
       tokenAddress: `late-${i}`,
@@ -298,9 +318,13 @@ test("high reputation alone cannot promote a consistently late wallet", async ()
       tokenScore: 95,
       profitChange: 2,
       entryDelaySec: 4 * 60 * 60,
+      holdSec: 7200,
       isEarly: false,
       isProfitable: true,
     });
+    if (i < 8) {
+      intelligence.applyTokenOutcome({ tokenAddress: `late-${i}`, outcomeScore: 85, status: "strong" });
+    }
   }
 
   const engine = createDiscoveryEngine({
@@ -326,27 +350,35 @@ test("high reputation alone cannot promote a consistently late wallet", async ()
 test("known strong wallets are prioritised and can form consensus", async () => {
   const { db, intelligence } = makeStore();
 
-  for (let i = 0; i < 8; i += 1) {
+  for (let i = 0; i < 12; i += 1) {
+    const tokenA = `strong-a-${i}`;
+    const tokenB = `strong-b-${i}`;
     intelligence.recordObservation({
       walletAddress: WALLET_A,
-      tokenAddress: `${i + 10}`.repeat(32).slice(0, 32),
+      tokenAddress: tokenA,
       source: "history",
       tokenScore: 90,
       profitChange: 1.2,
       entryDelaySec: 600,
+      holdSec: 7200,
       isEarly: true,
       isProfitable: true,
     });
     intelligence.recordObservation({
       walletAddress: WALLET_B,
-      tokenAddress: `${i + 30}`.repeat(32).slice(0, 32),
+      tokenAddress: tokenB,
       source: "history",
       tokenScore: 88,
       profitChange: 0.9,
       entryDelaySec: 900,
+      holdSec: 7200,
       isEarly: true,
       isProfitable: true,
     });
+    if (i < 8) {
+      intelligence.applyTokenOutcome({ tokenAddress: tokenA, outcomeScore: 85, status: "strong" });
+      intelligence.applyTokenOutcome({ tokenAddress: tokenB, outcomeScore: 85, status: "strong" });
+    }
   }
 
   const engine = createDiscoveryEngine({
@@ -362,14 +394,14 @@ test("known strong wallets are prioritised and can form consensus", async () => 
     tokenAddress: TOKEN,
     tokenInfo: { open_timestamp: 1000 },
     traders: [
-      { address: WALLET_A, profit: 500, profit_change: 0.4, start_holding_at: 1300 },
-      { address: WALLET_B, profit: 450, profit_change: 0.35, start_holding_at: 1400 },
+      { address: WALLET_A, profit: 5000, profit_change: 1.2, start_holding_at: 1300 },
+      { address: WALLET_B, profit: 4500, profit_change: 1.1, start_holding_at: 1400 },
     ],
   });
 
   assert.ok(result.consensus);
   assert.equal(result.consensus.walletCount, 2);
-  assert.ok(result.consensus.wallets.every((wallet) => wallet.distinctTokens >= 6));
+  assert.ok(result.consensus.wallets.every((wallet) => wallet.distinctTokens >= 12));
   assert.equal(result.candidates[0].profile.confidence_label !== "low", true);
   db.close();
 });

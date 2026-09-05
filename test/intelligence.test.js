@@ -139,6 +139,10 @@ test("strong mature outcome boosts token quality without duplicating evidence", 
   const after = intelligence.getProfile("wallet-strong");
   assert.equal(after.observations, 1);
   assert.equal(after.distinct_tokens, 1);
+  assert.equal(after.mature_tokens, 1);
+  assert.equal(after.positive_outcome_tokens, 1);
+  assert.equal(after.strong_outcome_tokens, 1);
+  assert.equal(after.avg_outcome_score, 100);
   assert.ok(after.avg_token_score > before.avg_token_score);
   assert.ok(after.reputation_score >= before.reputation_score);
   assert.ok(after.confidence_score > before.confidence_score);
@@ -307,5 +311,45 @@ test("profile aggregation can exclude the current token from historical trust", 
   assert.equal(full.distinct_tokens, 4);
   assert.equal(historical.distinct_tokens, 3);
   assert.ok(historical.confidence_score < full.confidence_score);
+  db.close();
+});
+
+test("outcome-quality profile columns migrate additively without losing existing wallets", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE wallet_profiles (
+      wallet_address TEXT PRIMARY KEY,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      observations INTEGER NOT NULL DEFAULT 0,
+      distinct_tokens INTEGER NOT NULL DEFAULT 0,
+      positive_signals INTEGER NOT NULL DEFAULT 0,
+      negative_signals INTEGER NOT NULL DEFAULT 0,
+      early_entries INTEGER NOT NULL DEFAULT 0,
+      profitable_entries INTEGER NOT NULL DEFAULT 0,
+      rug_or_bad_token_hits INTEGER NOT NULL DEFAULT 0,
+      avg_entry_delay_sec REAL,
+      avg_hold_sec REAL,
+      avg_token_score REAL,
+      reputation_score REAL NOT NULL DEFAULT 0,
+      confidence_score REAL NOT NULL DEFAULT 0,
+      confidence_label TEXT NOT NULL DEFAULT 'low',
+      last_refreshed_at INTEGER
+    );
+    INSERT INTO wallet_profiles(
+      wallet_address, first_seen_at, last_seen_at, reputation_score, confidence_score
+    ) VALUES ('preserved-wallet', 1, 2, 70, 55);
+  `);
+
+  const intelligence = initIntelligence(db);
+  const preserved = intelligence.getProfile("preserved-wallet");
+  assert.equal(preserved.wallet_address, "preserved-wallet");
+  assert.equal(preserved.reputation_score, 70);
+  assert.equal(preserved.mature_tokens, 0);
+  assert.equal(preserved.positive_outcome_tokens, 0);
+  assert.equal(preserved.strong_outcome_tokens, 0);
+  assert.equal(preserved.hold_evidence_tokens, 0);
+  assert.equal(preserved.meaningful_hold_tokens, 0);
+  assert.equal(preserved.avg_outcome_score, null);
   db.close();
 });

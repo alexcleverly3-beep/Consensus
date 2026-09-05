@@ -33,15 +33,28 @@ test("hardens autonomous trending toward older durable tokens", () => {
   ]);
 
   assert.equal(flagValue(args, "--interval"), "24h");
-  assert.equal(flagValue(args, "--min-created"), "2d");
-  assert.equal(flagValue(args, "--min-liquidity"), "20000");
-  assert.equal(flagValue(args, "--min-marketcap"), "100000");
-  assert.equal(flagValue(args, "--min-volume"), "10000");
-  assert.equal(flagValue(args, "--min-holder-count"), "200");
-  assert.equal(flagValue(args, "--max-top10-holder-rate"), "0.50");
-  assert.equal(flagValue(args, "--max-dev-team-hold-rate"), "0.20");
-  assert.equal(flagValue(args, "--max-rug-ratio"), "0.30");
+  assert.equal(flagValue(args, "--min-created"), "3d");
+  assert.equal(flagValue(args, "--min-liquidity"), "50000");
+  assert.equal(flagValue(args, "--min-marketcap"), "250000");
+  assert.equal(flagValue(args, "--min-volume"), "25000");
+  assert.equal(flagValue(args, "--min-holder-count"), "500");
+  assert.equal(flagValue(args, "--max-top10-holder-rate"), "0.4");
+  assert.equal(flagValue(args, "--max-top70-sniper-hold-rate"), "0.15");
+  assert.equal(flagValue(args, "--max-dev-team-hold-rate"), "0.1");
+  assert.equal(flagValue(args, "--max-entrapment-ratio"), "0.2");
+  assert.equal(flagValue(args, "--max-rug-ratio"), null);
+  assert.ok(args.some((value, i) => value === "--filter" && args[i + 1] === "renounced"));
   assert.ok(args.some((value, i) => value === "--filter" && args[i + 1] === "not_wash_trading"));
+});
+
+test("trending guard preserves settings that are already stricter", () => {
+  const args = hardenTrendingArgs([
+    "market", "trending", "--min-created", "7d",
+    "--min-liquidity", "100000", "--max-insider-rate", "0.05", "--raw",
+  ]);
+  assert.equal(flagValue(args, "--min-created"), "7d");
+  assert.equal(flagValue(args, "--min-liquidity"), "100000");
+  assert.equal(flagValue(args, "--max-insider-rate"), "0.05");
 });
 
 test("does not rewrite non-trending GMGN commands", () => {
@@ -60,7 +73,7 @@ test("guard passes hardened trending args to the real CLI", async () => {
 
   await call(guarded, ["market", "trending", "--chain", "sol", "--interval", "1h", "--raw"]);
   assert.equal(flagValue(received, "--interval"), "24h");
-  assert.equal(flagValue(received, "--min-created"), "2d");
+  assert.equal(flagValue(received, "--min-created"), "3d");
 });
 
 test("guard enforces one shared fresh-call budget", async () => {

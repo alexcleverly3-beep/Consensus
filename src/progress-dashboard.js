@@ -6,18 +6,59 @@ const fs = require("fs");
 const path = require("path");
 const Database = require("better-sqlite3");
 const { resolveDbPath } = require("./runtime-config");
+const { STRONG_WALLET_FLOORS, trustedProfileQuality } = require("./wallet-quality");
 
 function int(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : fallback;
 }
 
+function decimal(value, fallback, min = 0, max = 1) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+
 function trustedThresholds(env = process.env) {
   return {
-    reputation: int(env.TRUSTED_REPUTATION, 65),
-    confidence: int(env.TRUSTED_CONFIDENCE, 50),
-    distinctTokens: int(env.TRUSTED_DISTINCT_TOKENS, 4),
+    reputation: Math.max(STRONG_WALLET_FLOORS.reputation, int(env.TRUSTED_REPUTATION, 70)),
+    confidence: Math.max(STRONG_WALLET_FLOORS.confidence, int(env.TRUSTED_CONFIDENCE, 75)),
+    distinctTokens: Math.max(STRONG_WALLET_FLOORS.distinctTokens, int(env.TRUSTED_DISTINCT_TOKENS, 12)),
+    matureTokens: Math.max(STRONG_WALLET_FLOORS.matureTokens, int(env.TRUSTED_MATURE_TOKENS, 8)),
+    strongOutcomeTokens: Math.max(STRONG_WALLET_FLOORS.strongOutcomeTokens, int(env.TRUSTED_STRONG_OUTCOME_TOKENS, 2)),
+    minEarlyRate: Math.max(STRONG_WALLET_FLOORS.minEarlyRate, decimal(env.TRUSTED_MIN_EARLY_RATE, 2 / 3)),
+    minProfitableRate: Math.max(STRONG_WALLET_FLOORS.minProfitableRate, decimal(env.TRUSTED_MIN_PROFITABLE_RATE, 2 / 3)),
+    maxBadTokenRate: Math.min(STRONG_WALLET_FLOORS.maxBadTokenRate, decimal(env.TRUSTED_SEED_MAX_BAD_RATE, 0.10)),
+    maxNegativeSignalRate: Math.min(STRONG_WALLET_FLOORS.maxNegativeSignalRate, decimal(env.TRUSTED_MAX_NEGATIVE_SIGNAL_RATE, 0.15)),
+    minPositiveOutcomeRate: Math.max(STRONG_WALLET_FLOORS.minPositiveOutcomeRate, decimal(env.TRUSTED_MIN_POSITIVE_OUTCOME_RATE, 0.75)),
+    minHoldEvidenceRate: Math.max(STRONG_WALLET_FLOORS.minHoldEvidenceRate, decimal(env.TRUSTED_MIN_HOLD_EVIDENCE_RATE, 0.50)),
+    minMeaningfulHoldRate: Math.max(STRONG_WALLET_FLOORS.minMeaningfulHoldRate, decimal(env.TRUSTED_MIN_MEANINGFUL_HOLD_RATE, 0.75)),
+    minAverageHoldSec: Math.max(STRONG_WALLET_FLOORS.minAverageHoldSec, int(env.TRUSTED_MIN_AVG_HOLD_SEC, 3600)),
+    maxAverageEntryDelaySec: Math.min(STRONG_WALLET_FLOORS.maxAverageEntryDelaySec, int(env.TRUSTED_MAX_AVG_ENTRY_DELAY_SEC, 3600)),
+    minAverageTokenScore: Math.max(STRONG_WALLET_FLOORS.minAverageTokenScore, int(env.TRUSTED_MIN_AVG_TOKEN_SCORE, 68)),
+    minAverageOutcomeScore: Math.max(STRONG_WALLET_FLOORS.minAverageOutcomeScore, int(env.TRUSTED_MIN_AVG_OUTCOME_SCORE, 68)),
   };
+}
+
+function trustedProfileDecision(profile, thresholds) {
+  const quality = trustedProfileQuality(profile, {
+    minReputation: thresholds.reputation,
+    minConfidence: thresholds.confidence,
+    minDistinctTokens: thresholds.distinctTokens,
+    minMatureTokens: thresholds.matureTokens,
+    minStrongOutcomeTokens: thresholds.strongOutcomeTokens,
+    minEarlyRate: thresholds.minEarlyRate,
+    minProfitableRate: thresholds.minProfitableRate,
+    maxBadTokenRate: thresholds.maxBadTokenRate,
+    maxNegativeSignalRate: thresholds.maxNegativeSignalRate,
+    minPositiveOutcomeRate: thresholds.minPositiveOutcomeRate,
+    minHoldEvidenceRate: thresholds.minHoldEvidenceRate,
+    minMeaningfulHoldRate: thresholds.minMeaningfulHoldRate,
+    minAverageHoldSec: thresholds.minAverageHoldSec,
+    maxAverageEntryDelaySec: thresholds.maxAverageEntryDelaySec,
+    minAverageTokenScore: thresholds.minAverageTokenScore,
+    minAverageOutcomeScore: thresholds.minAverageOutcomeScore,
+  });
+  return quality;
 }
 
 function gmgnBudgetSnapshot(value = {}) {
@@ -47,10 +88,6 @@ function createProgressStore(db, { env = process.env, gmgnGuard = null, now = ()
       (SELECT COALESCE(SUM(scan_count), 0) FROM token_discovery_state) AS total_scans,
       (SELECT COUNT(*) FROM wallet_evidence) AS evidence_observations,
       (SELECT COUNT(*) FROM wallet_profiles) AS wallets_observed,
-      (SELECT COUNT(*) FROM wallet_profiles
-        WHERE reputation_score >= ?
-          AND confidence_score >= ?
-          AND distinct_tokens >= ?) AS smart_wallets_found,
       (SELECT COUNT(*) FROM consensus_alerts) AS consensus_alerts,
       (SELECT COUNT(*) FROM seed_token_queue WHERE status = 'pending') AS queued_tokens
   `);
@@ -68,6 +105,7 @@ function createProgressStore(db, { env = process.env, gmgnGuard = null, now = ()
     INSERT INTO meta(key, value) VALUES ('dashboard_change_state_v1', ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `);
+  const allProfilesStmt = db.prepare("SELECT * FROM wallet_profiles");
   const walletsStmt = db.prepare(`
     SELECT
       wallet_address,
@@ -83,16 +121,18 @@ function createProgressStore(db, { env = process.env, gmgnGuard = null, now = ()
       avg_entry_delay_sec,
       avg_hold_sec,
       avg_token_score,
+      mature_tokens,
+      positive_outcome_tokens,
+      strong_outcome_tokens,
+      hold_evidence_tokens,
+      meaningful_hold_tokens,
+      avg_outcome_score,
       reputation_score,
       confidence_score,
-      confidence_label,
-      CASE WHEN reputation_score >= ?
-        AND confidence_score >= ?
-        AND distinct_tokens >= ? THEN 1 ELSE 0 END AS is_trusted
+      confidence_label
     FROM wallet_profiles
     WHERE observations >= ?
     ORDER BY
-      is_trusted DESC,
       confidence_score DESC,
       reputation_score DESC,
       distinct_tokens DESC,
@@ -159,11 +199,10 @@ function createProgressStore(db, { env = process.env, gmgnGuard = null, now = ()
 
   return {
     snapshot({ recentLimit = 8 } = {}) {
-      const totals = totalsStmt.get(
-        thresholds.reputation,
-        thresholds.confidence,
-        thresholds.distinctTokens
-      ) || {};
+      const totals = totalsStmt.get() || {};
+      const smartWalletsFound = allProfilesStmt.all()
+        .filter((profile) => trustedProfileDecision(profile, thresholds).eligible)
+        .length;
       const gmgn = gmgnBudgetSnapshot(
         typeof gmgnGuard?.snapshot === "function" ? gmgnGuard.snapshot() : {}
       );
@@ -182,7 +221,7 @@ function createProgressStore(db, { env = process.env, gmgnGuard = null, now = ()
           totalScans: int(totals.total_scans),
           evidenceObservations: int(totals.evidence_observations),
           walletsObserved: int(totals.wallets_observed),
-          smartWalletsFound: int(totals.smart_wallets_found),
+          smartWalletsFound,
           consensusAlerts: int(totals.consensus_alerts),
           queuedTokens: int(totals.queued_tokens),
         },
@@ -197,9 +236,6 @@ function createProgressStore(db, { env = process.env, gmgnGuard = null, now = ()
     },
     wallets({ limit = 100, minObservations = 2 } = {}) {
       return walletsStmt.all(
-        thresholds.reputation,
-        thresholds.confidence,
-        thresholds.distinctTokens,
         Math.max(1, int(minObservations, 2)),
         Math.max(1, Math.min(250, int(limit, 100)))
       ).map((row) => ({
@@ -216,11 +252,31 @@ function createProgressStore(db, { env = process.env, gmgnGuard = null, now = ()
         averageEntryDelaySeconds: row.avg_entry_delay_sec == null ? null : Number(row.avg_entry_delay_sec),
         averageHoldSeconds: row.avg_hold_sec == null ? null : Number(row.avg_hold_sec),
         averageTokenScore: row.avg_token_score == null ? null : Number(row.avg_token_score),
+        matureTokens: int(row.mature_tokens),
+        positiveOutcomeTokens: int(row.positive_outcome_tokens),
+        strongOutcomeTokens: int(row.strong_outcome_tokens),
+        holdEvidenceTokens: int(row.hold_evidence_tokens),
+        meaningfulHoldTokens: int(row.meaningful_hold_tokens),
+        averageOutcomeScore: row.avg_outcome_score == null ? null : Number(row.avg_outcome_score),
         reputation: Number(row.reputation_score || 0),
         confidence: Number(row.confidence_score || 0),
         confidenceLabel: String(row.confidence_label || "low"),
-        trusted: Boolean(row.is_trusted),
-      }));
+        trusted: false,
+        qualityReasons: [],
+      })).map((wallet) => {
+        const decision = trustedProfileDecision(wallet, thresholds);
+        return {
+          ...wallet,
+          trusted: decision.eligible,
+          qualityReasons: decision.reasons,
+          qualityMetrics: decision.metrics,
+        };
+      }).sort((a, b) =>
+        Number(b.trusted) - Number(a.trusted) ||
+        b.confidence - a.confidence ||
+        b.reputation - a.reputation ||
+        b.distinctTokens - a.distinctTokens
+      );
     },
   };
 }
@@ -271,17 +327,32 @@ function isPrivateRequestAuthorized(req, env = process.env) {
 }
 
 function walletVerdict(wallet, thresholds) {
-  if (wallet.trusted) return { label: "Trusted", className: "trusted" };
+  if (wallet.trusted) return { label: "Strong — validated", className: "trusted" };
   const badRate = wallet.distinctTokens > 0 ? wallet.badTokenHits / wallet.distinctTokens : 0;
   if (wallet.reputation < 40 || (wallet.badTokenHits >= 2 && badRate >= 0.25)) {
     return { label: "Risk watch", className: "risk" };
   }
-  const missing = [];
-  if (wallet.reputation < thresholds.reputation) missing.push("reputation");
-  if (wallet.confidence < thresholds.confidence) missing.push("confidence");
-  if (wallet.distinctTokens < thresholds.distinctTokens) missing.push("breadth");
+  const labels = {
+    "low-reputation": "reputation",
+    "low-confidence": "confidence",
+    "insufficient-breadth": "breadth",
+    "insufficient-mature-outcomes": "maturity",
+    "insufficient-strong-outcomes": "strong outcomes",
+    "weak-early-entry-rate": "early entries",
+    "weak-profitability-rate": "repeat wins",
+    "high-bad-token-rate": "bad-token risk",
+    "high-negative-signal-rate": "loss discipline",
+    "weak-mature-outcome-rate": "positive outcomes",
+    "insufficient-hold-evidence": "hold evidence",
+    "short-hold-pattern": "holding time",
+    "short-average-hold": "average hold",
+    "late-average-entry": "entry timing",
+    "weak-average-token-score": "token quality",
+    "weak-average-outcome-score": "outcome quality",
+  };
+  const missing = [...new Set((wallet.qualityReasons || []).map((reason) => labels[reason] || reason))];
   return {
-    label: missing.length ? `Building: ${missing.join(", ")}` : "Building evidence",
+    label: missing.length ? `Needs: ${missing.slice(0, 3).join(", ")}` : "Building evidence",
     className: "building",
   };
 }
@@ -301,7 +372,7 @@ function renderChange(changes, key) {
   return `<div class="change ${className}">${arrow} ${escapeHtml(signed)} / ${escapeHtml(changes.windowMinutes)}m</div>`;
 }
 
-function renderWalletsPage(wallets, thresholds) {
+function renderWalletsPage(wallets, thresholds, { showAll = false, totalCandidates = wallets.length } = {}) {
   const rows = wallets.length
     ? wallets.map((wallet, index) => {
       const verdict = walletVerdict(wallet, thresholds);
@@ -316,11 +387,17 @@ function renderWalletsPage(wallets, thresholds) {
         <td>${wallet.earlyEntries}</td>
         <td>${wallet.profitableEntries}</td>
         <td>${wallet.badTokenHits}</td>
+        <td>${wallet.matureTokens}</td>
+        <td>${wallet.positiveOutcomeTokens}</td>
+        <td>${wallet.strongOutcomeTokens}</td>
+        <td>${wallet.meaningfulHoldTokens}/${wallet.holdEvidenceTokens}</td>
+        <td>${wallet.averageHoldSeconds == null ? "—" : `${Math.round(wallet.averageHoldSeconds / 3600)}h`}</td>
+        <td>${formatScore(wallet.averageOutcomeScore)}</td>
         <td>${formatScore(wallet.averageTokenScore)}</td>
         <td>${escapeHtml(formatTime(wallet.lastSeenAt))}</td>
       </tr>`;
     }).join("")
-    : '<tr><td colspan="12">No wallets have enough evidence to review yet.</td></tr>';
+    : '<tr><td colspan="18">No wallets meet the strict outcome-validated trust gate yet.</td></tr>';
 
   return `<!doctype html>
 <html lang="en">
@@ -339,7 +416,7 @@ function renderWalletsPage(wallets, thresholds) {
     .summary { display: flex; flex-wrap: wrap; gap: 12px; margin: 22px 0; }
     .card { border: 1px solid #30363d; border-radius: 10px; background: #161b22; padding: 14px 16px; }
     .table-wrap { overflow-x: auto; border: 1px solid #30363d; border-radius: 10px; }
-    table { width: 100%; min-width: 1250px; border-collapse: collapse; background: #161b22; }
+    table { width: 100%; min-width: 1750px; border-collapse: collapse; background: #161b22; }
     th, td { text-align: left; padding: 11px; border-bottom: 1px solid #30363d; font-size: 13px; white-space: nowrap; }
     th { color: #8b949e; font-weight: 600; position: sticky; top: 0; background: #161b22; }
     tr:last-child td { border-bottom: 0; }
@@ -353,20 +430,20 @@ function renderWalletsPage(wallets, thresholds) {
 <body>
 <main>
   <h1>Private wallet review</h1>
-  <p class="muted">Ranked longitudinal evidence. Auto-refreshes every 60 seconds. Wallet links open in Solscan.</p>
+  <p class="muted">${showAll ? "All repeat-observation candidates are shown for diagnosis." : "Only strong, outcome-validated wallets are shown by default."} Auto-refreshes every 60 seconds. Wallet links open in Solscan.</p>
   <div class="summary">
-    <div class="card"><strong>${wallets.filter((wallet) => wallet.trusted).length}</strong> trusted in this view</div>
-    <div class="card"><strong>${wallets.length}</strong> wallets with repeat observations</div>
-    <div class="card">Trust requires rep ≥ <strong>${thresholds.reputation}</strong>, confidence ≥ <strong>${thresholds.confidence}</strong>, and ≥ <strong>${thresholds.distinctTokens}</strong> independent tokens</div>
+    <div class="card"><strong>${wallets.filter((wallet) => wallet.trusted).length}</strong> strong wallets</div>
+    <div class="card"><strong>${totalCandidates}</strong> repeat-observation candidates total</div>
+    <div class="card">Strong requires rep ≥ <strong>${thresholds.reputation}</strong>, confidence ≥ <strong>${thresholds.confidence}</strong>, ≥ <strong>${thresholds.distinctTokens}</strong> independent tokens, ≥ <strong>${thresholds.matureTokens}</strong> mature outcomes, and meaningful hold proof</div>
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>#</th><th>Wallet</th><th>Verdict</th><th>Rep</th><th>Conf</th><th>Tokens</th><th>Positive</th><th>Early</th><th>Profitable</th><th>Bad hits</th><th>Avg token</th><th>Last seen</th></tr></thead>
+      <thead><tr><th>#</th><th>Wallet</th><th>Verdict</th><th>Rep</th><th>Conf</th><th>Tokens</th><th>Positive</th><th>Early</th><th>Profitable</th><th>Bad hits</th><th>Mature</th><th>Good outcomes</th><th>Strong outcomes</th><th>Meaningful holds</th><th>Avg hold</th><th>Avg outcome</th><th>Avg token</th><th>Last seen</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </div>
-  <p class="note">“Trusted” means the wallet meets the configured historical thresholds; it is not a guarantee of future performance. Bad-token exposure and weak breadth remain visible for review.</p>
-  <p><a href="/">Back to public progress</a></p>
+  <p class="note">“Strong — validated” requires broad repeatability, strong mature token results, early profitable entries, low loss/rug exposure, and copyable holding behaviour. It is still not a guarantee of future performance.</p>
+  <p>${showAll ? '<a href="/wallets">Show trusted only</a>' : '<a href="/wallets?view=all">Review all observed candidates</a>'} · <a href="/">Back to public progress</a></p>
 </main>
 </body>
 </html>`;
@@ -377,7 +454,7 @@ function renderDashboard(snapshot) {
   const cards = [
     ["Tokens scanned", t.tokensScanned, "tokensScanned"],
     ["Wallets observed", t.walletsObserved, "walletsObserved"],
-    ["Smart wallets found", t.smartWalletsFound, "smartWalletsFound"],
+    ["Strong wallets found", t.smartWalletsFound, "smartWalletsFound"],
     ["Evidence saved", t.evidenceObservations, "evidenceObservations"],
     ["Consensus alerts", t.consensusAlerts, "consensusAlerts"],
     ["Queued tokens", t.queuedTokens, "queuedTokens"],
@@ -475,9 +552,11 @@ function startProgressDashboard({
   }, 60 * 1000);
   changeTimer.unref?.();
   const server = http.createServer((req, res) => {
+    let requestUrl;
     let pathname;
     try {
-      pathname = new URL(req.url, "http://dashboard.local").pathname;
+      requestUrl = new URL(req.url, "http://dashboard.local");
+      pathname = requestUrl.pathname;
     } catch {
       pathname = req.url;
     }
@@ -514,14 +593,25 @@ function startProgressDashboard({
         res.end("Authentication required");
         return;
       }
-      const wallets = store.wallets();
+      const allWallets = store.wallets();
+      const showAll = requestUrl?.searchParams.get("view") === "all";
+      const wallets = showAll ? allWallets : allWallets.filter((wallet) => wallet.trusted);
       if (pathname === "/api/wallets") {
         res.writeHead(200, { ...securityHeaders, "content-type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ generatedAt: Date.now(), thresholds: trustedThresholds(env), wallets }));
+        res.end(JSON.stringify({
+          generatedAt: Date.now(),
+          thresholds: trustedThresholds(env),
+          view: showAll ? "all" : "trusted",
+          totalCandidates: allWallets.length,
+          wallets,
+        }));
         return;
       }
       res.writeHead(200, { ...securityHeaders, "content-type": "text/html; charset=utf-8" });
-      res.end(renderWalletsPage(wallets, trustedThresholds(env)));
+      res.end(renderWalletsPage(wallets, trustedThresholds(env), {
+        showAll,
+        totalCandidates: allWallets.length,
+      }));
       return;
     }
     if (pathname !== "/" && pathname !== "/index.html") {

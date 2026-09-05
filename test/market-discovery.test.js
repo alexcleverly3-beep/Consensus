@@ -8,6 +8,7 @@ const {
   formatDiscoveryDiagnostics,
   shouldScanToken,
   qualityGate,
+  seedTokenQualityGate,
   launchedAt,
 } = require("../src/market-discovery");
 
@@ -67,27 +68,37 @@ test("qualityGate requires known age and durable market quality by default", () 
 
 test("qualityGate rejects mature tokens with pump-and-dump or rug characteristics", () => {
   assert.equal(qualityGate(mature({ is_wash_trading: true }), { now: NOW }).reason, "wash-trading");
-  assert.equal(qualityGate(mature({ rug_ratio: 0.31 }), { now: NOW }).reason, "high-rug-risk");
-  assert.equal(qualityGate(mature({ top_10_holder_rate: 0.51 }), { now: NOW }).reason, "concentrated-holders");
-  assert.equal(qualityGate(mature({ dev_team_hold_rate: 0.21 }), { now: NOW }).reason, "high-dev-hold");
+  assert.equal(qualityGate(mature({ is_honeypot: true }), { now: NOW }).reason, "honeypot");
+  assert.equal(qualityGate(mature({ renounced_mint: false }), { now: NOW }).reason, "mutable-mint-authority");
+  assert.equal(qualityGate(mature({ renounced_freeze_account: "0" }), { now: NOW }).reason, "active-freeze-authority");
+  assert.equal(qualityGate(mature({ rug_ratio: 0.16 }), { now: NOW }).reason, "high-rug-risk");
+  assert.equal(qualityGate(mature({ top_10_holder_rate: 0.41 }), { now: NOW }).reason, "concentrated-holders");
+  assert.equal(qualityGate(mature({ dev_team_hold_rate: 0.11 }), { now: NOW }).reason, "high-dev-hold");
   assert.equal(qualityGate(mature({ creator_token_status: "creator_hold" }), { now: NOW }).reason, "creator-still-holding");
-  assert.equal(qualityGate(mature({ rat_trader_amount_rate: 0.36 }), { now: NOW }).reason, "high-insider-rate");
+  assert.equal(qualityGate(mature({ rat_trader_amount_rate: 0.21 }), { now: NOW }).reason, "high-insider-rate");
+  assert.equal(qualityGate(mature({ bundler_rate: 0.21 }), { now: NOW }).reason, "high-bundler-rate");
+  assert.equal(qualityGate(mature({ entrapment_ratio: 0.21 }), { now: NOW }).reason, "high-entrapment-ratio");
+  assert.equal(qualityGate(mature({ top_70_sniper_hold_rate: 0.16 }), { now: NOW }).reason, "high-sniper-hold");
 });
 
 test("qualityGate rejects thinly-backed and hyperactive mature tokens", () => {
   assert.equal(
-    qualityGate(mature({ liquidity: 20000, market_cap: 5000000 }), { now: NOW }).reason,
+    qualityGate(mature({ liquidity: 50000, market_cap: 5000000 }), { now: NOW }).reason,
     "thin-liquidity"
   );
   assert.equal(
-    qualityGate(mature({ liquidity: 20000, market_cap: 500000, volume: 600000 }), { now: NOW }).reason,
+    qualityGate(mature({ liquidity: 50000, market_cap: 500000, volume: 650000 }), { now: NOW }).reason,
     "extreme-turnover"
   );
 });
 
-test("qualityGate uses holder breadth when GMGN supplies it but tolerates missing holder data", () => {
+test("qualityGate requires holder breadth for autonomous token intake", () => {
   assert.equal(qualityGate(mature({ holder_count: 75 }), { now: NOW }).reason, "low-holder-count");
-  assert.equal(qualityGate(mature({ holder_count: undefined }), { now: NOW }).ok, true);
+  assert.equal(qualityGate(mature({ holder_count: undefined }), { now: NOW }).reason, "unknown-holder-count");
+  assert.equal(
+    qualityGate(mature({ holder_count: undefined }), { now: NOW, requireKnownHolderCount: false }).ok,
+    true
+  );
 });
 
 test("qualityGate accepts interval-specific 24h volume payloads", () => {
@@ -95,6 +106,12 @@ test("qualityGate accepts interval-specific 24h volume payloads", () => {
   const gate = qualityGate(row, { now: NOW });
   assert.equal(gate.ok, true);
   assert.equal(gate.volume, 75000);
+});
+
+test("seed token gate rejects obvious junk before spending a trader scan", () => {
+  assert.equal(seedTokenQualityGate(mature({ liquidity: 10_000 }), { now: NOW }).reason, "low-liquidity");
+  assert.equal(seedTokenQualityGate(mature({ market_cap: 50_000 }), { now: NOW }).reason, "low-market-cap");
+  assert.equal(seedTokenQualityGate(mature({ holder_count: undefined }), { now: NOW }).ok, true);
 });
 
 test("candidate analysis explains quality rejection and deduplication without extra requests", () => {

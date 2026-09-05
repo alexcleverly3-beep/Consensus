@@ -5,7 +5,7 @@
   "main": "src/start.js",
   "scripts": {
     "start": "node src/start.js",
-    "check": "node --check src/start.js && node --check src/app.js && node --check src/discovery-engine.js && node --check src/intelligence.js && node --check src/request-budget.js && node --check src/market-discovery.js && node --check src/seed-discovery.js && node --check src/seed-history.js && node --check src/token-outcomes.js && node --check src/outcome-rescan.js && node --check src/gmgn-runtime-guard.js && node --check src/gmgn-guard-state.js && node --check src/runtime-diagnostics.js && node --check src/progress-dashboard.js && node --check src/runtime-config.js",
+    "check": "node --check src/start.js && node --check src/app.js && node --check src/discovery-engine.js && node --check src/intelligence.js && node --check src/wallet-quality.js && node --check src/request-budget.js && node --check src/market-discovery.js && node --check src/seed-discovery.js && node --check src/seed-history.js && node --check src/token-outcomes.js && node --check src/outcome-rescan.js && node --check src/gmgn-runtime-guard.js && node --check src/gmgn-guard-state.js && node --check src/runtime-diagnostics.js && node --check src/progress-dashboard.js && node --check src/runtime-config.js",
     "test": "node --test"
   },
   "engines": {

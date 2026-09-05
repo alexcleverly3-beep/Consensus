@@ -1,6 +1,6 @@
 "use strict";
 
-const DEFAULT_MIN_AGE_MS = 48 * 60 * 60 * 1000;
+const DEFAULT_MIN_AGE_MS = 72 * 60 * 60 * 1000;
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 function num(value, fallback = 0) {
@@ -10,6 +10,13 @@ function num(value, fallback = 0) {
 
 function boolFlag(value) {
   return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true";
+}
+
+function optionalBool(value) {
+  if (value == null || value === "") return null;
+  if (boolFlag(value)) return true;
+  if (value === false || value === 0 || value === "0" || String(value).toLowerCase() === "false") return false;
+  return null;
 }
 
 function tokenAddress(row) {
@@ -71,11 +78,16 @@ function marketMetrics(row) {
     volumeToLiquidity: liquidity > 0 ? volume / liquidity : 0,
     insider: num(row?.insider_rate ?? row?.rat_trader_amount_rate),
     bundler: num(row?.bundler_rate),
+    entrapment: num(row?.entrapment_ratio),
+    top70SniperHoldRate: num(row?.top_70_sniper_hold_rate ?? row?.top70_sniper_hold_rate),
     smart: num(row?.smart_degen_count ?? row?.smart_money_count),
     rugRatio: num(row?.rug_ratio),
     top10HolderRate: num(row?.top_10_holder_rate ?? row?.top10_holder_rate),
     devTeamHoldRate: num(row?.dev_team_hold_rate),
     washTrading: boolFlag(row?.is_wash_trading),
+    honeypot: boolFlag(row?.is_honeypot),
+    renouncedMint: optionalBool(row?.renounced_mint),
+    renouncedFreeze: optionalBool(row?.renounced_freeze_account),
     creatorStatus: String(row?.creator_token_status || "").toLowerCase(),
   };
 }
@@ -83,19 +95,22 @@ function marketMetrics(row) {
 function qualityGate(row, {
   now = Date.now(),
   minAgeMs = DEFAULT_MIN_AGE_MS,
-  minLiquidity = 20_000,
-  minMarketCap = 100_000,
-  minVolume = 10_000,
-  minHolderCount = 200,
-  minLiquidityToMarketCap = 0.01,
-  maxVolumeToLiquidity = 25,
-  maxInsiderRate = 0.35,
-  maxBundlerRate = 0.35,
-  maxRugRatio = 0.30,
-  maxTop10HolderRate = 0.50,
-  maxDevTeamHoldRate = 0.20,
+  minLiquidity = 50_000,
+  minMarketCap = 250_000,
+  minVolume = 25_000,
+  minHolderCount = 500,
+  minLiquidityToMarketCap = 0.02,
+  maxVolumeToLiquidity = 12,
+  maxInsiderRate = 0.20,
+  maxBundlerRate = 0.20,
+  maxEntrapmentRatio = 0.20,
+  maxTop70SniperHoldRate = 0.15,
+  maxRugRatio = 0.15,
+  maxTop10HolderRate = 0.40,
+  maxDevTeamHoldRate = 0.10,
   rejectCreatorHolding = true,
   requireKnownAge = true,
+  requireKnownHolderCount = true,
 } = {}) {
   const launch = launchedAt(row);
   const ageMs = launch ? Math.max(0, now - launch) : null;
@@ -107,6 +122,9 @@ function qualityGate(row, {
   if (metrics.marketCap < minMarketCap) return { ok: false, reason: "low-market-cap", ageMs, ...metrics };
   if (metrics.volume < minVolume) return { ok: false, reason: "low-volume", ageMs, ...metrics };
 
+  if (requireKnownHolderCount && metrics.holderCount <= 0) {
+    return { ok: false, reason: "unknown-holder-count", ageMs, ...metrics };
+  }
   if (metrics.holderCount > 0 && metrics.holderCount < minHolderCount) {
     return { ok: false, reason: "low-holder-count", ageMs, ...metrics };
   }
@@ -119,12 +137,17 @@ function qualityGate(row, {
   }
 
   if (metrics.washTrading) return { ok: false, reason: "wash-trading", ageMs, ...metrics };
+  if (metrics.honeypot) return { ok: false, reason: "honeypot", ageMs, ...metrics };
+  if (metrics.renouncedMint === false) return { ok: false, reason: "mutable-mint-authority", ageMs, ...metrics };
+  if (metrics.renouncedFreeze === false) return { ok: false, reason: "active-freeze-authority", ageMs, ...metrics };
   if (metrics.rugRatio > maxRugRatio) return { ok: false, reason: "high-rug-risk", ageMs, ...metrics };
   if (metrics.top10HolderRate > maxTop10HolderRate) return { ok: false, reason: "concentrated-holders", ageMs, ...metrics };
   if (metrics.devTeamHoldRate > maxDevTeamHoldRate) return { ok: false, reason: "high-dev-hold", ageMs, ...metrics };
   if (rejectCreatorHolding && metrics.creatorStatus === "creator_hold") return { ok: false, reason: "creator-still-holding", ageMs, ...metrics };
   if (metrics.insider > maxInsiderRate) return { ok: false, reason: "high-insider-rate", ageMs, ...metrics };
   if (metrics.bundler > maxBundlerRate) return { ok: false, reason: "high-bundler-rate", ageMs, ...metrics };
+  if (metrics.entrapment > maxEntrapmentRatio) return { ok: false, reason: "high-entrapment-ratio", ageMs, ...metrics };
+  if (metrics.top70SniperHoldRate > maxTop70SniperHoldRate) return { ok: false, reason: "high-sniper-hold", ageMs, ...metrics };
   return { ok: true, reason: null, ageMs, ...metrics };
 }
 
@@ -149,6 +172,30 @@ function qualityScore(row, gate) {
   if (metrics.insider > 0.25) score -= 1;
   if (metrics.bundler > 0.25) score -= 1;
   return score;
+}
+
+// Seed-wallet history is allowed to be less fashionable than the autonomous
+// trending feed, but obvious low-quality tokens are rejected before the much
+// more expensive trader request is spent.
+function seedTokenQualityGate(row, options = {}) {
+  return qualityGate(row, {
+    minAgeMs: 24 * 60 * 60 * 1000,
+    minLiquidity: 25_000,
+    minMarketCap: 100_000,
+    minVolume: 0,
+    minHolderCount: 200,
+    minLiquidityToMarketCap: 0.01,
+    maxVolumeToLiquidity: 25,
+    maxInsiderRate: 0.25,
+    maxBundlerRate: 0.25,
+    maxEntrapmentRatio: 0.25,
+    maxTop70SniperHoldRate: 0.20,
+    maxRugRatio: 0.20,
+    maxTop10HolderRate: 0.45,
+    maxDevTeamHoldRate: 0.15,
+    requireKnownHolderCount: false,
+    ...options,
+  });
 }
 
 function analyzeTokenCandidates(response, { limit = 8, ...qualityOptions } = {}) {
@@ -229,5 +276,6 @@ module.exports = {
   launchedAt,
   marketMetrics,
   qualityGate,
+  seedTokenQualityGate,
   qualityScore,
 };

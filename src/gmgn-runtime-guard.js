@@ -54,21 +54,53 @@ function addRepeatableFlag(args, flag, value) {
   return next;
 }
 
+function numericFlag(args, flag) {
+  const index = args.indexOf(flag);
+  if (index < 0 || index + 1 >= args.length) return null;
+  const value = Number(args[index + 1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function setMinimumFlag(args, flag, floor) {
+  const current = numericFlag(args, flag);
+  return current != null && current >= floor ? [...args] : setFlag(args, flag, floor);
+}
+
+function setMaximumFlag(args, flag, ceiling) {
+  const current = numericFlag(args, flag);
+  return current != null && current <= ceiling ? [...args] : setFlag(args, flag, ceiling);
+}
+
+function durationMinutes(value) {
+  const match = String(value || "").match(/^(\d+(?:\.\d+)?)(m|h|d)$/i);
+  if (!match) return null;
+  const multipliers = { m: 1, h: 60, d: 1440 };
+  return Number(match[1]) * multipliers[match[2].toLowerCase()];
+}
+
+function setMinimumDurationFlag(args, flag, floor) {
+  const index = args.indexOf(flag);
+  const current = index >= 0 ? durationMinutes(args[index + 1]) : null;
+  return current != null && current >= durationMinutes(floor) ? [...args] : setFlag(args, flag, floor);
+}
+
 function hardenTrendingArgs(args = []) {
   let next = Array.isArray(args) ? args.map(String) : [];
   if (commandKind(next) !== "market-trending") return next;
 
   next = setFlag(next, "--interval", "24h");
-  next = setFlag(next, "--min-created", "2d");
-  next = setFlag(next, "--min-liquidity", "20000");
-  next = setFlag(next, "--min-marketcap", "100000");
-  next = setFlag(next, "--min-volume", "10000");
-  next = setFlag(next, "--min-holder-count", "200");
-  next = setFlag(next, "--max-top10-holder-rate", "0.50");
-  next = setFlag(next, "--max-dev-team-hold-rate", "0.20");
-  next = setFlag(next, "--max-rug-ratio", "0.30");
-  next = setFlag(next, "--max-insider-rate", "0.35");
-  next = setFlag(next, "--max-bundler-rate", "0.35");
+  next = setMinimumDurationFlag(next, "--min-created", "3d");
+  next = setMinimumFlag(next, "--min-liquidity", 50000);
+  next = setMinimumFlag(next, "--min-marketcap", 250000);
+  next = setMinimumFlag(next, "--min-volume", 25000);
+  next = setMinimumFlag(next, "--min-holder-count", 500);
+  next = setMaximumFlag(next, "--max-top10-holder-rate", 0.40);
+  next = setMaximumFlag(next, "--max-top70-sniper-hold-rate", 0.15);
+  next = setMaximumFlag(next, "--max-dev-team-hold-rate", 0.10);
+  next = setMaximumFlag(next, "--max-entrapment-ratio", 0.20);
+  next = setMaximumFlag(next, "--max-insider-rate", 0.20);
+  next = setMaximumFlag(next, "--max-bundler-rate", 0.20);
+  next = addRepeatableFlag(next, "--filter", "renounced");
   next = addRepeatableFlag(next, "--filter", "not_wash_trading");
   return next;
 }

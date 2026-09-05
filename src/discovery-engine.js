@@ -15,6 +15,16 @@ function num(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function boolFlag(value) {
+  return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true";
+}
+
+function unixSeconds(value) {
+  const n = num(value);
+  if (n <= 0) return 0;
+  return n >= 1e12 ? n / 1000 : n;
+}
+
 function normalizeFraction(value) {
   const n = num(value);
   // GMGN reports profit_change/realized_pnl as multiplier ratios: 1.5 means
@@ -27,7 +37,7 @@ function traderAddress(trader) {
   return trader?.address || trader?.wallet_address || trader?.wallet || null;
 }
 
-function traderTokenEvidence(trader, tokenInfo = {}) {
+function traderTokenEvidence(trader, tokenInfo = {}, now = Date.now()) {
   const realized = num(trader?.realized_profit);
   const unrealized = num(trader?.unrealized_profit);
   const totalProfit = num(trader?.profit, realized + unrealized);
@@ -36,13 +46,17 @@ function traderTokenEvidence(trader, tokenInfo = {}) {
   );
   const buyCount = num(trader?.buy_tx_count_cur);
   const sellCount = num(trader?.sell_tx_count_cur);
-  const firstHeld = num(trader?.start_holding_at);
-  const opened = num(
+  const firstHeld = unixSeconds(trader?.start_holding_at);
+  const ended = unixSeconds(trader?.end_holding_at);
+  const opened = unixSeconds(
     tokenInfo?.open_timestamp ?? tokenInfo?.creation_timestamp
   );
   const entryDelaySec = firstHeld && opened && firstHeld >= opened
     ? firstHeld - opened
     : null;
+  const observedAtSec = unixSeconds(now);
+  const holdEnd = ended >= firstHeld ? ended : observedAtSec;
+  const holdSec = firstHeld && holdEnd >= firstHeld ? holdEnd - firstHeld : null;
 
   const roiQuality = clamp((profitChange + 0.1) / 1.6, 0, 1);
   const profitQuality = clamp(
@@ -79,6 +93,7 @@ function traderTokenEvidence(trader, tokenInfo = {}) {
     realizedProfit: realized,
     totalProfit,
     entryDelaySec,
+    holdSec,
     isEarly: entryDelaySec != null && entryDelaySec <= 7200,
     // A tiny green trade is weak evidence of skill. Keep neutral/weak candidates
     // available for longitudinal learning, but only call the current trade a win
@@ -111,6 +126,7 @@ function defaultTraderFilter(trader, creatorAddress) {
   if (!SOL_ADDR.test(wallet)) return "invalid-wallet";
   if (creatorAddress && wallet === creatorAddress) return "creator";
   if (Number(trader?.addr_type) === 2) return "exchange-or-pool";
+  if (boolFlag(trader?.transfer_in)) return "transfer-funded";
   if (
     trader?.is_suspicious === true ||
     trader?.is_suspicious === 1 ||
@@ -133,12 +149,13 @@ function defaultTraderFilter(trader, creatorAddress) {
   // an extreme threshold so ordinary scaling in/out remains eligible.
   const buyCount = Math.max(0, num(trader?.buy_tx_count_cur));
   const sellCount = Math.max(0, num(trader?.sell_tx_count_cur));
-  if (buyCount + sellCount >= 80) return "high-frequency-trading";
+  if (trader?.buy_tx_count_cur != null && buyCount === 0) return "no-buy-activity";
+  if (buyCount + sellCount >= 50) return "high-frequency-trading";
 
   return null;
 }
 
-function currentConsensusEligible(evidence, minConsensusTokenScore = 45) {
+function currentConsensusEligible(evidence, minConsensusTokenScore = 68) {
   return Boolean(
     evidence?.isEarly &&
     evidence?.isProfitable &&
@@ -152,16 +169,24 @@ function createDiscoveryEngine({
   maxFreshCalls = 12,
   maxEnrichments = 8,
   minTokenScore = 35,
-  minTrustedReputation = 65,
-  minTrustedConfidence = 50,
-  minTrustedDistinctTokens = 6,
-  minTrustedEarlyRate = 0.5,
-  minTrustedProfitableRate = 0.6,
-  maxTrustedBadTokenRate = 0.2,
-  maxTrustedAverageEntryDelaySec = 2 * 60 * 60,
-  minTrustedAverageTokenScore = 60,
+  minTrustedReputation = 70,
+  minTrustedConfidence = 75,
+  minTrustedDistinctTokens = 12,
+  minTrustedMatureTokens = 8,
+  minTrustedStrongOutcomeTokens = 2,
+  minTrustedEarlyRate = 2 / 3,
+  minTrustedProfitableRate = 2 / 3,
+  maxTrustedBadTokenRate = 0.10,
+  maxTrustedNegativeSignalRate = 0.15,
+  minTrustedPositiveOutcomeRate = 0.75,
+  minTrustedHoldEvidenceRate = 0.50,
+  minTrustedMeaningfulHoldRate = 0.75,
+  minTrustedAverageHoldSec = 60 * 60,
+  maxTrustedAverageEntryDelaySec = 60 * 60,
+  minTrustedAverageTokenScore = 68,
+  minTrustedAverageOutcomeScore = 68,
   minConsensusWallets = 2,
-  minConsensusTokenScore = 45,
+  minConsensusTokenScore = 68,
   traderFilter = defaultTraderFilter,
 } = {}) {
   if (!intelligence?.recordObservation || !intelligence?.getProfile) {
@@ -211,6 +236,7 @@ function createDiscoveryEngine({
         profitChange: evidence.profitChange,
         realizedProfit: evidence.realizedProfit,
         entryDelaySec: evidence.entryDelaySec,
+        holdSec: evidence.holdSec,
         isEarly: evidence.isEarly,
         isProfitable: evidence.isProfitable,
         evidenceWeight: evidence.isEarly && evidence.isProfitable && evidence.tokenScore >= 60 ? 1.25 : 1,
@@ -282,17 +308,25 @@ function createDiscoveryEngine({
       const profile = candidate.historicalProfile;
       candidate.trustedProfile = profile;
       const quality = trustedProfileQuality(profile, {
+        minReputation: minTrustedReputation,
+        minConfidence: minTrustedConfidence,
         minDistinctTokens: minTrustedDistinctTokens,
+        minMatureTokens: minTrustedMatureTokens,
+        minStrongOutcomeTokens: minTrustedStrongOutcomeTokens,
         minEarlyRate: minTrustedEarlyRate,
         minProfitableRate: minTrustedProfitableRate,
         maxBadTokenRate: maxTrustedBadTokenRate,
+        maxNegativeSignalRate: maxTrustedNegativeSignalRate,
+        minPositiveOutcomeRate: minTrustedPositiveOutcomeRate,
+        minHoldEvidenceRate: minTrustedHoldEvidenceRate,
+        minMeaningfulHoldRate: minTrustedMeaningfulHoldRate,
+        minAverageHoldSec: minTrustedAverageHoldSec,
         maxAverageEntryDelaySec: maxTrustedAverageEntryDelaySec,
         minAverageTokenScore: minTrustedAverageTokenScore,
+        minAverageOutcomeScore: minTrustedAverageOutcomeScore,
       });
       candidate.trustQuality = quality;
       return currentConsensusEligible(candidate.evidence, minConsensusTokenScore) &&
-        num(profile?.reputation_score) >= minTrustedReputation &&
-        num(profile?.confidence_score) >= minTrustedConfidence &&
         quality.eligible;
     });
 

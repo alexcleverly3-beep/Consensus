@@ -58,6 +58,12 @@ function makeDb(filename = ":memory:") {
       avg_entry_delay_sec REAL,
       avg_hold_sec REAL,
       avg_token_score REAL,
+      mature_tokens INTEGER NOT NULL DEFAULT 0,
+      positive_outcome_tokens INTEGER NOT NULL DEFAULT 0,
+      strong_outcome_tokens INTEGER NOT NULL DEFAULT 0,
+      hold_evidence_tokens INTEGER NOT NULL DEFAULT 0,
+      meaningful_hold_tokens INTEGER NOT NULL DEFAULT 0,
+      avg_outcome_score REAL,
       reputation_score REAL NOT NULL DEFAULT 0,
       confidence_score REAL NOT NULL DEFAULT 0,
       confidence_label TEXT NOT NULL DEFAULT 'low',
@@ -110,20 +116,35 @@ test("progress snapshot counts trusted wallets without exposing their identities
     INSERT INTO wallet_profiles(
       wallet_address, first_seen_at, last_seen_at, observations, distinct_tokens,
       positive_signals, negative_signals, early_entries, profitable_entries,
-      rug_or_bad_token_hits, avg_token_score, reputation_score, confidence_score,
+      rug_or_bad_token_hits, avg_entry_delay_sec, avg_token_score, mature_tokens,
+      positive_outcome_tokens, strong_outcome_tokens, hold_evidence_tokens,
+      meaningful_hold_tokens, avg_hold_sec, avg_outcome_score, reputation_score, confidence_score,
       confidence_label
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run("secret-smart-wallet", 100, 2000, 8, 8, 7, 1, 6, 7, 1, 78, 82, 71, "medium");
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run("secret-smart-wallet", 100, 2000, 14, 12, 11, 1, 10, 10, 1, 1800, 82, 8, 6, 3, 10, 8, 7200, 82, 82, 80, "high");
   db.prepare(`
     INSERT INTO wallet_profiles(
       wallet_address, first_seen_at, last_seen_at, observations, distinct_tokens,
       positive_signals, negative_signals, early_entries, profitable_entries,
-      rug_or_bad_token_hits, avg_token_score, reputation_score, confidence_score,
+      rug_or_bad_token_hits, avg_entry_delay_sec, avg_token_score, mature_tokens,
+      positive_outcome_tokens, strong_outcome_tokens, hold_evidence_tokens,
+      meaningful_hold_tokens, avg_hold_sec, avg_outcome_score, reputation_score, confidence_score,
       confidence_label
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run("not-yet-trusted", 100, 1500, 10, 10, 4, 6, 2, 4, 3, 42, 90, 20, "low");
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run("not-yet-trusted", 100, 1500, 10, 10, 4, 6, 2, 4, 3, 3600, 42, 5, 1, 0, 7, 2, 900, 35, 90, 20, "low");
+  db.prepare(`
+    INSERT INTO wallet_profiles(
+      wallet_address, first_seen_at, last_seen_at, observations, distinct_tokens,
+      positive_signals, negative_signals, early_entries, profitable_entries,
+      rug_or_bad_token_hits, avg_entry_delay_sec, avg_token_score, mature_tokens,
+      positive_outcome_tokens, strong_outcome_tokens, hold_evidence_tokens,
+      meaningful_hold_tokens, avg_hold_sec, avg_outcome_score, reputation_score, confidence_score,
+      confidence_label
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run("headline-only-wallet", 100, 1800, 14, 12, 11, 1, 10, 10, 0, 900, 85, 0, 0, 0, 10, 8, 7200, null, 92, 90, "high");
   db.prepare("INSERT INTO wallet_evidence(wallet_address, token_address) VALUES (?, ?)").run("secret-smart-wallet", "token-a");
   db.prepare("INSERT INTO wallet_evidence(wallet_address, token_address) VALUES (?, ?)").run("not-yet-trusted", "token-b");
+  db.prepare("INSERT INTO wallet_evidence(wallet_address, token_address) VALUES (?, ?)").run("headline-only-wallet", "token-c");
   db.prepare("INSERT INTO consensus_alerts VALUES (?, ?, ?, ?)").run("token-a", 2000, 2, "{}");
   db.prepare("INSERT INTO seed_token_queue(token_address, source_wallet, discovered_at, status) VALUES (?, ?, ?, ?)")
     .run("token-c", "seed-secret", 2000, "pending");
@@ -153,8 +174,8 @@ test("progress snapshot counts trusted wallets without exposing their identities
   assert.deepEqual(snapshot.totals, {
     tokensScanned: 2,
     totalScans: 4,
-    evidenceObservations: 2,
-    walletsObserved: 2,
+    evidenceObservations: 3,
+    walletsObserved: 3,
     smartWalletsFound: 1,
     consensusAlerts: 1,
     queuedTokens: 1,
@@ -166,22 +187,25 @@ test("progress snapshot counts trusted wallets without exposing their identities
   assert.ok(snapshot.gmgn.cooldownRemainingMs > 50_000);
 
   const html = renderDashboard(snapshot);
-  assert.match(html, /Smart wallets found/);
+  assert.match(html, /Strong wallets found/);
   assert.match(html, /Recent successful token scans/);
   assert.match(html, /GMGN calls \/ window/);
   assert.match(html, /GMGN cooldown/);
   assert.match(html, /baseline warming up/);
   assert.match(html, /not sample data/);
-  assert.doesNotMatch(html, /secret-smart-wallet|not-yet-trusted|seed-secret|token-a|token-b/);
+  assert.doesNotMatch(html, /secret-smart-wallet|not-yet-trusted|headline-only-wallet|seed-secret|token-a|token-b/);
 
   const wallets = store.wallets();
   assert.equal(wallets[0].walletAddress, "secret-smart-wallet");
   assert.equal(wallets[0].trusted, true);
-  assert.equal(wallets[0].distinctTokens, 8);
+  assert.equal(wallets[0].distinctTokens, 12);
+  const headlineOnly = wallets.find((wallet) => wallet.walletAddress === "headline-only-wallet");
+  assert.equal(headlineOnly.trusted, false);
+  assert.ok(headlineOnly.qualityReasons.includes("insufficient-mature-outcomes"));
 
   const privateHtml = renderWalletsPage(wallets, snapshot.thresholds);
   assert.match(privateHtml, /secret-smart-wallet/);
-  assert.match(privateHtml, /Trusted/);
+  assert.match(privateHtml, /Strong — validated/);
   assert.match(privateHtml, /Bad hits/);
   db.close();
 });
@@ -200,7 +224,7 @@ test("private wallet authentication rejects missing and incorrect credentials", 
 
 test("wallet verdicts distinguish trusted, building, and risky evidence", () => {
   const thresholds = { reputation: 65, confidence: 50, distinctTokens: 4 };
-  assert.equal(walletVerdict({ trusted: true }, thresholds).label, "Trusted");
+  assert.equal(walletVerdict({ trusted: true }, thresholds).label, "Strong — validated");
   assert.match(
     walletVerdict({ trusted: false, reputation: 60, confidence: 40, distinctTokens: 3, badTokenHits: 0 }, thresholds).label,
     /Building/
@@ -249,9 +273,11 @@ test("wallet identities are served only after private dashboard authentication",
     INSERT INTO wallet_profiles(
       wallet_address, first_seen_at, last_seen_at, observations, distinct_tokens,
       positive_signals, negative_signals, early_entries, profitable_entries,
-      rug_or_bad_token_hits, avg_token_score, reputation_score, confidence_score,
+      rug_or_bad_token_hits, avg_entry_delay_sec, avg_token_score, mature_tokens,
+      positive_outcome_tokens, strong_outcome_tokens, hold_evidence_tokens,
+      meaningful_hold_tokens, avg_hold_sec, avg_outcome_score, reputation_score, confidence_score,
       confidence_label
-    ) VALUES (?, 1, 2, 8, 8, 7, 1, 6, 7, 1, 78, 82, 71, 'medium')
+    ) VALUES (?, 1, 2, 14, 12, 11, 1, 10, 10, 1, 1800, 82, 8, 6, 3, 10, 8, 7200, 82, 82, 80, 'high')
   `).run("private-wallet-address");
   setupDb.close();
 

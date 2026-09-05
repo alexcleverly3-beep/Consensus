@@ -9,12 +9,13 @@ const Database = require("better-sqlite3");
 const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const { initIntelligence } = require("./intelligence");
 const { createDiscoveryEngine } = require("./discovery-engine");
-const { extractTokenCandidates, shouldScanToken } = require("./market-discovery");
+const { extractTokenCandidates, seedTokenQualityGate, shouldScanToken } = require("./market-discovery");
 const { boundedSeedQueueSelection, nextDueSeedWallet, parseSeedWallets } = require("./seed-discovery");
 const { collectSeedHistory } = require("./seed-history");
 const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
 const { initOutcomeRescan } = require("./outcome-rescan");
 const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
+const { STRONG_WALLET_FLOORS, trustedProfileQuality } = require("./wallet-quality");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SOL_ADDR_IN_TEXT = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
@@ -28,11 +29,24 @@ const TOKEN_RESCAN_MS = clampInt(process.env.TOKEN_RESCAN_HOURS, 12, 1, 168) * 6
 const TOKEN_SCANS_PER_CYCLE = clampInt(process.env.TOKENS_PER_CYCLE, 1, 1, 3);
 const TRENDING_LIMIT = clampInt(process.env.TRENDING_LIMIT, 12, 5, 50);
 const CONSENSUS_WALLETS = clampInt(process.env.CONSENSUS_WALLETS, 2, 2, 5);
-const TRUSTED_REPUTATION = clampInt(process.env.TRUSTED_REPUTATION, 65, 40, 95);
-const TRUSTED_CONFIDENCE = clampInt(process.env.TRUSTED_CONFIDENCE, 50, 20, 95);
-const TRUSTED_DISTINCT_TOKENS = clampInt(process.env.TRUSTED_DISTINCT_TOKENS, 4, 2, 100);
+const TRUSTED_REPUTATION = clampInt(process.env.TRUSTED_REPUTATION, 70, STRONG_WALLET_FLOORS.reputation, 95);
+const TRUSTED_CONFIDENCE = clampInt(process.env.TRUSTED_CONFIDENCE, 75, STRONG_WALLET_FLOORS.confidence, 95);
+const TRUSTED_DISTINCT_TOKENS = clampInt(process.env.TRUSTED_DISTINCT_TOKENS, 12, STRONG_WALLET_FLOORS.distinctTokens, 100);
+const TRUSTED_MATURE_TOKENS = clampInt(process.env.TRUSTED_MATURE_TOKENS, 8, STRONG_WALLET_FLOORS.matureTokens, 100);
+const TRUSTED_STRONG_OUTCOME_TOKENS = clampInt(process.env.TRUSTED_STRONG_OUTCOME_TOKENS, 2, STRONG_WALLET_FLOORS.strongOutcomeTokens, 100);
+const TRUSTED_MIN_EARLY_RATE = clampNumber(process.env.TRUSTED_MIN_EARLY_RATE, 2 / 3, STRONG_WALLET_FLOORS.minEarlyRate, 1);
+const TRUSTED_MIN_PROFITABLE_RATE = clampNumber(process.env.TRUSTED_MIN_PROFITABLE_RATE, 2 / 3, STRONG_WALLET_FLOORS.minProfitableRate, 1);
+const TRUSTED_MIN_POSITIVE_OUTCOME_RATE = clampNumber(process.env.TRUSTED_MIN_POSITIVE_OUTCOME_RATE, 0.75, STRONG_WALLET_FLOORS.minPositiveOutcomeRate, 1);
+const TRUSTED_MIN_HOLD_EVIDENCE_RATE = clampNumber(process.env.TRUSTED_MIN_HOLD_EVIDENCE_RATE, 0.50, STRONG_WALLET_FLOORS.minHoldEvidenceRate, 1);
+const TRUSTED_MIN_MEANINGFUL_HOLD_RATE = clampNumber(process.env.TRUSTED_MIN_MEANINGFUL_HOLD_RATE, 0.75, STRONG_WALLET_FLOORS.minMeaningfulHoldRate, 1);
+const TRUSTED_MIN_AVG_HOLD_SEC = clampInt(process.env.TRUSTED_MIN_AVG_HOLD_SEC, 3600, STRONG_WALLET_FLOORS.minAverageHoldSec, 30 * 86400);
+const TRUSTED_MIN_AVG_TOKEN_SCORE = clampInt(process.env.TRUSTED_MIN_AVG_TOKEN_SCORE, 68, STRONG_WALLET_FLOORS.minAverageTokenScore, 100);
+const TRUSTED_MIN_AVG_OUTCOME_SCORE = clampInt(process.env.TRUSTED_MIN_AVG_OUTCOME_SCORE, 68, STRONG_WALLET_FLOORS.minAverageOutcomeScore, 100);
+const TRUSTED_MAX_AVG_ENTRY_DELAY_SEC = clampInt(process.env.TRUSTED_MAX_AVG_ENTRY_DELAY_SEC, 3600, 300, STRONG_WALLET_FLOORS.maxAverageEntryDelaySec);
 const TRUSTED_SEED_LIMIT = clampInt(process.env.TRUSTED_SEED_LIMIT, 20, 1, 100);
-const TRUSTED_SEED_MAX_BAD_RATE = clampNumber(process.env.TRUSTED_SEED_MAX_BAD_RATE, 0.25, 0, 1);
+const TRUSTED_SEED_MAX_BAD_RATE = clampNumber(process.env.TRUSTED_SEED_MAX_BAD_RATE, 0.10, 0, STRONG_WALLET_FLOORS.maxBadTokenRate);
+const TRUSTED_MAX_NEGATIVE_SIGNAL_RATE = clampNumber(process.env.TRUSTED_MAX_NEGATIVE_SIGNAL_RATE, 0.15, 0, STRONG_WALLET_FLOORS.maxNegativeSignalRate);
+const CONSENSUS_MIN_TOKEN_SCORE = clampInt(process.env.CONSENSUS_MIN_TOKEN_SCORE, 68, 68, 95);
 const SEED_WALLETS = parseSeedWallets(process.env.SEED_WALLETS, DEFAULT_SEED_WALLETS);
 const SEED_REFRESH_MS = clampInt(process.env.SEED_REFRESH_HOURS, 6, 6, 168) * 60 * 60 * 1000;
 const SEED_ACTIVITY_LIMIT = clampInt(process.env.SEED_ACTIVITY_LIMIT, 100, 20, 100);
@@ -185,6 +199,7 @@ const seedQueueCountStmt = db.prepare(`
   SELECT
     SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
     SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+    SUM(CASE WHEN status = 'filtered' THEN 1 ELSE 0 END) AS filtered,
     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
   FROM seed_token_queue
 `);
@@ -285,9 +300,14 @@ async function getTokenInfo(address) {
 
 async function getTrending() {
   return cli([
-    "market", "trending", "--chain", "sol", "--interval", "1h",
-    "--min-liquidity", "10000", "--min-marketcap", "50000",
-    "--max-insider-rate", "0.35", "--max-bundler-rate", "0.35",
+    "market", "trending", "--chain", "sol", "--interval", "24h",
+    "--filter", "renounced", "--filter", "not_wash_trading",
+    "--min-created", "3d", "--min-liquidity", "50000",
+    "--min-marketcap", "250000", "--min-volume", "25000",
+    "--min-holder-count", "500", "--max-insider-rate", "0.20",
+    "--max-bundler-rate", "0.20", "--max-entrapment-ratio", "0.20",
+    "--max-top10-holder-rate", "0.40", "--max-top70-sniper-hold-rate", "0.15",
+    "--max-dev-team-hold-rate", "0.10",
     "--order-by", "volume", "--limit", String(TRENDING_LIMIT), "--raw",
   ]);
 }
@@ -312,14 +332,28 @@ const engine = createDiscoveryEngine({
   minTrustedReputation: TRUSTED_REPUTATION,
   minTrustedConfidence: TRUSTED_CONFIDENCE,
   minTrustedDistinctTokens: TRUSTED_DISTINCT_TOKENS,
+  minTrustedMatureTokens: TRUSTED_MATURE_TOKENS,
+  minTrustedStrongOutcomeTokens: TRUSTED_STRONG_OUTCOME_TOKENS,
+  minTrustedEarlyRate: TRUSTED_MIN_EARLY_RATE,
+  minTrustedProfitableRate: TRUSTED_MIN_PROFITABLE_RATE,
+  maxTrustedBadTokenRate: TRUSTED_SEED_MAX_BAD_RATE,
+  maxTrustedNegativeSignalRate: TRUSTED_MAX_NEGATIVE_SIGNAL_RATE,
+  minTrustedPositiveOutcomeRate: TRUSTED_MIN_POSITIVE_OUTCOME_RATE,
+  minTrustedHoldEvidenceRate: TRUSTED_MIN_HOLD_EVIDENCE_RATE,
+  minTrustedMeaningfulHoldRate: TRUSTED_MIN_MEANINGFUL_HOLD_RATE,
+  minTrustedAverageHoldSec: TRUSTED_MIN_AVG_HOLD_SEC,
+  maxTrustedAverageEntryDelaySec: TRUSTED_MAX_AVG_ENTRY_DELAY_SEC,
+  minTrustedAverageTokenScore: TRUSTED_MIN_AVG_TOKEN_SCORE,
+  minTrustedAverageOutcomeScore: TRUSTED_MIN_AVG_OUTCOME_SCORE,
   minConsensusWallets: CONSENSUS_WALLETS,
+  minConsensusTokenScore: CONSENSUS_MIN_TOKEN_SCORE,
 });
 
 let client = null;
 let cycleRunning = false;
 let cycleNumber = metaNumber("discovery_cycle_number", 0);
 
-async function processToken(tokenAddress, source = "autonomous") {
+async function processToken(tokenAddress, source = "autonomous", prefetchedTokenInfo = null) {
   const state = getTokenStateStmt.get(tokenAddress);
   const now = Date.now();
   upsertTokenSeenStmt.run(tokenAddress, now, now);
@@ -334,12 +368,14 @@ async function processToken(tokenAddress, source = "autonomous") {
     return { tokenAddress, candidates: [], trusted: [], consensus: null, skipped: false };
   }
 
-  let tokenInfo = {};
-  try {
-    tokenInfo = await getTokenInfo(tokenAddress);
-  } catch (error) {
-    if (isRateLimitError(error)) throw error;
-    console.warn(`Token info failed for ${short(tokenAddress)}: ${error.message}`);
+  let tokenInfo = prefetchedTokenInfo || {};
+  if (!prefetchedTokenInfo) {
+    try {
+      tokenInfo = await getTokenInfo(tokenAddress);
+    } catch (error) {
+      if (isRateLimitError(error)) throw error;
+      console.warn(`Token info failed for ${short(tokenAddress)}: ${error.message}`);
+    }
   }
 
   const result = await engine.processToken({ tokenAddress, tokenInfo, traders, source });
@@ -396,7 +432,7 @@ function consensusEmbed(result) {
   );
   return new EmbedBuilder()
     .setTitle(`🧠 Consensus: ${symbol}`)
-    .setDescription(`**${result.consensus.walletCount} trusted wallets** independently appeared among profitable traders.\n\n${wallets.join("\n")}`)
+    .setDescription(`**${result.consensus.walletCount} strong, outcome-validated wallets** independently appeared among profitable traders.\n\n${wallets.join("\n")}`)
     .addFields({ name: "Token", value: `\`${result.tokenAddress}\`` })
     .setFooter({ text: "Consensus V1 • longitudinal wallet evidence" })
     .setTimestamp(new Date());
@@ -436,6 +472,18 @@ async function refreshOneSeedWallet() {
       minConfidence: TRUSTED_CONFIDENCE,
       minDistinctTokens: TRUSTED_DISTINCT_TOKENS,
       maxBadTokenRate: TRUSTED_SEED_MAX_BAD_RATE,
+      minMatureTokens: TRUSTED_MATURE_TOKENS,
+      minStrongOutcomeTokens: TRUSTED_STRONG_OUTCOME_TOKENS,
+      maxNegativeSignalRate: TRUSTED_MAX_NEGATIVE_SIGNAL_RATE,
+      minEarlyRate: TRUSTED_MIN_EARLY_RATE,
+      minProfitableRate: TRUSTED_MIN_PROFITABLE_RATE,
+      minPositiveOutcomeRate: TRUSTED_MIN_POSITIVE_OUTCOME_RATE,
+      minHoldEvidenceRate: TRUSTED_MIN_HOLD_EVIDENCE_RATE,
+      minMeaningfulHoldRate: TRUSTED_MIN_MEANINGFUL_HOLD_RATE,
+      minAverageHoldSec: TRUSTED_MIN_AVG_HOLD_SEC,
+      maxAverageEntryDelaySec: TRUSTED_MAX_AVG_ENTRY_DELAY_SEC,
+      minAverageTokenScore: TRUSTED_MIN_AVG_TOKEN_SCORE,
+      minAverageOutcomeScore: TRUSTED_MIN_AVG_OUTCOME_SCORE,
       limit: TRUSTED_SEED_LIMIT,
     },
   });
@@ -521,7 +569,25 @@ async function processOneSeedToken() {
   }
 
   try {
-    const result = await processToken(queued.token_address, `seed:${queued.source_wallet}`);
+    const tokenInfo = await getTokenInfo(queued.token_address);
+    const seedQuality = seedTokenQualityGate(tokenInfo);
+    if (!seedQuality.ok) {
+      markSeedTokenStmt.run(
+        "filtered",
+        Date.now(),
+        `token-quality:${seedQuality.reason}`,
+        queued.token_address,
+        queued.source_wallet
+      );
+      console.log(`[seed] ${short(queued.token_address)} filtered before trader scan: ${seedQuality.reason}`);
+      return true;
+    }
+
+    const result = await processToken(
+      queued.token_address,
+      `seed:${queued.source_wallet}`,
+      tokenInfo
+    );
     markSeedTokenStmt.run("done", Date.now(), null, queued.token_address, queued.source_wallet);
     await maybeSendConsensus(result);
     console.log(
@@ -593,17 +659,38 @@ async function discoveryCycle() {
 }
 
 function statusEmbed() {
-  const profiles = intelligence.getTopProfiles({ limit: 10, minObservations: 2 });
+  const profiles = intelligence.getTopProfiles({ limit: 250, minObservations: 2 })
+    .filter((profile) =>
+      trustedProfileQuality(profile, {
+        minReputation: TRUSTED_REPUTATION,
+        minConfidence: TRUSTED_CONFIDENCE,
+        minDistinctTokens: TRUSTED_DISTINCT_TOKENS,
+        minMatureTokens: TRUSTED_MATURE_TOKENS,
+        minStrongOutcomeTokens: TRUSTED_STRONG_OUTCOME_TOKENS,
+        minEarlyRate: TRUSTED_MIN_EARLY_RATE,
+        minProfitableRate: TRUSTED_MIN_PROFITABLE_RATE,
+        maxBadTokenRate: TRUSTED_SEED_MAX_BAD_RATE,
+        maxNegativeSignalRate: TRUSTED_MAX_NEGATIVE_SIGNAL_RATE,
+        minPositiveOutcomeRate: TRUSTED_MIN_POSITIVE_OUTCOME_RATE,
+        minHoldEvidenceRate: TRUSTED_MIN_HOLD_EVIDENCE_RATE,
+        minMeaningfulHoldRate: TRUSTED_MIN_MEANINGFUL_HOLD_RATE,
+        minAverageHoldSec: TRUSTED_MIN_AVG_HOLD_SEC,
+        maxAverageEntryDelaySec: TRUSTED_MAX_AVG_ENTRY_DELAY_SEC,
+        minAverageTokenScore: TRUSTED_MIN_AVG_TOKEN_SCORE,
+        minAverageOutcomeScore: TRUSTED_MIN_AVG_OUTCOME_SCORE,
+      }).eligible
+    )
+    .slice(0, 10);
   const queue = seedQueueCountStmt.get() || {};
   const rows = profiles.length
     ? profiles.map((p, i) => `${i + 1}. \`${p.wallet_address}\` — rep **${Math.round(p.reputation_score)}**, conf **${Math.round(p.confidence_score)}**, ${p.distinct_tokens} tokens`).join("\n")
-    : "Evidence is still accumulating; no wallet has two distinct observations yet.";
+    : "Evidence is still accumulating; no wallet meets the strong, outcome-validated gate yet.";
   return new EmbedBuilder()
     .setTitle("🧠 Consensus V1 intelligence")
     .setDescription(rows)
     .addFields({
       name: "Seed backfill",
-      value: `${SEED_WALLETS.length} configured seed wallet(s) • learned trusted seeds enabled • ${Number(queue.pending || 0)} pending • ${Number(queue.done || 0)} scanned`,
+      value: `${SEED_WALLETS.length} configured seed wallet(s) • learned strong-wallet seeds enabled • ${Number(queue.pending || 0)} pending • ${Number(queue.done || 0)} scanned • ${Number(queue.filtered || 0)} quality-filtered`,
     })
     .setFooter({
       text: `Discovery every ${Math.round(DISCOVERY_INTERVAL_MS / 60000)}m • max ${TOKEN_SCANS_PER_CYCLE} trader scan/cycle • outcome follow-up every ${OUTCOME_RESCAN_EVERY_CYCLES} cycles`,
@@ -629,7 +716,7 @@ async function handleMessage(message) {
       await maybeSendConsensus(result);
     } else {
       await progress.edit(
-        `🧠 ${short(address)}: saved evidence from **${result.candidates?.length || 0}** promising traders; **${result.trusted?.length || 0}** currently meet trusted-wallet thresholds. The database keeps this evidence for future consensus.`
+        `🧠 ${short(address)}: saved evidence from **${result.candidates?.length || 0}** promising traders; **${result.trusted?.length || 0}** currently meet the strong, outcome-validated thresholds. The database keeps this evidence for future consensus.`
       );
     }
   } catch (error) {

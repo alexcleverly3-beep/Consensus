@@ -86,14 +86,22 @@ function parseSeedWallets(value, fallback = []) {
 }
 
 function trustedWalletSeeds(profiles, {
-  minReputation = 65,
-  minConfidence = 50,
-  minDistinctTokens = 6,
-  maxBadTokenRate = 0.2,
-  minEarlyRate = 0.5,
-  minProfitableRate = 0.6,
-  maxAverageEntryDelaySec = 2 * 60 * 60,
-  minAverageTokenScore = 60,
+  minReputation = 70,
+  minConfidence = 75,
+  minDistinctTokens = 12,
+  minMatureTokens = 8,
+  minStrongOutcomeTokens = 2,
+  maxBadTokenRate = 0.10,
+  maxNegativeSignalRate = 0.15,
+  minEarlyRate = 2 / 3,
+  minProfitableRate = 2 / 3,
+  minPositiveOutcomeRate = 0.75,
+  minHoldEvidenceRate = 0.50,
+  minMeaningfulHoldRate = 0.75,
+  minAverageHoldSec = 60 * 60,
+  maxAverageEntryDelaySec = 60 * 60,
+  minAverageTokenScore = 68,
+  minAverageOutcomeScore = 68,
   limit = 20,
   exclude = [],
 } = {}) {
@@ -106,16 +114,23 @@ function trustedWalletSeeds(profiles, {
 
     const reputation = num(profile?.reputation_score ?? profile?.reputationScore);
     const confidence = num(profile?.confidence_score ?? profile?.confidenceScore);
-    if (reputation < minReputation) continue;
-    if (confidence < minConfidence) continue;
-
     const quality = trustedProfileQuality(profile, {
+      minReputation,
+      minConfidence,
       minDistinctTokens,
+      minMatureTokens,
+      minStrongOutcomeTokens,
       maxBadTokenRate,
+      maxNegativeSignalRate,
       minEarlyRate,
       minProfitableRate,
+      minPositiveOutcomeRate,
+      minHoldEvidenceRate,
+      minMeaningfulHoldRate,
+      minAverageHoldSec,
       maxAverageEntryDelaySec,
       minAverageTokenScore,
+      minAverageOutcomeScore,
     });
     if (!quality.eligible) continue;
 
@@ -124,11 +139,19 @@ function trustedWalletSeeds(profiles, {
       reputation,
       confidence,
       distinctTokens: quality.metrics.distinctTokens,
+      matureTokens: quality.metrics.matureTokens,
+      strongOutcomeTokens: quality.metrics.strongOutcomeTokens,
       badTokenRate: quality.metrics.badTokenRate,
+      negativeSignalRate: quality.metrics.negativeSignalRate,
       earlyRate: quality.metrics.earlyRate,
       profitableRate: quality.metrics.profitableRate,
       averageEntryDelaySec: quality.metrics.averageEntryDelaySec,
       averageTokenScore: quality.metrics.averageTokenScore,
+      positiveOutcomeRate: quality.metrics.positiveOutcomeRate,
+      averageOutcomeScore: quality.metrics.averageOutcomeScore,
+      holdEvidenceRate: quality.metrics.holdEvidenceRate,
+      meaningfulHoldRate: quality.metrics.meaningfulHoldRate,
+      averageHoldSec: quality.metrics.averageHoldSec,
     });
   }
 
