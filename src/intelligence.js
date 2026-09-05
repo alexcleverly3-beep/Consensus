@@ -54,6 +54,7 @@ function initIntelligence(db) {
       mature_tokens INTEGER NOT NULL DEFAULT 0,
       positive_outcome_tokens INTEGER NOT NULL DEFAULT 0,
       strong_outcome_tokens INTEGER NOT NULL DEFAULT 0,
+      validated_winner_tokens INTEGER NOT NULL DEFAULT 0,
       hold_evidence_tokens INTEGER NOT NULL DEFAULT 0,
       meaningful_hold_tokens INTEGER NOT NULL DEFAULT 0,
       avg_outcome_score REAL,
@@ -94,6 +95,7 @@ function initIntelligence(db) {
     ensureColumn(db, "wallet_profiles", "mature_tokens", "INTEGER NOT NULL DEFAULT 0"),
     ensureColumn(db, "wallet_profiles", "positive_outcome_tokens", "INTEGER NOT NULL DEFAULT 0"),
     ensureColumn(db, "wallet_profiles", "strong_outcome_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ensureColumn(db, "wallet_profiles", "validated_winner_tokens", "INTEGER NOT NULL DEFAULT 0"),
     ensureColumn(db, "wallet_profiles", "hold_evidence_tokens", "INTEGER NOT NULL DEFAULT 0"),
     ensureColumn(db, "wallet_profiles", "meaningful_hold_tokens", "INTEGER NOT NULL DEFAULT 0"),
     ensureColumn(db, "wallet_profiles", "avg_outcome_score", "REAL"),
@@ -178,6 +180,10 @@ function initIntelligence(db) {
       COALESCE(SUM(CASE WHEN outcome_score IS NOT NULL THEN 1 ELSE 0 END), 0) AS mature_tokens,
       COALESCE(SUM(CASE WHEN outcome_score >= 68 THEN 1 ELSE 0 END), 0) AS positive_outcome_tokens,
       COALESCE(SUM(CASE WHEN outcome_score >= 85 THEN 1 ELSE 0 END), 0) AS strong_outcome_tokens,
+      COALESCE(SUM(CASE
+        WHEN is_early = 1 AND is_profitable = 1 AND outcome_score >= 68 THEN 1
+        ELSE 0
+      END), 0) AS validated_winner_tokens,
       COALESCE(SUM(CASE WHEN hold_sec IS NOT NULL THEN 1 ELSE 0 END), 0) AS hold_evidence_tokens,
       COALESCE(SUM(CASE WHEN hold_sec >= 1800 THEN 1 ELSE 0 END), 0) AS meaningful_hold_tokens,
       AVG(outcome_score) AS avg_outcome_score,
@@ -208,13 +214,14 @@ function initIntelligence(db) {
       mature_tokens,
       positive_outcome_tokens,
       strong_outcome_tokens,
+      validated_winner_tokens,
       hold_evidence_tokens,
       meaningful_hold_tokens,
       avg_outcome_score,
       reputation_score,
       confidence_score,
       confidence_label
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(wallet_address)
     DO UPDATE SET
       first_seen_at = excluded.first_seen_at,
@@ -232,6 +239,7 @@ function initIntelligence(db) {
       mature_tokens = excluded.mature_tokens,
       positive_outcome_tokens = excluded.positive_outcome_tokens,
       strong_outcome_tokens = excluded.strong_outcome_tokens,
+      validated_winner_tokens = excluded.validated_winner_tokens,
       hold_evidence_tokens = excluded.hold_evidence_tokens,
       meaningful_hold_tokens = excluded.meaningful_hold_tokens,
       avg_outcome_score = excluded.avg_outcome_score,
@@ -287,6 +295,7 @@ function initIntelligence(db) {
     const matureTokens = num(aggregate.mature_tokens);
     const positiveOutcomeTokens = num(aggregate.positive_outcome_tokens);
     const strongOutcomeTokens = num(aggregate.strong_outcome_tokens);
+    const validatedWinnerTokens = num(aggregate.validated_winner_tokens);
     const holdEvidenceTokens = num(aggregate.hold_evidence_tokens);
     const meaningfulHoldTokens = num(aggregate.meaningful_hold_tokens);
 
@@ -332,6 +341,7 @@ function initIntelligence(db) {
       mature_tokens: matureTokens,
       positive_outcome_tokens: positiveOutcomeTokens,
       strong_outcome_tokens: strongOutcomeTokens,
+      validated_winner_tokens: validatedWinnerTokens,
       hold_evidence_tokens: holdEvidenceTokens,
       meaningful_hold_tokens: meaningfulHoldTokens,
       avg_outcome_score: aggregate.avg_outcome_score,
@@ -365,6 +375,7 @@ function initIntelligence(db) {
       profile.mature_tokens,
       profile.positive_outcome_tokens,
       profile.strong_outcome_tokens,
+      profile.validated_winner_tokens,
       profile.hold_evidence_tokens,
       profile.meaningful_hold_tokens,
       profile.avg_outcome_score,
