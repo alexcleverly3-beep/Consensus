@@ -33,6 +33,22 @@ test("extractBoughtTokens keeps unique buys ordered by most recent activity", ()
   assert.equal(tokens[0].lastActivityAt, 300000);
 });
 
+test("extractBoughtTokens accepts serialized GMGN buy flags but explicit sells still win", () => {
+  const response = {
+    data: {
+      list: [
+        { is_buy: "1", token_address: A, timestamp: 100 },
+        { isBuy: "true", token_address: B, timestamp: 200 },
+        { event_type: "sell", is_buy: "1", token_address: A, timestamp: 300 },
+      ],
+    },
+  };
+
+  const tokens = extractBoughtTokens(response, { walletAddress: WALLET });
+  assert.deepEqual(tokens.map((x) => x.address), [B, A]);
+  assert.equal(tokens.find((x) => x.address === A).lastActivityAt, 100000);
+});
+
 test("parseSeedWallets accepts comma/space separated wallets and removes duplicates", () => {
   assert.deepEqual(parseSeedWallets(`${WALLET}, ${WALLET}`), [WALLET]);
   assert.deepEqual(parseSeedWallets("", [WALLET]), [WALLET]);
