@@ -39,6 +39,8 @@ require("./runtime-diagnostics")
 // app.js initializes the persistent SQLite schema synchronously before its
 // asynchronous discovery loop begins. Starting the dashboard immediately after
 // it means Railway can expose live progress from that same database without a
-// second service or any wallet-identifying UI.
+// second service. The public /health wrapper exposes only whitelisted aggregate
+// collection counters and never wallet/token identities.
 require("./app");
-require("./progress-dashboard").startProgressDashboard({ gmgnGuard });
+const dashboard = require("./progress-dashboard").startProgressDashboard({ gmgnGuard });
+require("./public-health").installPublicHealthEndpoint(dashboard);
