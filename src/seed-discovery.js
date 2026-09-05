@@ -52,7 +52,11 @@ function isBuy(row) {
   const sellAmount = num(row?.sell_amount ?? row?.sellAmount, 0);
   if (buyAmount > 0 && sellAmount <= 0) return true;
 
-  return row?.is_buy === true || row?.isBuy === true;
+  // GMGN payload typing is not always stable across endpoints/versions. Treat
+  // common serialized/numeric true values as buys so seed-history discovery does
+  // not silently discard valid purchases merely because is_buy arrived as "1".
+  const flag = row?.is_buy ?? row?.isBuy;
+  return flag === true || flag === 1 || String(flag).toLowerCase() === "true" || String(flag) === "1";
 }
 
 function extractBoughtTokens(response, { walletAddress = null, limit = 100 } = {}) {
