@@ -163,6 +163,41 @@ function currentConsensusEligible(evidence, minConsensusTokenScore = 68) {
   );
 }
 
+function rankTrustedCandidates(candidates = []) {
+  return candidates.sort((a, b) => {
+    const am = a?.trustQuality?.metrics || {};
+    const bm = b?.trustQuality?.metrics || {};
+    return num(bm.validatedWinnerRate) - num(am.validatedWinnerRate) ||
+      num(bm.validatedWinnerTokens) - num(am.validatedWinnerTokens) ||
+      num(bm.strongOutcomeRate) - num(am.strongOutcomeRate) ||
+      num(bm.positiveOutcomeRate) - num(am.positiveOutcomeRate) ||
+      num(bm.confidence) - num(am.confidence) ||
+      num(bm.reputation) - num(am.reputation) ||
+      num(b?.evidence?.tokenScore) - num(a?.evidence?.tokenScore) ||
+      String(a?.walletAddress || "").localeCompare(String(b?.walletAddress || ""));
+  });
+}
+
+function consensusWalletSummary(candidate) {
+  const metrics = candidate?.trustQuality?.metrics || {};
+  return {
+    walletAddress: candidate.walletAddress,
+    reputation: num(metrics.reputation ?? candidate.trustedProfile?.reputation_score),
+    confidence: num(metrics.confidence ?? candidate.trustedProfile?.confidence_score),
+    distinctTokens: num(metrics.distinctTokens ?? candidate.trustedProfile?.distinct_tokens),
+    matureTokens: num(metrics.matureTokens ?? candidate.trustedProfile?.mature_tokens),
+    validatedWinnerTokens: num(metrics.validatedWinnerTokens),
+    validatedWinnerRate: num(metrics.validatedWinnerRate),
+    strongOutcomeRate: num(metrics.strongOutcomeRate),
+    positiveOutcomeRate: num(metrics.positiveOutcomeRate),
+    tokenScore: num(candidate?.evidence?.tokenScore),
+    profitChange: num(candidate?.evidence?.profitChange),
+    entryDelaySec: candidate?.evidence?.entryDelaySec == null
+      ? null
+      : num(candidate.evidence.entryDelaySec),
+  };
+}
+
 function createDiscoveryEngine({
   intelligence,
   fetchWalletStats,
@@ -329,18 +364,13 @@ function createDiscoveryEngine({
       return currentConsensusEligible(candidate.evidence, minConsensusTokenScore) &&
         quality.eligible;
     });
+    rankTrustedCandidates(trusted);
 
     const consensus = trusted.length >= minConsensusWallets
       ? {
           tokenAddress,
           walletCount: trusted.length,
-          wallets: trusted.map((candidate) => ({
-            walletAddress: candidate.walletAddress,
-            reputation: num(candidate.trustedProfile?.reputation_score),
-            confidence: num(candidate.trustedProfile?.confidence_score),
-            distinctTokens: num(candidate.trustedProfile?.distinct_tokens),
-            tokenScore: candidate.evidence.tokenScore,
-          })),
+          wallets: trusted.map(consensusWalletSummary),
         }
       : null;
 
@@ -365,4 +395,6 @@ module.exports = {
   candidatePriority,
   defaultTraderFilter,
   currentConsensusEligible,
+  rankTrustedCandidates,
+  consensusWalletSummary,
 };
