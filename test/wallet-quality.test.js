@@ -33,6 +33,8 @@ test("trustedProfileQuality accepts repeatable early profitable behaviour", () =
   assert.equal(result.metrics.earlyRate, 0.8);
   assert.equal(result.metrics.profitableRate, 0.8);
   assert.equal(result.metrics.positiveOutcomeRate, 0.8);
+  assert.equal(result.metrics.outcomeCoverageRate, 2 / 3);
+  assert.equal(result.metrics.strongOutcomeRate, 0.3);
   assert.equal(result.metrics.guaranteedValidatedTokens, 2);
 });
 
@@ -84,6 +86,42 @@ test("trustedProfileQuality requires several genuinely positive mature outcomes"
   assert.equal(weakOutcomes.eligible, false);
   assert.ok(weakOutcomes.reasons.includes("weak-mature-outcome-rate"));
   assert.ok(weakOutcomes.reasons.includes("weak-average-outcome-score"));
+});
+
+test("trustedProfileQuality requires mature outcomes across most observed tokens", () => {
+  const result = trustedProfileQuality(profile({
+    distinct_tokens: 18,
+    early_entries: 16,
+    profitable_entries: 16,
+    mature_tokens: 10,
+    positive_outcome_tokens: 9,
+    strong_outcome_tokens: 3,
+    hold_evidence_tokens: 15,
+    meaningful_hold_tokens: 12,
+  }));
+
+  assert.equal(result.metrics.outcomeCoverageRate, 10 / 18);
+  assert.ok(result.metrics.guaranteedValidatedTokens >= 2);
+  assert.equal(result.eligible, false);
+  assert.ok(result.reasons.includes("insufficient-outcome-coverage"));
+});
+
+test("trustedProfileQuality requires strong winners to repeat, not just exist", () => {
+  const result = trustedProfileQuality(profile({
+    distinct_tokens: 15,
+    early_entries: 13,
+    profitable_entries: 13,
+    mature_tokens: 12,
+    positive_outcome_tokens: 10,
+    strong_outcome_tokens: 2,
+    hold_evidence_tokens: 12,
+    meaningful_hold_tokens: 10,
+  }));
+
+  assert.equal(result.metrics.strongOutcomeRate, 1 / 6);
+  assert.ok(result.metrics.outcomeCoverageRate >= 2 / 3);
+  assert.equal(result.eligible, false);
+  assert.ok(result.reasons.includes("weak-strong-outcome-rate"));
 });
 
 test("trustedProfileQuality rejects disjoint early/profitable/outcome headline rates", () => {
