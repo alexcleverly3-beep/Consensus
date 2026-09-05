@@ -326,6 +326,13 @@ async function getWalletActivity(walletAddress, cursor = null) {
 const intelligence = initIntelligence(db);
 const outcomes = initTokenOutcomes(db);
 const outcomeRescan = initOutcomeRescan(db);
+// Optional additive experiment: its own tables and failures cannot change V1's
+// existing wallet scores, alerts, seed feedback or discovery schedule.
+let selectionReview = null;
+if (process.env.SELECTION_REVIEW_ENABLED !== "0") {
+  try { selectionReview = require("./selection-review").initSelectionReview(db); }
+  catch (error) { console.warn(`[selection-review] unavailable: ${error.message}`); }
+}
 const engine = createDiscoveryEngine({
   intelligence,
   maxFreshCalls: 0,
@@ -381,7 +388,43 @@ async function processToken(tokenAddress, source = "autonomous", prefetchedToken
 
   const result = await engine.processToken({ tokenAddress, tokenInfo, traders, source });
   markTokenScannedStmt.run(now, result.candidates.length, result.trusted.length, tokenAddress);
+  if (selectionReview) {
+    try {
+      // Reuse already fetched token metadata, but normalize current GMGN shapes
+      // only for the new screen; do not alter legacy evidence in this experiment.
+      const snapshot = require("./selection-token-info").selectionTokenInfo(tokenInfo);
+      if (seedTokenQualityGate(snapshot).ok) selectionReview.recordToken(tokenAddress, tokenInfo);
+    } catch (error) { console.warn(`[selection-review] intake skipped: ${error.message}`); }
+  }
   return { ...result, tokenInfo, skipped: false };
+}
+
+async function selectionReviewStep() {
+  if (!selectionReview || selectionReview.progress().saved >= 10) return;
+  const budget = execFile.snapshot?.();
+  // Only use spare capacity AFTER normal work. Leave at least three requests
+  // reserved, and never run a second unguarded scanner against the API key.
+  if (!budget || budget.remaining < 4 || budget.cooldownRemainingMs > 0 || Date.now() < gmgnBlockedUntil) return;
+  const token = selectionReview.nextToken();
+  const progress = selectionReview.progress();
+  if (token && (progress.discovered < 100 || cycleNumber % 6 === 0)) {
+    selectionReview.markToken(token.token); // bounded retry even on request failure
+    const response = await cli(["token", "traders", "--chain", "sol", "--address", token.token,
+      "--order-by", "buy_volume_cur", "--direction", "desc", "--limit", "100", "--raw"]);
+    const payload = response?.data ?? response;
+    const traders = Array.isArray(payload) ? payload : payload?.list;
+    if (!Array.isArray(traders)) throw new Error("Unrecognized selection trader response");
+    const added = selectionReview.ingest(traders, token.token, JSON.parse(token.info_json));
+    console.log(`[selection-review] discovery added=${added} target=10`);
+    return;
+  }
+  const result = await selectionReview.tick({
+    fetchActivity: (wallet, cursor) => getWalletActivity(wallet, cursor),
+    fetchCandles: (buy) => cli(["market", "kline", "--chain", "sol", "--address", buy.token,
+      "--resolution", "1h", "--from", String(Math.floor(buy.at / 3600000) * 3600),
+      "--to", String(Math.floor((buy.at + 7 * 86400000) / 1000)), "--raw"]),
+  });
+  console.log(`[selection-review] ${result.kind} saved=${selectionReview.progress().saved}/10`);
 }
 
 async function processOneOutcomeFollowup() {
@@ -653,6 +696,8 @@ async function discoveryCycle() {
   } catch (error) {
     console.warn(`[discovery] cycle failed: ${error.message}`);
   } finally {
+    try { await selectionReviewStep(); }
+    catch (error) { console.warn(`[selection-review] deferred: ${error.message}`); }
     cycleRunning = false;
   }
 }

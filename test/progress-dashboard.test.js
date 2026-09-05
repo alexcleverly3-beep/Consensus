@@ -316,4 +316,15 @@ test("wallet identities are served only after private dashboard authentication",
   const privateApi = await request(port, "/api/wallets", authorization);
   assert.equal(privateApi.statusCode, 200);
   assert.equal(JSON.parse(privateApi.body).wallets[0].walletAddress, "private-wallet-address");
+  for (const route of ["/review", "/api/review-wallets"]) {
+    assert.equal((await request(port, route)).statusCode, 401);
+    const allowed = await request(port, route, authorization);
+    assert.equal(allowed.statusCode, 200);
+    assert.match(allowed.headers["cache-control"], /no-store/);
+    assert.doesNotMatch(allowed.body, /private-wallet-address/);
+  }
+  const reviewProgress = await request(port, "/api/review-progress");
+  assert.equal(reviewProgress.statusCode, 200);
+  assert.equal(JSON.parse(reviewProgress.body).target, 10);
+  assert.doesNotMatch(reviewProgress.body, /wallet_address|private-wallet-address/);
 });
