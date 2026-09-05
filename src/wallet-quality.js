@@ -12,7 +12,9 @@ const STRONG_WALLET_FLOORS = Object.freeze({
   minProfitableRate: 2 / 3,
   maxBadTokenRate: 0.10,
   maxNegativeSignalRate: 0.15,
+  minOutcomeCoverageRate: 2 / 3,
   minPositiveOutcomeRate: 0.75,
+  minStrongOutcomeRate: 0.25,
   minGuaranteedValidatedTokens: 2,
   minHoldEvidenceRate: 0.50,
   minMeaningfulHoldRate: 0.75,
@@ -49,7 +51,9 @@ function trustedProfileQuality(profile, {
   minProfitableRate = STRONG_WALLET_FLOORS.minProfitableRate,
   maxBadTokenRate = STRONG_WALLET_FLOORS.maxBadTokenRate,
   maxNegativeSignalRate = STRONG_WALLET_FLOORS.maxNegativeSignalRate,
+  minOutcomeCoverageRate = STRONG_WALLET_FLOORS.minOutcomeCoverageRate,
   minPositiveOutcomeRate = STRONG_WALLET_FLOORS.minPositiveOutcomeRate,
+  minStrongOutcomeRate = STRONG_WALLET_FLOORS.minStrongOutcomeRate,
   minGuaranteedValidatedTokens = STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens,
   minHoldEvidenceRate = STRONG_WALLET_FLOORS.minHoldEvidenceRate,
   minMeaningfulHoldRate = STRONG_WALLET_FLOORS.minMeaningfulHoldRate,
@@ -91,8 +95,14 @@ function trustedProfileQuality(profile, {
   const profitableRate = distinctTokens > 0 ? clamp(profitableEntries / distinctTokens, 0, 1) : 0;
   const badTokenRate = distinctTokens > 0 ? clamp(badHits / distinctTokens, 0, 1) : 1;
   const negativeSignalRate = distinctTokens > 0 ? clamp(negativeSignals / distinctTokens, 0, 1) : 1;
+  const outcomeCoverageRate = distinctTokens > 0
+    ? clamp(matureTokens / distinctTokens, 0, 1)
+    : 0;
   const positiveOutcomeRate = matureTokens > 0
     ? clamp(positiveOutcomeTokens / matureTokens, 0, 1)
+    : 0;
+  const strongOutcomeRate = matureTokens > 0
+    ? clamp(strongOutcomeTokens / matureTokens, 0, 1)
     : 0;
 
   // Inclusion-exclusion gives a conservative lower bound for how many token
@@ -125,7 +135,9 @@ function trustedProfileQuality(profile, {
     minProfitableRate: atLeast(minProfitableRate, STRONG_WALLET_FLOORS.minProfitableRate),
     maxBadTokenRate: atMost(maxBadTokenRate, STRONG_WALLET_FLOORS.maxBadTokenRate),
     maxNegativeSignalRate: atMost(maxNegativeSignalRate, STRONG_WALLET_FLOORS.maxNegativeSignalRate),
+    minOutcomeCoverageRate: atLeast(minOutcomeCoverageRate, STRONG_WALLET_FLOORS.minOutcomeCoverageRate),
     minPositiveOutcomeRate: atLeast(minPositiveOutcomeRate, STRONG_WALLET_FLOORS.minPositiveOutcomeRate),
+    minStrongOutcomeRate: atLeast(minStrongOutcomeRate, STRONG_WALLET_FLOORS.minStrongOutcomeRate),
     minGuaranteedValidatedTokens: Math.floor(atLeast(
       minGuaranteedValidatedTokens,
       STRONG_WALLET_FLOORS.minGuaranteedValidatedTokens
@@ -151,7 +163,9 @@ function trustedProfileQuality(profile, {
   if (profitableRate < thresholds.minProfitableRate) reasons.push("weak-profitability-rate");
   if (badTokenRate > thresholds.maxBadTokenRate) reasons.push("high-bad-token-rate");
   if (negativeSignalRate > thresholds.maxNegativeSignalRate) reasons.push("high-negative-signal-rate");
+  if (outcomeCoverageRate < thresholds.minOutcomeCoverageRate) reasons.push("insufficient-outcome-coverage");
   if (positiveOutcomeRate < thresholds.minPositiveOutcomeRate) reasons.push("weak-mature-outcome-rate");
+  if (strongOutcomeRate < thresholds.minStrongOutcomeRate) reasons.push("weak-strong-outcome-rate");
   if (guaranteedValidatedTokens < thresholds.minGuaranteedValidatedTokens) {
     reasons.push("insufficient-aligned-winner-evidence");
   }
@@ -187,7 +201,9 @@ function trustedProfileQuality(profile, {
       profitableRate,
       badTokenRate,
       negativeSignalRate,
+      outcomeCoverageRate,
       positiveOutcomeRate,
+      strongOutcomeRate,
       guaranteedValidatedTokens,
       holdEvidenceRate,
       meaningfulHoldRate,
