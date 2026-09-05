@@ -2,21 +2,20 @@
 
 require("dotenv").config();
 
-// Preserve the Railway environment names used by the original bot while the
-// V1 runtime adopts a smaller, evidence-first entrypoint.
+// Preserve the Railway environment names used by the original bot.
 if (!process.env.DISCORD_TOKEN && process.env.DISCORD_BOT_TOKEN) {
   process.env.DISCORD_TOKEN = process.env.DISCORD_BOT_TOKEN;
 }
 
-// The V1 scheduler owns cooldown/backoff. Do not let the CLI independently
-// retry a rate-limited request and unexpectedly spend more of the request budget.
+// Consensus owns cooldown/backoff. Do not let the CLI independently retry a
+// rate-limited request and unexpectedly spend more of the shared request budget.
 if (process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS === undefined) {
   process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS = "0";
 }
 
-// Install before app.js captures child_process.execFile. This gives every GMGN
-// path (market, trader, token-info, and seed history) one shared rolling budget,
-// plus exact-request caching and in-flight deduplication.
+// Install before either runtime captures child_process.execFile. Both the new
+// recurrence-first scanner and the preserved longitudinal V1 runtime therefore
+// share the same rolling GMGN budget, cache and in-flight deduplication.
 let gmgnGuardState = null;
 try {
   gmgnGuardState = require("./gmgn-guard-state").openGmgnGuardState();
@@ -29,25 +28,31 @@ const gmgnGuard = require("./gmgn-runtime-guard").install({
   onStateChange: gmgnGuardState ? (state) => gmgnGuardState.save(state) : null,
 });
 
-// Budget diagnostics only read in-memory guard counters; they never make GMGN
-// requests. Railway logs now expose whether caching is saving calls and whether
-// the configured request ceiling is being approached or exhausted.
 require("./runtime-diagnostics")
   .createRuntimeDiagnostics({ gmgnGuard })
   .start();
 
-// app.js initializes the persistent SQLite schema synchronously before its
-// asynchronous discovery loop begins. Immediately install the observation clock
-// so rescans cannot move a wallet's original first-seen timestamp forward while
-// the profile can still retain the true latest observation time.
-require("./app");
-try {
-  const result = require("./evidence-observation-integrity")
-    .installEvidenceObservationIntegrityAtPath();
-  console.log(`[evidence] observation clock active (${result.clockRows} existing row(s) seeded)`);
-} catch (error) {
-  console.warn(`[evidence] observation clock unavailable: ${error.message}`);
-}
+// New default: breadth first. We retain all existing V1 code and tables, but
+// autonomous production work now scans trending tokens for top traders and
+// tallies wallet recurrence across independent tokens. Set
+// CONSENSUS_DISCOVERY_MODE=legacy to run the prior evidence-first scheduler.
+const mode = String(process.env.CONSENSUS_DISCOVERY_MODE || "recurrence").trim().toLowerCase();
+if (mode !== "legacy") {
+  console.log("[startup] Consensus discovery mode: recurrence-first");
+  require("./recurrence-app").startRecurrenceApp({ gmgnGuard });
+} else {
+  console.log("[startup] Consensus discovery mode: preserved longitudinal V1");
 
-const dashboard = require("./progress-dashboard").startProgressDashboard({ gmgnGuard });
-require("./public-health").installPublicHealthEndpoint(dashboard);
+  // app.js initializes the original persistent schema and scheduler.
+  require("./app");
+  try {
+    const result = require("./evidence-observation-integrity")
+      .installEvidenceObservationIntegrityAtPath();
+    console.log(`[evidence] observation clock active (${result.clockRows} existing row(s) seeded)`);
+  } catch (error) {
+    console.warn(`[evidence] observation clock unavailable: ${error.message}`);
+  }
+
+  const dashboard = require("./progress-dashboard").startProgressDashboard({ gmgnGuard });
+  require("./public-health").installPublicHealthEndpoint(dashboard);
+}
