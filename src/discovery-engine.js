@@ -2,6 +2,7 @@
 
 const { RequestBudget, RequestCoalescer } = require("./request-budget");
 const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
+const { trustedProfileQuality } = require("./wallet-quality");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
@@ -49,15 +50,20 @@ function traderTokenEvidence(trader, tokenInfo = {}) {
     0,
     1
   );
+  // Six hours was too permissive for the type of wallet Consensus is intended
+  // to surface. Reward genuinely early positioning much more heavily and only
+  // classify entries within two hours as "early" for new evidence.
   const timingQuality = entryDelaySec == null
-    ? 0.45
-    : entryDelaySec <= 1800
+    ? 0.35
+    : entryDelaySec <= 900
       ? 1
-      : entryDelaySec <= 7200
-        ? 0.82
-        : entryDelaySec <= 21600
-          ? 0.68
-          : 0.35;
+      : entryDelaySec <= 3600
+        ? 0.88
+        : entryDelaySec <= 7200
+          ? 0.70
+          : entryDelaySec <= 21600
+            ? 0.30
+            : 0.12;
   const txCount = buyCount + sellCount;
   const simplicity = clamp(1 - Math.max(0, txCount - 12) / 70, 0, 1);
   const tokenScore = Math.round(100 * (
@@ -73,8 +79,11 @@ function traderTokenEvidence(trader, tokenInfo = {}) {
     realizedProfit: realized,
     totalProfit,
     entryDelaySec,
-    isEarly: entryDelaySec != null && entryDelaySec <= 21600,
-    isProfitable: totalProfit > 0 && profitChange > 0,
+    isEarly: entryDelaySec != null && entryDelaySec <= 7200,
+    // A tiny green trade is weak evidence of skill. Keep neutral/weak candidates
+    // available for longitudinal learning, but only call the current trade a win
+    // once it cleared a meaningful +25% return.
+    isProfitable: totalProfit > 0 && profitChange >= 0.25,
     buyCount,
     sellCount,
   };
@@ -145,7 +154,12 @@ function createDiscoveryEngine({
   minTokenScore = 35,
   minTrustedReputation = 65,
   minTrustedConfidence = 50,
-  minTrustedDistinctTokens = 4,
+  minTrustedDistinctTokens = 6,
+  minTrustedEarlyRate = 0.5,
+  minTrustedProfitableRate = 0.6,
+  maxTrustedBadTokenRate = 0.2,
+  maxTrustedAverageEntryDelaySec = 2 * 60 * 60,
+  minTrustedAverageTokenScore = 60,
   minConsensusWallets = 2,
   minConsensusTokenScore = 45,
   traderFilter = defaultTraderFilter,
@@ -199,7 +213,7 @@ function createDiscoveryEngine({
         entryDelaySec: evidence.entryDelaySec,
         isEarly: evidence.isEarly,
         isProfitable: evidence.isProfitable,
-        evidenceWeight: evidence.isEarly && evidence.isProfitable ? 1.25 : 1,
+        evidenceWeight: evidence.isEarly && evidence.isProfitable && evidence.tokenScore >= 60 ? 1.25 : 1,
       });
 
       const tags = [
@@ -267,10 +281,19 @@ function createDiscoveryEngine({
     const trusted = candidates.filter((candidate) => {
       const profile = candidate.historicalProfile;
       candidate.trustedProfile = profile;
+      const quality = trustedProfileQuality(profile, {
+        minDistinctTokens: minTrustedDistinctTokens,
+        minEarlyRate: minTrustedEarlyRate,
+        minProfitableRate: minTrustedProfitableRate,
+        maxBadTokenRate: maxTrustedBadTokenRate,
+        maxAverageEntryDelaySec: maxTrustedAverageEntryDelaySec,
+        minAverageTokenScore: minTrustedAverageTokenScore,
+      });
+      candidate.trustQuality = quality;
       return currentConsensusEligible(candidate.evidence, minConsensusTokenScore) &&
         num(profile?.reputation_score) >= minTrustedReputation &&
         num(profile?.confidence_score) >= minTrustedConfidence &&
-        num(profile?.distinct_tokens) >= minTrustedDistinctTokens;
+        quality.eligible;
     });
 
     const consensus = trusted.length >= minConsensusWallets
