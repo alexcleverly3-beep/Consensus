@@ -3,6 +3,8 @@
 const { RequestBudget, RequestCoalescer } = require("./request-budget");
 const { initTokenOutcomes, hasSnapshotData } = require("./token-outcomes");
 
+const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
@@ -95,11 +97,17 @@ function candidatePriority({ evidence, profile, tags = [] }) {
 }
 
 function defaultTraderFilter(trader, creatorAddress) {
-  const wallet = traderAddress(trader);
-  if (!wallet) return "invalid-wallet";
+  const rawWallet = traderAddress(trader);
+  const wallet = typeof rawWallet === "string" ? rawWallet.trim() : "";
+  if (!SOL_ADDR.test(wallet)) return "invalid-wallet";
   if (creatorAddress && wallet === creatorAddress) return "creator";
   if (Number(trader?.addr_type) === 2) return "exchange-or-pool";
-  if (trader?.is_suspicious === true || trader?.is_suspicious === 1) {
+  if (
+    trader?.is_suspicious === true ||
+    trader?.is_suspicious === 1 ||
+    String(trader?.is_suspicious).toLowerCase() === "true" ||
+    String(trader?.is_suspicious) === "1"
+  ) {
     return "suspicious";
   }
   const tags = [
