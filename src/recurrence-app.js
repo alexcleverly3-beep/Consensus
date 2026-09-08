@@ -23,6 +23,14 @@ function safeJson(value, fallback = {}) {
   try { return JSON.parse(String(value || "")); } catch { return fallback; }
 }
 
+function isGlobalGmgnThrottle(error) {
+  const code = String(error?.code || "");
+  const text = String(error?.message || error || "");
+  return code === "GMGN_BUDGET_EXHAUSTED" ||
+    code === "GMGN_COOLDOWN_ACTIVE" ||
+    /GMGN request budget exhausted|GMGN adaptive cooldown active|RATE_LIMIT_EXCEEDED|RATE_LIMIT_BANNED|IP rate limit exceeded|\b429\b|rate[ _-]?limit/i.test(text);
+}
+
 function createCli({ minGapMs = 12_000 } = {}) {
   let queue = Promise.resolve();
   let lastFinishedAt = 0;
@@ -39,7 +47,9 @@ function createCli({ minGapMs = 12_000 } = {}) {
         if (error) {
           const message = [stderr, stdout, error.message]
             .filter(Boolean).map(String).map((item) => item.trim()).filter(Boolean).join("\n");
-          reject(new Error(message || "gmgn-cli failed"));
+          const wrapped = new Error(message || "gmgn-cli failed");
+          if (error.code) wrapped.code = error.code;
+          reject(wrapped);
           return;
         }
         try { resolve(JSON.parse(stdout)); }
@@ -108,6 +118,116 @@ function renderDashboard(health) {
   });
 }
 
+function createDiscoveryCycleRunner({
+  store,
+  fetchTrending,
+  fetchTopTraders,
+  tokensPerCycle = 2,
+  trendingRefreshMs = 60 * 60 * 1000,
+  now = () => Date.now(),
+  logger = console,
+} = {}) {
+  if (!store || typeof store.summary !== "function" || typeof store.nextToken !== "function") {
+    throw new Error("recurrence store is required");
+  }
+  if (typeof fetchTrending !== "function" || typeof fetchTopTraders !== "function") {
+    throw new Error("fetchTrending and fetchTopTraders are required");
+  }
+
+  let running = false;
+  let cycle = 0;
+  let lastTrendingAt = store.summary().tokensSeen > 0 ? now() : 0;
+
+  async function refreshTrending() {
+    const trending = await fetchTrending();
+    const intake = store.enqueueTrending(trending);
+    lastTrendingAt = now();
+    logger.log(
+      `[recurrence] cycle=${cycle} trending rows=${intake.rows} unique=${intake.uniqueTokens} ` +
+      `new=${intake.added} queue=${store.summary().queuedTokens}`
+    );
+    return intake;
+  }
+
+  async function discoveryCycle() {
+    if (running) return { skipped: true };
+    running = true;
+    cycle += 1;
+    let successfulScans = 0;
+    let tokenFailures = 0;
+    let throttled = false;
+    let trendingRefreshed = false;
+
+    try {
+      // If the queue is empty we must discover tokens first. Otherwise preserve
+      // scarce GMGN budget for the queued top-trader scans that build the DB.
+      if (store.summary().queuedTokens === 0) {
+        try {
+          await refreshTrending();
+          trendingRefreshed = true;
+        } catch (error) {
+          throttled = isGlobalGmgnThrottle(error);
+          logger.warn(`[recurrence] trending refresh failed: ${String(error?.message || error).slice(0, 1000)}`);
+          return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed };
+        }
+      }
+
+      for (let i = 0; i < tokensPerCycle; i += 1) {
+        const token = store.nextToken();
+        if (!token) break;
+        try {
+          const traders = await fetchTopTraders(token.token_address);
+          const result = store.ingestTokenTraders({
+            tokenAddress: token.token_address,
+            traders,
+            tokenMeta: safeJson(token.trend_json),
+          });
+          successfulScans += 1;
+          const summary = store.summary();
+          logger.log(
+            `[recurrence] trader-scan accepted=${result.accepted} rejected=${result.rejected} ` +
+            `wallets=${summary.walletsSeen} repeats=${summary.repeatWallets} queue=${summary.queuedTokens}`
+          );
+        } catch (error) {
+          if (isGlobalGmgnThrottle(error)) {
+            throttled = true;
+            logger.warn(`[recurrence] GMGN budget/cooldown paused token scans: ${String(error?.message || error).slice(0, 1000)}`);
+            break;
+          }
+          store.markFailed(token.token_address, error);
+          tokenFailures += 1;
+          logger.warn(
+            `[recurrence] token trader scan failed; deferring token=${token.token_address}: ` +
+            String(error?.message || error).slice(0, 1000)
+          );
+        }
+      }
+
+      // Refresh trending only after useful queued work, and only when the queue
+      // needs replenishing or the discovery list is stale. Never let this call
+      // take budget ahead of an already-queued token scan.
+      const summary = store.summary();
+      const trendingStale = now() - lastTrendingAt >= trendingRefreshMs;
+      const queueLow = summary.queuedTokens < tokensPerCycle;
+      if (!trendingRefreshed && !throttled && (queueLow || trendingStale)) {
+        try {
+          await refreshTrending();
+          trendingRefreshed = true;
+        } catch (error) {
+          throttled = isGlobalGmgnThrottle(error);
+          logger.warn(`[recurrence] trending refresh deferred: ${String(error?.message || error).slice(0, 1000)}`);
+        }
+      }
+
+      return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed };
+    } finally {
+      running = false;
+    }
+  }
+
+  return { discoveryCycle };
+}
+
 function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   const dbPath = resolveDbPath(env);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -125,12 +245,11 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   const tokensPerCycle = clampInt(env.RECURRENCE_TOKENS_PER_CYCLE, 2, 1, 3);
   const traderLimit = clampInt(env.RECURRENCE_TRADER_LIMIT, 100, 25, 100);
   const rescanHours = clampInt(env.RECURRENCE_RESCAN_HOURS, 24, 6, 168);
+  const trendingRefreshMinutes = clampInt(env.RECURRENCE_TRENDING_REFRESH_MINUTES, 60, 15, 360);
   const minGapMs = clampInt(env.GMGN_MIN_REQUEST_GAP_MS, 12_000, 3_000, 60_000);
   const store = initRecurrenceStore(db, { rescanMs: rescanHours * 60 * 60 * 1000 });
   const dashboardStore = createRecurrenceDashboardStore(db);
   const cli = createCli({ minGapMs });
-  let running = false;
-  let cycle = 0;
 
   async function fetchTrending() {
     return cli([
@@ -148,44 +267,14 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     return unwrapRows(response);
   }
 
-  async function discoveryCycle() {
-    if (running) return;
-    running = true;
-    cycle += 1;
-    try {
-      const trending = await fetchTrending();
-      const intake = store.enqueueTrending(trending);
-      console.log(
-        `[recurrence] cycle=${cycle} trending rows=${intake.rows} unique=${intake.uniqueTokens} ` +
-        `new=${intake.added} queue=${store.summary().queuedTokens}`
-      );
-
-      for (let i = 0; i < tokensPerCycle; i += 1) {
-        const token = store.nextToken();
-        if (!token) break;
-        try {
-          const traders = await fetchTopTraders(token.token_address);
-          const result = store.ingestTokenTraders({
-            tokenAddress: token.token_address,
-            traders,
-            tokenMeta: safeJson(token.trend_json),
-          });
-          const summary = store.summary();
-          console.log(
-            `[recurrence] trader-scan accepted=${result.accepted} rejected=${result.rejected} ` +
-            `wallets=${summary.walletsSeen} repeats=${summary.repeatWallets} queue=${summary.queuedTokens}`
-          );
-        } catch (error) {
-          store.markFailed(token.token_address, error);
-          throw error;
-        }
-      }
-    } catch (error) {
-      console.warn(`[recurrence] cycle failed: ${String(error?.message || error).slice(0, 1000)}`);
-    } finally {
-      running = false;
-    }
-  }
+  const runner = createDiscoveryCycleRunner({
+    store,
+    fetchTrending,
+    fetchTopTraders,
+    tokensPerCycle,
+    trendingRefreshMs: trendingRefreshMinutes * 60 * 1000,
+  });
+  const discoveryCycle = runner.discoveryCycle;
 
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
@@ -262,7 +351,8 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   server.listen(port, host, () => {
     console.log(
       `[recurrence] listening on ${host}:${server.address()?.port || port}; interval=${intervalMinutes}m; ` +
-      `trending=${trendingLimit}; scans/cycle=${tokensPerCycle}; top-traders=${traderLimit}; rescan=${rescanHours}h`
+      `trending=${trendingLimit}; scans/cycle=${tokensPerCycle}; top-traders=${traderLimit}; ` +
+      `rescan=${rescanHours}h; trending-refresh=${trendingRefreshMinutes}m`
     );
   });
   queueMicrotask(() => discoveryCycle());
@@ -275,6 +365,8 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 
 module.exports = {
   createCli,
+  createDiscoveryCycleRunner,
+  isGlobalGmgnThrottle,
   publicHealth,
   renderDashboard,
   startRecurrenceApp,
