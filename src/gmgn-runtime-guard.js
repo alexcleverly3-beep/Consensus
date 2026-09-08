@@ -113,6 +113,7 @@ function createGmgnExecGuard({
   cooldownMs = 30 * 1000,
   recoveryWindows = 2,
   adaptive = true,
+  hardenTrending = true,
   now = () => Date.now(),
   ttlForKind = defaultTtlMs,
   initialState = {},
@@ -212,13 +213,15 @@ function createGmgnExecGuard({
       windowStartedAt,
       windowMs: safeWindowMs,
       adaptive: Boolean(adaptive),
+      hardenTrending: Boolean(hardenTrending),
     };
   }
 
   function guardedExecFile(file, args, options, callback) {
     if (file !== "gmgn-cli") return execFile(file, args, options, callback);
 
-    const effectiveArgs = hardenTrendingArgs(args);
+    const requestedArgs = Array.isArray(args) ? args.map(String) : [];
+    const effectiveArgs = hardenTrending ? hardenTrendingArgs(requestedArgs) : requestedArgs;
     const at = now();
     rollWindow(at);
     const key = keyFor(file, effectiveArgs);
