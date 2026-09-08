@@ -123,6 +123,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     UPDATE recurrence_token_queue
     SET last_seen_at = ?, trend_json = ?,
         status = CASE
+          WHEN status = 'failed' THEN 'failed'
           WHEN last_scanned_at IS NULL OR last_scanned_at <= ? THEN 'pending'
           ELSE status
         END
@@ -130,8 +131,9 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   `);
   const nextToken = db.prepare(`
     SELECT * FROM recurrence_token_queue
-    WHERE status = 'pending'
-    ORDER BY first_seen_at ASC, last_seen_at ASC
+    WHERE status IN ('pending', 'failed')
+    ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,
+             first_seen_at ASC, last_seen_at ASC
     LIMIT 1
   `);
   const markScanned = db.prepare(`
@@ -142,7 +144,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   `);
   const markFailed = db.prepare(`
     UPDATE recurrence_token_queue
-    SET status = 'pending', last_error = ?
+    SET status = 'failed', last_error = ?
     WHERE token_address = ?
   `);
   const getWalletToken = db.prepare(`
@@ -169,7 +171,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       (SELECT COUNT(*) FROM recurrence_token_queue) AS tokens_seen,
       (SELECT COUNT(*) FROM recurrence_token_queue WHERE scan_count > 0) AS tokens_scanned,
       (SELECT COALESCE(SUM(scan_count), 0) FROM recurrence_token_queue) AS total_token_scans,
-      (SELECT COUNT(*) FROM recurrence_token_queue WHERE status = 'pending') AS queued_tokens,
+      (SELECT COUNT(*) FROM recurrence_token_queue WHERE status IN ('pending', 'failed')) AS queued_tokens,
       (SELECT COUNT(*) FROM recurrence_wallet_tokens) AS wallet_token_links,
       (SELECT COUNT(DISTINCT wallet_address) FROM recurrence_wallet_tokens) AS wallets_seen,
       (SELECT COUNT(*) FROM (
