@@ -13,9 +13,8 @@ if (process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS === undefined) {
   process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS = "0";
 }
 
-// Install before either runtime captures child_process.execFile. Both the new
-// recurrence-first scanner and the preserved longitudinal V1 runtime therefore
-// share the same rolling GMGN budget, cache and in-flight deduplication.
+// Install before the recurrence runtime captures child_process.execFile so all
+// GMGN work shares the same rolling budget, cache and in-flight deduplication.
 let gmgnGuardState = null;
 try {
   gmgnGuardState = require("./gmgn-guard-state").openGmgnGuardState();
@@ -32,27 +31,9 @@ require("./runtime-diagnostics")
   .createRuntimeDiagnostics({ gmgnGuard })
   .start();
 
-// New default: breadth first. We retain all existing V1 code and tables, but
-// autonomous production work now scans trending tokens for top traders and
-// tallies wallet recurrence across independent tokens. Set
-// CONSENSUS_DISCOVERY_MODE=legacy to run the prior evidence-first scheduler.
-const mode = String(process.env.CONSENSUS_DISCOVERY_MODE || "recurrence").trim().toLowerCase();
-if (mode !== "legacy") {
-  console.log("[startup] Consensus discovery mode: recurrence-first");
-  require("./recurrence-app").startRecurrenceApp({ gmgnGuard });
-} else {
-  console.log("[startup] Consensus discovery mode: preserved longitudinal V1");
-
-  // app.js initializes the original persistent schema and scheduler.
-  require("./app");
-  try {
-    const result = require("./evidence-observation-integrity")
-      .installEvidenceObservationIntegrityAtPath();
-    console.log(`[evidence] observation clock active (${result.clockRows} existing row(s) seeded)`);
-  } catch (error) {
-    console.warn(`[evidence] observation clock unavailable: ${error.message}`);
-  }
-
-  const dashboard = require("./progress-dashboard").startProgressDashboard({ gmgnGuard });
-  require("./public-health").installPublicHealthEndpoint(dashboard);
-}
+// Phase 1 is recurrence-first only: discover trending tokens, ingest their top
+// traders, and accumulate independent wallet/token observations. The obsolete
+// one-shot/evidence-first scheduler is intentionally not retained as a runtime
+// compatibility mode.
+console.log("[startup] Consensus discovery mode: recurrence-first");
+require("./recurrence-app").startRecurrenceApp({ gmgnGuard });
