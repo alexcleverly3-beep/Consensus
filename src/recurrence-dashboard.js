@@ -136,6 +136,7 @@ function renderPrivateDashboard(stats, wallets) {
     ["Tokens scanned", stats.tokensScanned],
     ["Scanned / last hour", stats.scansLastHour],
     ["Queued tokens", stats.queuedTokens],
+    ["Discord priority queued", stats.priorityQueuedTokens || 0],
     ["Unique wallets", stats.walletsSeen],
     ["Wallet/token links", stats.walletTokenLinks],
     ["Recurring wallets 2+", stats.repeatWallets],
