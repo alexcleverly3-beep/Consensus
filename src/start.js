@@ -15,6 +15,8 @@ if (process.env.GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS === undefined) {
 
 // Install before the recurrence runtime captures child_process.execFile so all
 // GMGN work shares the same rolling budget, cache and in-flight deduplication.
+// Phase 1 intentionally requests broad trending discovery; legacy quality
+// filters are deferred until recurrence data tells us what actually matters.
 let gmgnGuardState = null;
 try {
   gmgnGuardState = require("./gmgn-guard-state").openGmgnGuardState();
@@ -25,6 +27,7 @@ try {
 const gmgnGuard = require("./gmgn-runtime-guard").install({
   initialState: gmgnGuardState?.load() || {},
   onStateChange: gmgnGuardState ? (state) => gmgnGuardState.save(state) : null,
+  hardenTrending: false,
 });
 
 require("./runtime-diagnostics")
