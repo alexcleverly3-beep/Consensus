@@ -39,4 +39,15 @@ require("./runtime-diagnostics")
 // one-shot/evidence-first scheduler is intentionally not retained as a runtime
 // compatibility mode.
 console.log("[startup] Consensus discovery mode: recurrence-first");
-require("./recurrence-app").startRecurrenceApp({ gmgnGuard });
+const recurrence = require("./recurrence-app").startRecurrenceApp({ gmgnGuard });
+
+// A CA posted to the configured Discord bot/channel is inserted into the same
+// durable recurrence queue as a priority item. Trigger a cycle immediately; the
+// shared GMGN budget/cooldown guard still decides whether the request can run.
+const discordPriority = require("./discord-priority-intake").startDiscordPriorityIntake({
+  store: recurrence.store,
+  onQueued: recurrence.discoveryCycle,
+});
+if (discordPriority) {
+  recurrence.server.once("close", () => discordPriority.destroy?.());
+}

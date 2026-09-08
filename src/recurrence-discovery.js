@@ -79,6 +79,13 @@ function insiderLike(trader, walletAddress, creatorAddress = "") {
   return tags.some((tag) => ["dev", "developer", "creator", "insider", "rat_trader"].includes(tag));
 }
 
+function ensureColumn(db, tableName, columnName, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (!columns.some((column) => column.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
 function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS recurrence_token_queue (
@@ -91,8 +98,6 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       last_error TEXT,
       trend_json TEXT NOT NULL DEFAULT '{}'
     );
-    CREATE INDEX IF NOT EXISTS idx_recurrence_token_queue_status
-      ON recurrence_token_queue(status, first_seen_at ASC);
 
     CREATE TABLE IF NOT EXISTS recurrence_wallet_tokens (
       wallet_address TEXT NOT NULL,
@@ -113,11 +118,25 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       ON recurrence_wallet_tokens(wallet_address, last_seen_at DESC);
   `);
 
+  // Additive migration so existing Railway SQLite data is preserved.
+  ensureColumn(db, "recurrence_token_queue", "priority", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recurrence_token_queue", "source", "TEXT NOT NULL DEFAULT 'trending'");
+  ensureColumn(db, "recurrence_token_queue", "priority_queued_at", "INTEGER");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_recurrence_token_queue_status
+      ON recurrence_token_queue(status, priority DESC, first_seen_at ASC);
+  `);
+
   const getToken = db.prepare("SELECT * FROM recurrence_token_queue WHERE token_address = ?");
   const insertToken = db.prepare(`
     INSERT INTO recurrence_token_queue(
-      token_address, first_seen_at, last_seen_at, status, trend_json
-    ) VALUES (?, ?, ?, 'pending', ?)
+      token_address, first_seen_at, last_seen_at, status, trend_json, priority, source, priority_queued_at
+    ) VALUES (?, ?, ?, 'pending', ?, 0, 'trending', NULL)
+  `);
+  const insertPriorityToken = db.prepare(`
+    INSERT INTO recurrence_token_queue(
+      token_address, first_seen_at, last_seen_at, status, trend_json, priority, source, priority_queued_at
+    ) VALUES (?, ?, ?, 'pending', '{}', 1, ?, ?)
   `);
   const updateTokenSeen = db.prepare(`
     UPDATE recurrence_token_queue
@@ -129,17 +148,30 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
         END
     WHERE token_address = ?
   `);
+  const reprioritizeToken = db.prepare(`
+    UPDATE recurrence_token_queue
+    SET last_seen_at = ?, status = 'pending', priority = 1,
+        source = ?, priority_queued_at = ?, last_error = NULL
+    WHERE token_address = ?
+  `);
   const nextToken = db.prepare(`
     SELECT * FROM recurrence_token_queue
     WHERE status IN ('pending', 'failed')
-    ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,
-             first_seen_at ASC, last_seen_at ASC
+    ORDER BY
+      CASE
+        WHEN status = 'pending' AND priority > 0 THEN 0
+        WHEN status = 'pending' THEN 1
+        WHEN status = 'failed' AND priority > 0 THEN 2
+        ELSE 3
+      END,
+      CASE WHEN priority > 0 THEN COALESCE(priority_queued_at, first_seen_at) ELSE first_seen_at END ASC,
+      last_seen_at ASC
     LIMIT 1
   `);
   const markScanned = db.prepare(`
     UPDATE recurrence_token_queue
     SET last_scanned_at = ?, scan_count = scan_count + 1,
-        status = 'done', last_error = NULL
+        status = 'done', last_error = NULL, priority = 0, priority_queued_at = NULL
     WHERE token_address = ?
   `);
   const markFailed = db.prepare(`
@@ -172,6 +204,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       (SELECT COUNT(*) FROM recurrence_token_queue WHERE scan_count > 0) AS tokens_scanned,
       (SELECT COALESCE(SUM(scan_count), 0) FROM recurrence_token_queue) AS total_token_scans,
       (SELECT COUNT(*) FROM recurrence_token_queue WHERE status IN ('pending', 'failed')) AS queued_tokens,
+      (SELECT COUNT(*) FROM recurrence_token_queue WHERE status = 'pending' AND priority > 0) AS priority_queued_tokens,
       (SELECT COUNT(*) FROM recurrence_wallet_tokens) AS wallet_token_links,
       (SELECT COUNT(DISTINCT wallet_address) FROM recurrence_wallet_tokens) AS wallets_seen,
       (SELECT COUNT(*) FROM (
@@ -219,6 +252,19 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       }
     }
     return { rows: rows.length, uniqueTokens: seen.size, added, refreshed, invalid };
+  }
+
+  function enqueuePriorityToken(address, { observedAt = Date.now(), source = "discord" } = {}) {
+    const canonical = canonicalAddress(address);
+    if (!SOL_ADDR.test(canonical)) throw new Error("valid tokenAddress is required");
+    const safeSource = String(source || "manual").slice(0, 64);
+    const existing = getToken.get(canonical);
+    if (!existing) {
+      insertPriorityToken.run(canonical, observedAt, observedAt, safeSource, observedAt);
+      return { tokenAddress: canonical, added: true, reprioritized: false };
+    }
+    reprioritizeToken.run(observedAt, safeSource, observedAt, canonical);
+    return { tokenAddress: canonical, added: false, reprioritized: true };
   }
 
   const ingestTx = db.transaction(({ tokenAddress: address, traders, tokenMeta, observedAt }) => {
@@ -272,6 +318,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
 
   return {
     enqueueTrending,
+    enqueuePriorityToken,
     nextToken: () => nextToken.get() || null,
     markFailed(token, error) {
       markFailed.run(String(error?.message || error || "scan failed").slice(0, 1000), token);
@@ -288,6 +335,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
         tokensScanned: num(row.tokens_scanned),
         totalTokenScans: num(row.total_token_scans),
         queuedTokens: num(row.queued_tokens),
+        priorityQueuedTokens: num(row.priority_queued_tokens),
         walletTokenLinks: num(row.wallet_token_links),
         walletsSeen: num(row.wallets_seen),
         repeatWallets: num(row.repeat_wallets),
