@@ -47,6 +47,21 @@ test("recurrence intake queues every valid trending token without old quality ga
   db.close();
 });
 
+test("failed token is deprioritized behind untouched pending tokens", () => {
+  const db = new Database(":memory:");
+  const store = initRecurrenceStore(db);
+  store.enqueueTrending({ data: { list: [{ address: TOKEN_A }, { address: TOKEN_B }] } }, 1000);
+
+  assert.equal(store.nextToken().token_address, TOKEN_A);
+  store.markFailed(TOKEN_A, new Error("provider failure"));
+  assert.equal(store.nextToken().token_address, TOKEN_B);
+  assert.equal(store.summary().queuedTokens, 2);
+
+  store.ingestTokenTraders({ tokenAddress: TOKEN_B, observedAt: 2000, traders: [trader(WALLET_OTHER)] });
+  assert.equal(store.nextToken().token_address, TOKEN_A);
+  db.close();
+});
+
 test("recurrence trader filter removes bot-like actors but keeps dev and insider-like wallets", () => {
   assert.equal(recurrenceTraderExclusion(trader(WALLET_BOT, { tags: ["mev_bot"] })), "tag:mev_bot");
   assert.equal(recurrenceTraderExclusion(trader(WALLET_BOT, { addr_type: 2 })), "exchange-or-pool");
