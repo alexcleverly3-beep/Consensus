@@ -3,12 +3,21 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  clampInt,
   createDiscoveryCycleRunner,
   isGlobalGmgnThrottle,
   publicHealth,
 } = require("../src/recurrence-app");
 
 const TOKEN_A = "A".repeat(32);
+
+test("missing dashboard query parameters keep their intended defaults", () => {
+  assert.equal(clampInt(null, 3, 2, 100), 3);
+  assert.equal(clampInt(undefined, 250, 1, 1000), 250);
+  assert.equal(clampInt("", 250, 1, 1000), 250);
+  assert.equal(clampInt("4", 3, 2, 100), 4);
+  assert.equal(clampInt("5000", 250, 1, 1000), 1000);
+});
 
 test("recurrence health exposes collection progress without wallet or token identities", () => {
   const store = {

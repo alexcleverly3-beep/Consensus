@@ -15,6 +15,7 @@ const {
 const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
 
 function clampInt(value, fallback, min, max) {
+  if (value == null || String(value).trim() === "") return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
 }
@@ -159,8 +160,6 @@ function createDiscoveryCycleRunner({
     let trendingRefreshed = false;
 
     try {
-      // If the queue is empty we must discover tokens first. Otherwise preserve
-      // scarce GMGN budget for the queued top-trader scans that build the DB.
       if (store.summary().queuedTokens === 0) {
         try {
           await refreshTrending();
@@ -203,9 +202,6 @@ function createDiscoveryCycleRunner({
         }
       }
 
-      // Refresh trending only after useful queued work, and only when the queue
-      // needs replenishing or the discovery list is stale. Never let this call
-      // take budget ahead of an already-queued token scan.
       const summary = store.summary();
       const trendingStale = now() - lastTrendingAt >= trendingRefreshMs;
       const queueLow = summary.queuedTokens < tokensPerCycle;
@@ -364,6 +360,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 }
 
 module.exports = {
+  clampInt,
   createCli,
   createDiscoveryCycleRunner,
   isGlobalGmgnThrottle,
