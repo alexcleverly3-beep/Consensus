@@ -6,6 +6,12 @@ const path = require("path");
 const { execFile } = require("child_process");
 const Database = require("better-sqlite3");
 const { initRecurrenceStore, unwrapRows } = require("./recurrence-discovery");
+const {
+  createRecurrenceDashboardStore,
+  dashboardCredentials,
+  isAuthorized,
+  renderPrivateDashboard,
+} = require("./recurrence-dashboard");
 const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
 
 function clampInt(value, fallback, min, max) {
@@ -15,11 +21,6 @@ function clampInt(value, fallback, min, max) {
 
 function safeJson(value, fallback = {}) {
   try { return JSON.parse(String(value || "")); } catch { return fallback; }
-}
-
-function escapeHtml(value) {
-  return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
 
 function createCli({ minGapMs = 12_000 } = {}) {
@@ -99,18 +100,12 @@ function publicHealth(store, gmgnGuard = null, generatedAt = Date.now()) {
 
 function renderDashboard(health) {
   const c = health.collection;
-  const cards = [
-    ["Trending tokens seen", c.tokensSeen],
-    ["Tokens trader-scanned", c.tokensScanned],
-    ["Top-trader wallet/token links", c.walletTokenLinks],
-    ["Unique wallets saved", c.walletsSeen],
-    ["Repeat wallets", c.repeatWallets],
-    ["Queued tokens", c.queuedTokens],
-    ["GMGN calls / window", `${health.gmgn.freshCalls}/${health.gmgn.effectiveMax}`],
-    ["GMGN cache + dedupe", health.gmgn.cacheHits + health.gmgn.coalesced],
-  ];
-  const last = c.lastScanAt ? new Date(c.lastScanAt).toISOString() : "Not yet";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>Consensus recurrence discovery</title><style>:root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif}body{margin:0;background:#0d1117;color:#e6edf3}main{max-width:980px;margin:0 auto;padding:32px 20px}.muted{color:#8b949e}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:24px}.card{border:1px solid #30363d;border-radius:10px;background:#161b22;padding:16px}.label{color:#8b949e;font-size:13px}.value{margin-top:6px;font-size:28px;font-weight:700}.note{margin-top:24px;color:#8b949e;line-height:1.5}</style></head><body><main><h1>Consensus — recurrence discovery</h1><p class="muted">Breadth-first mode: scan trending tokens, save non-bot top traders, and rank wallets by independent token recurrence.</p><div class="grid">${cards.map(([label,value]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`).join("")}</div><p class="note">Last completed trader scan: ${escapeHtml(last)}. Wallet identities remain private. Dev/insider-like wallets are retained and labelled internally; obvious bots, exchanges/pools and extreme high-frequency accounts are excluded. Existing V1 evidence tables and code are preserved but are not driving autonomous discovery in this mode.</p></main></body></html>`;
+  return JSON.stringify({
+    mode: health.mode,
+    tokensScanned: c.tokensScanned,
+    walletsSeen: c.walletsSeen,
+    repeatWallets: c.repeatWallets,
+  });
 }
 
 function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
@@ -132,6 +127,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   const rescanHours = clampInt(env.RECURRENCE_RESCAN_HOURS, 24, 6, 168);
   const minGapMs = clampInt(env.GMGN_MIN_REQUEST_GAP_MS, 12_000, 3_000, 60_000);
   const store = initRecurrenceStore(db, { rescanMs: rescanHours * 60 * 60 * 1000 });
+  const dashboardStore = createRecurrenceDashboardStore(db);
   const cli = createCli({ minGapMs });
   let running = false;
   let cycle = 0;
@@ -193,10 +189,24 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
+  const privateHeaders = {
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+  };
+
   const server = http.createServer((req, res) => {
+    let requestUrl;
     let pathname;
-    try { pathname = new URL(req.url, "http://recurrence.local").pathname; }
-    catch { pathname = req.url; }
+    try {
+      requestUrl = new URL(req.url, "http://recurrence.local");
+      pathname = requestUrl.pathname;
+    } catch {
+      pathname = req.url;
+    }
+
     if (pathname === "/health" || pathname === "/api/progress") {
       try {
         const health = publicHealth(store, gmgnGuard);
@@ -208,14 +218,45 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
       }
       return;
     }
-    if (pathname !== "/" && pathname !== "/index.html") {
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-      res.end("Not found");
+
+    if (pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets") {
+      const credentials = dashboardCredentials(env);
+      if (!credentials.password) {
+        res.writeHead(503, { ...privateHeaders, "content-type": "text/plain; charset=utf-8" });
+        res.end("Private Consensus dashboard is disabled. Set DASHBOARD_PASSWORD in Railway.");
+        return;
+      }
+      if (!isAuthorized(req, env)) {
+        res.writeHead(401, {
+          ...privateHeaders,
+          "content-type": "text/plain; charset=utf-8",
+          "www-authenticate": 'Basic realm="Consensus private dashboard", charset="UTF-8"',
+        });
+        res.end("Authentication required");
+        return;
+      }
+
+      try {
+        const minDistinctTokens = clampInt(requestUrl?.searchParams.get("min"), 3, 2, 100);
+        const limit = clampInt(requestUrl?.searchParams.get("limit"), 250, 1, 1000);
+        const stats = dashboardStore.stats(store.summary());
+        const wallets = dashboardStore.wallets({ minDistinctTokens, limit });
+        if (pathname === "/api/wallets") {
+          res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ generatedAt: stats.generatedAt, minDistinctTokens, stats, wallets }, null, 2));
+          return;
+        }
+        res.writeHead(200, { ...privateHeaders, "content-type": "text/html; charset=utf-8" });
+        res.end(renderPrivateDashboard(stats, wallets));
+      } catch (error) {
+        res.writeHead(503, { ...privateHeaders, "content-type": "text/plain; charset=utf-8" });
+        res.end(`Dashboard temporarily unavailable: ${String(error?.message || error).slice(0, 200)}`);
+      }
       return;
     }
-    const health = publicHealth(store, gmgnGuard);
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-    res.end(renderDashboard(health));
+
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Not found");
   });
 
   server.listen(port, host, () => {
@@ -229,7 +270,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   timer.unref?.();
   server.once("close", () => clearInterval(timer));
 
-  return { db, server, store, discoveryCycle };
+  return { db, server, store, dashboardStore, discoveryCycle };
 }
 
 module.exports = {
