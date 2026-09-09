@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
@@ -22,6 +23,38 @@ function clampInt(value, fallback, min, max) {
 
 function safeJson(value, fallback = {}) {
   try { return JSON.parse(String(value || "")); } catch { return fallback; }
+}
+
+function safeTokenEqual(left, right) {
+  const a = Buffer.from(String(left || ""));
+  const b = Buffer.from(String(right || ""));
+  return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+}
+
+function readFormBody(req, maxBytes = 4096) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    let settled = false;
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      if (settled) return;
+      body += chunk;
+      if (Buffer.byteLength(body, "utf8") > maxBytes) {
+        settled = true;
+        reject(new Error("request body too large"));
+      }
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(new URLSearchParams(body));
+    });
+    req.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+  });
 }
 
 function isGlobalGmgnThrottle(error) {
@@ -274,15 +307,45 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
+  const dashboardActionToken = crypto.randomBytes(24).toString("hex");
   const privateHeaders = {
     "cache-control": "no-store",
-    "content-security-policy": "default-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    "content-security-policy": "default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     "referrer-policy": "no-referrer",
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
   };
 
-  const server = http.createServer((req, res) => {
+  function rejectPrivate(res, status, message) {
+    res.writeHead(status, { ...privateHeaders, "content-type": "text/plain; charset=utf-8" });
+    res.end(message);
+  }
+
+  function requirePrivateAccess(req, res) {
+    const credentials = dashboardCredentials(env);
+    if (!credentials.password) {
+      rejectPrivate(res, 503, "Private Consensus dashboard is disabled. Set DASHBOARD_PASSWORD in Railway.");
+      return false;
+    }
+    if (!isAuthorized(req, env)) {
+      res.writeHead(401, {
+        ...privateHeaders,
+        "content-type": "text/plain; charset=utf-8",
+        "www-authenticate": 'Basic realm="Consensus private dashboard", charset="UTF-8"',
+      });
+      res.end("Authentication required");
+      return false;
+    }
+    return true;
+  }
+
+  function redirectNotice(res, message, kind = "success") {
+    const query = new URLSearchParams({ notice: String(message).slice(0, 180), kind });
+    res.writeHead(303, { ...privateHeaders, location: `/?${query.toString()}` });
+    res.end();
+  }
+
+  const server = http.createServer(async (req, res) => {
     let requestUrl;
     let pathname;
     try {
@@ -304,38 +367,80 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
       return;
     }
 
-    if (pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets") {
-      const credentials = dashboardCredentials(env);
-      if (!credentials.password) {
-        res.writeHead(503, { ...privateHeaders, "content-type": "text/plain; charset=utf-8" });
-        res.end("Private Consensus dashboard is disabled. Set DASHBOARD_PASSWORD in Railway.");
-        return;
-      }
-      if (!isAuthorized(req, env)) {
-        res.writeHead(401, {
-          ...privateHeaders,
-          "content-type": "text/plain; charset=utf-8",
-          "www-authenticate": 'Basic realm="Consensus private dashboard", charset="UTF-8"',
-        });
-        res.end("Authentication required");
-        return;
+    const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" ||
+      pathname === "/api/queue" || pathname === "/actions/token/add" || pathname === "/actions/token/cancel";
+    if (privatePath) {
+      if (!requirePrivateAccess(req, res)) return;
+
+      if (pathname === "/actions/token/add" || pathname === "/actions/token/cancel") {
+        if (req.method !== "POST") {
+          rejectPrivate(res, 405, "POST required");
+          return;
+        }
+        const contentType = String(req.headers["content-type"] || "").toLowerCase();
+        if (!contentType.startsWith("application/x-www-form-urlencoded")) {
+          rejectPrivate(res, 415, "Form submission required");
+          return;
+        }
+        try {
+          const form = await readFormBody(req);
+          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) {
+            rejectPrivate(res, 403, "Invalid dashboard action token");
+            return;
+          }
+          const token = String(form.get("token") || "").trim();
+          if (pathname === "/actions/token/add") {
+            const result = store.enqueuePriorityToken(token, { source: "dashboard" });
+            queueMicrotask(() => Promise.resolve(discoveryCycle()).catch((error) => {
+              console.warn(`[dashboard] immediate manual scan trigger failed: ${String(error?.message || error).slice(0, 300)}`);
+            }));
+            redirectNotice(res, result.added ? "Token added to the priority queue." : "Token re-queued as priority.");
+            return;
+          }
+          const result = dashboardStore.cancelQueuedToken(token);
+          redirectNotice(
+            res,
+            result.cancelled ? "Token removed from the current scan queue." : "Token was not currently queued.",
+            result.cancelled ? "success" : "error"
+          );
+          return;
+        } catch (error) {
+          redirectNotice(res, String(error?.message || error).slice(0, 160), "error");
+          return;
+        }
       }
 
       try {
         const minDistinctTokens = clampInt(requestUrl?.searchParams.get("min"), 3, 2, 100);
         const limit = clampInt(requestUrl?.searchParams.get("limit"), 250, 1, 1000);
+        const queueLimit = clampInt(requestUrl?.searchParams.get("queueLimit"), 100, 1, 500);
         const stats = dashboardStore.stats(store.summary());
         const wallets = dashboardStore.wallets({ minDistinctTokens, limit });
+        const queue = dashboardStore.queue({ limit: queueLimit });
+
         if (pathname === "/api/wallets") {
           res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ generatedAt: stats.generatedAt, minDistinctTokens, stats, wallets }, null, 2));
           return;
         }
+        if (pathname === "/api/queue") {
+          res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ generatedAt: stats.generatedAt, stats, queue }, null, 2));
+          return;
+        }
+
+        const notice = String(requestUrl?.searchParams.get("notice") || "").slice(0, 180);
+        const noticeKind = requestUrl?.searchParams.get("kind") === "error" ? "error" : "success";
         res.writeHead(200, { ...privateHeaders, "content-type": "text/html; charset=utf-8" });
-        res.end(renderPrivateDashboard(stats, wallets));
+        res.end(renderPrivateDashboard(stats, wallets, {
+          queue,
+          minDistinctTokens,
+          csrfToken: dashboardActionToken,
+          notice,
+          noticeKind,
+        }));
       } catch (error) {
-        res.writeHead(503, { ...privateHeaders, "content-type": "text/plain; charset=utf-8" });
-        res.end(`Dashboard temporarily unavailable: ${String(error?.message || error).slice(0, 200)}`);
+        rejectPrivate(res, 503, `Dashboard temporarily unavailable: ${String(error?.message || error).slice(0, 200)}`);
       }
       return;
     }
@@ -365,6 +470,8 @@ module.exports = {
   createDiscoveryCycleRunner,
   isGlobalGmgnThrottle,
   publicHealth,
+  readFormBody,
   renderDashboard,
+  safeTokenEqual,
   startRecurrenceApp,
 };
