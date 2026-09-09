@@ -13,6 +13,7 @@ const {
   isAuthorized,
   renderPrivateDashboard,
 } = require("./recurrence-dashboard");
+const { initPhase2WalletLab, renderPhase2WalletLab } = require("./phase2-wallet-lab");
 const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
 
 function clampInt(value, fallback, min, max) {
@@ -144,30 +145,12 @@ function publicHealth(store, gmgnGuard = null, generatedAt = Date.now()) {
 
 function renderDashboard(health) {
   const c = health.collection;
-  return JSON.stringify({
-    mode: health.mode,
-    tokensScanned: c.tokensScanned,
-    walletsSeen: c.walletsSeen,
-    repeatWallets: c.repeatWallets,
-  });
+  return JSON.stringify({ mode: health.mode, tokensScanned: c.tokensScanned, walletsSeen: c.walletsSeen, repeatWallets: c.repeatWallets });
 }
 
-function createDiscoveryCycleRunner({
-  store,
-  fetchTrending,
-  fetchTopTraders,
-  tokensPerCycle = 2,
-  trendingRefreshMs = 60 * 60 * 1000,
-  now = () => Date.now(),
-  logger = console,
-} = {}) {
-  if (!store || typeof store.summary !== "function" || typeof store.nextToken !== "function") {
-    throw new Error("recurrence store is required");
-  }
-  if (typeof fetchTrending !== "function" || typeof fetchTopTraders !== "function") {
-    throw new Error("fetchTrending and fetchTopTraders are required");
-  }
-
+function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle = 2, trendingRefreshMs = 60 * 60 * 1000, now = () => Date.now(), logger = console } = {}) {
+  if (!store || typeof store.summary !== "function" || typeof store.nextToken !== "function") throw new Error("recurrence store is required");
+  if (typeof fetchTrending !== "function" || typeof fetchTopTraders !== "function") throw new Error("fetchTrending and fetchTopTraders are required");
   let running = false;
   let cycle = 0;
   let lastTrendingAt = store.summary().tokensSeen > 0 ? now() : 0;
@@ -176,10 +159,7 @@ function createDiscoveryCycleRunner({
     const trending = await fetchTrending();
     const intake = store.enqueueTrending(trending);
     lastTrendingAt = now();
-    logger.log(
-      `[recurrence] cycle=${cycle} trending rows=${intake.rows} unique=${intake.uniqueTokens} ` +
-      `new=${intake.added} queue=${store.summary().queuedTokens}`
-    );
+    logger.log(`[recurrence] cycle=${cycle} trending rows=${intake.rows} unique=${intake.uniqueTokens} new=${intake.added} queue=${store.summary().queuedTokens}`);
     return intake;
   }
 
@@ -191,35 +171,24 @@ function createDiscoveryCycleRunner({
     let tokenFailures = 0;
     let throttled = false;
     let trendingRefreshed = false;
-
     try {
       if (store.summary().queuedTokens === 0) {
-        try {
-          await refreshTrending();
-          trendingRefreshed = true;
-        } catch (error) {
+        try { await refreshTrending(); trendingRefreshed = true; }
+        catch (error) {
           throttled = isGlobalGmgnThrottle(error);
           logger.warn(`[recurrence] trending refresh failed: ${String(error?.message || error).slice(0, 1000)}`);
           return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed };
         }
       }
-
       for (let i = 0; i < tokensPerCycle; i += 1) {
         const token = store.nextToken();
         if (!token) break;
         try {
           const traders = await fetchTopTraders(token.token_address);
-          const result = store.ingestTokenTraders({
-            tokenAddress: token.token_address,
-            traders,
-            tokenMeta: safeJson(token.trend_json),
-          });
+          const result = store.ingestTokenTraders({ tokenAddress: token.token_address, traders, tokenMeta: safeJson(token.trend_json) });
           successfulScans += 1;
           const summary = store.summary();
-          logger.log(
-            `[recurrence] trader-scan accepted=${result.accepted} rejected=${result.rejected} ` +
-            `wallets=${summary.walletsSeen} repeats=${summary.repeatWallets} queue=${summary.queuedTokens}`
-          );
+          logger.log(`[recurrence] trader-scan accepted=${result.accepted} rejected=${result.rejected} wallets=${summary.walletsSeen} repeats=${summary.repeatWallets} queue=${summary.queuedTokens}`);
         } catch (error) {
           if (isGlobalGmgnThrottle(error)) {
             throttled = true;
@@ -228,32 +197,22 @@ function createDiscoveryCycleRunner({
           }
           store.markFailed(token.token_address, error);
           tokenFailures += 1;
-          logger.warn(
-            `[recurrence] token trader scan failed; deferring token=${token.token_address}: ` +
-            String(error?.message || error).slice(0, 1000)
-          );
+          logger.warn(`[recurrence] token trader scan failed; deferring token=${token.token_address}: ${String(error?.message || error).slice(0, 1000)}`);
         }
       }
-
       const summary = store.summary();
       const trendingStale = now() - lastTrendingAt >= trendingRefreshMs;
       const queueLow = summary.queuedTokens < tokensPerCycle;
       if (!trendingRefreshed && !throttled && (queueLow || trendingStale)) {
-        try {
-          await refreshTrending();
-          trendingRefreshed = true;
-        } catch (error) {
+        try { await refreshTrending(); trendingRefreshed = true; }
+        catch (error) {
           throttled = isGlobalGmgnThrottle(error);
           logger.warn(`[recurrence] trending refresh deferred: ${String(error?.message || error).slice(0, 1000)}`);
         }
       }
-
       return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed };
-    } finally {
-      running = false;
-    }
+    } finally { running = false; }
   }
-
   return { discoveryCycle };
 }
 
@@ -264,12 +223,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
 
-  const intervalMinutes = clampInt(
-    env.RECURRENCE_INTERVAL_MINUTES,
-    resolveDiscoveryIntervalMinutes(env),
-    5,
-    120
-  );
+  const intervalMinutes = clampInt(env.RECURRENCE_INTERVAL_MINUTES, resolveDiscoveryIntervalMinutes(env), 5, 120);
   const trendingLimit = clampInt(env.RECURRENCE_TRENDING_LIMIT, 50, 10, 100);
   const tokensPerCycle = clampInt(env.RECURRENCE_TOKENS_PER_CYCLE, 2, 1, 3);
   const traderLimit = clampInt(env.RECURRENCE_TRADER_LIMIT, 100, 25, 100);
@@ -278,33 +232,22 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   const minGapMs = clampInt(env.GMGN_MIN_REQUEST_GAP_MS, 12_000, 3_000, 60_000);
   const store = initRecurrenceStore(db, { rescanMs: rescanHours * 60 * 60 * 1000 });
   const dashboardStore = createRecurrenceDashboardStore(db);
+  const phase2Lab = initPhase2WalletLab(db);
   const cli = createCli({ minGapMs });
 
   async function fetchTrending() {
-    return cli([
-      "market", "trending", "--chain", "sol", "--interval", "24h",
-      "--order-by", "volume", "--limit", String(trendingLimit), "--raw",
-    ]);
+    return cli(["market", "trending", "--chain", "sol", "--interval", "24h", "--order-by", "volume", "--limit", String(trendingLimit), "--raw"]);
   }
-
   async function fetchTopTraders(token) {
-    const response = await cli([
-      "token", "traders", "--chain", "sol", "--address", token,
-      "--order-by", "profit", "--direction", "desc",
-      "--limit", String(traderLimit), "--raw",
-    ]);
+    const response = await cli(["token", "traders", "--chain", "sol", "--address", token, "--order-by", "profit", "--direction", "desc", "--limit", String(traderLimit), "--raw"]);
     return unwrapRows(response);
   }
+  async function fetchWalletActivity(wallet) {
+    return cli(["portfolio", "activity", "--chain", "sol", "--wallet", wallet, "--limit", "100", "--raw"]);
+  }
 
-  const runner = createDiscoveryCycleRunner({
-    store,
-    fetchTrending,
-    fetchTopTraders,
-    tokensPerCycle,
-    trendingRefreshMs: trendingRefreshMinutes * 60 * 1000,
-  });
+  const runner = createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle, trendingRefreshMs: trendingRefreshMinutes * 60 * 1000 });
   const discoveryCycle = runner.discoveryCycle;
-
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
   const dashboardActionToken = crypto.randomBytes(24).toString("hex");
@@ -320,40 +263,27 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     res.writeHead(status, { ...privateHeaders, "content-type": "text/plain; charset=utf-8" });
     res.end(message);
   }
-
   function requirePrivateAccess(req, res) {
     const credentials = dashboardCredentials(env);
-    if (!credentials.password) {
-      rejectPrivate(res, 503, "Private Consensus dashboard is disabled. Set DASHBOARD_PASSWORD in Railway.");
-      return false;
-    }
+    if (!credentials.password) { rejectPrivate(res, 503, "Private Consensus dashboard is disabled. Set DASHBOARD_PASSWORD in Railway."); return false; }
     if (!isAuthorized(req, env)) {
-      res.writeHead(401, {
-        ...privateHeaders,
-        "content-type": "text/plain; charset=utf-8",
-        "www-authenticate": 'Basic realm="Consensus private dashboard", charset="UTF-8"',
-      });
+      res.writeHead(401, { ...privateHeaders, "content-type": "text/plain; charset=utf-8", "www-authenticate": 'Basic realm="Consensus private dashboard", charset="UTF-8"' });
       res.end("Authentication required");
       return false;
     }
     return true;
   }
-
-  function redirectNotice(res, message, kind = "success") {
+  function redirectNotice(res, message, kind = "success", base = "/") {
     const query = new URLSearchParams({ notice: String(message).slice(0, 180), kind });
-    res.writeHead(303, { ...privateHeaders, location: `/?${query.toString()}` });
+    res.writeHead(303, { ...privateHeaders, location: `${base}?${query.toString()}` });
     res.end();
   }
 
   const server = http.createServer(async (req, res) => {
     let requestUrl;
     let pathname;
-    try {
-      requestUrl = new URL(req.url, "http://recurrence.local");
-      pathname = requestUrl.pathname;
-    } catch {
-      pathname = req.url;
-    }
+    try { requestUrl = new URL(req.url, "http://recurrence.local"); pathname = requestUrl.pathname; }
+    catch { pathname = req.url; }
 
     if (pathname === "/health" || pathname === "/api/progress") {
       try {
@@ -367,47 +297,66 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
       return;
     }
 
-    const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" ||
-      pathname === "/api/queue" || pathname === "/actions/token/add" || pathname === "/actions/token/cancel";
+    const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" || pathname === "/api/queue" ||
+      pathname === "/actions/token/add" || pathname === "/actions/token/cancel" || pathname === "/phase2" ||
+      pathname === "/api/phase2/wallets" || pathname === "/actions/phase2/analyze" || pathname === "/actions/phase2/label";
     if (privatePath) {
       if (!requirePrivateAccess(req, res)) return;
 
-      if (pathname === "/actions/token/add" || pathname === "/actions/token/cancel") {
-        if (req.method !== "POST") {
-          rejectPrivate(res, 405, "POST required");
+      if (pathname === "/phase2" || pathname === "/api/phase2/wallets") {
+        const items = phase2Lab.list(100);
+        if (pathname === "/api/phase2/wallets") {
+          res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ generatedAt: Date.now(), wallets: items }, null, 2));
           return;
         }
+        const notice = String(requestUrl?.searchParams.get("notice") || "").slice(0, 180);
+        res.writeHead(200, { ...privateHeaders, "content-type": "text/html; charset=utf-8" });
+        res.end(renderPhase2WalletLab(items, dashboardActionToken, notice));
+        return;
+      }
+
+      if (pathname === "/actions/phase2/analyze" || pathname === "/actions/phase2/label") {
+        if (req.method !== "POST") { rejectPrivate(res, 405, "POST required"); return; }
         const contentType = String(req.headers["content-type"] || "").toLowerCase();
-        if (!contentType.startsWith("application/x-www-form-urlencoded")) {
-          rejectPrivate(res, 415, "Form submission required");
-          return;
-        }
+        if (!contentType.startsWith("application/x-www-form-urlencoded")) { rejectPrivate(res, 415, "Form submission required"); return; }
         try {
           const form = await readFormBody(req);
-          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) {
-            rejectPrivate(res, 403, "Invalid dashboard action token");
+          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) { rejectPrivate(res, 403, "Invalid dashboard action token"); return; }
+          const wallet = String(form.get("wallet") || "").trim();
+          if (pathname === "/actions/phase2/label") {
+            const result = phase2Lab.label(wallet, form.get("label"));
+            redirectNotice(res, `Saved ${result.humanLabel} calibration label.`, "success", "/phase2");
             return;
           }
+          const activity = await fetchWalletActivity(wallet);
+          const result = phase2Lab.analyze(wallet, activity);
+          redirectNotice(res, `Analysis complete: ${result.score}/100 with ${result.confidence}% evidence confidence.`, "success", "/phase2");
+          return;
+        } catch (error) {
+          redirectNotice(res, String(error?.message || error).slice(0, 160), "error", "/phase2");
+          return;
+        }
+      }
+
+      if (pathname === "/actions/token/add" || pathname === "/actions/token/cancel") {
+        if (req.method !== "POST") { rejectPrivate(res, 405, "POST required"); return; }
+        const contentType = String(req.headers["content-type"] || "").toLowerCase();
+        if (!contentType.startsWith("application/x-www-form-urlencoded")) { rejectPrivate(res, 415, "Form submission required"); return; }
+        try {
+          const form = await readFormBody(req);
+          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) { rejectPrivate(res, 403, "Invalid dashboard action token"); return; }
           const token = String(form.get("token") || "").trim();
           if (pathname === "/actions/token/add") {
             const result = store.enqueuePriorityToken(token, { source: "dashboard" });
-            queueMicrotask(() => Promise.resolve(discoveryCycle()).catch((error) => {
-              console.warn(`[dashboard] immediate manual scan trigger failed: ${String(error?.message || error).slice(0, 300)}`);
-            }));
+            queueMicrotask(() => Promise.resolve(discoveryCycle()).catch((error) => console.warn(`[dashboard] immediate manual scan trigger failed: ${String(error?.message || error).slice(0, 300)}`)));
             redirectNotice(res, result.added ? "Token added to the priority queue." : "Token re-queued as priority.");
             return;
           }
           const result = dashboardStore.cancelQueuedToken(token);
-          redirectNotice(
-            res,
-            result.cancelled ? "Token removed from the current scan queue." : "Token was not currently queued.",
-            result.cancelled ? "success" : "error"
-          );
+          redirectNotice(res, result.cancelled ? "Token removed from the current scan queue." : "Token was not currently queued.", result.cancelled ? "success" : "error");
           return;
-        } catch (error) {
-          redirectNotice(res, String(error?.message || error).slice(0, 160), "error");
-          return;
-        }
+        } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error"); return; }
       }
 
       try {
@@ -417,7 +366,6 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
         const stats = dashboardStore.stats(store.summary());
         const wallets = dashboardStore.wallets({ minDistinctTokens, limit });
         const queue = dashboardStore.queue({ limit: queueLimit });
-
         if (pathname === "/api/wallets") {
           res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ generatedAt: stats.generatedAt, minDistinctTokens, stats, wallets }, null, 2));
@@ -428,50 +376,25 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
           res.end(JSON.stringify({ generatedAt: stats.generatedAt, stats, queue }, null, 2));
           return;
         }
-
         const notice = String(requestUrl?.searchParams.get("notice") || "").slice(0, 180);
         const noticeKind = requestUrl?.searchParams.get("kind") === "error" ? "error" : "success";
         res.writeHead(200, { ...privateHeaders, "content-type": "text/html; charset=utf-8" });
-        res.end(renderPrivateDashboard(stats, wallets, {
-          queue,
-          minDistinctTokens,
-          csrfToken: dashboardActionToken,
-          notice,
-          noticeKind,
-        }));
-      } catch (error) {
-        rejectPrivate(res, 503, `Dashboard temporarily unavailable: ${String(error?.message || error).slice(0, 200)}`);
-      }
+        res.end(renderPrivateDashboard(stats, wallets, { queue, minDistinctTokens, csrfToken: dashboardActionToken, notice, noticeKind }));
+      } catch (error) { rejectPrivate(res, 503, `Dashboard temporarily unavailable: ${String(error?.message || error).slice(0, 200)}`); }
       return;
     }
-
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     res.end("Not found");
   });
 
   server.listen(port, host, () => {
-    console.log(
-      `[recurrence] listening on ${host}:${server.address()?.port || port}; interval=${intervalMinutes}m; ` +
-      `trending=${trendingLimit}; scans/cycle=${tokensPerCycle}; top-traders=${traderLimit}; ` +
-      `rescan=${rescanHours}h; trending-refresh=${trendingRefreshMinutes}m`
-    );
+    console.log(`[recurrence] listening on ${host}:${server.address()?.port || port}; interval=${intervalMinutes}m; trending=${trendingLimit}; scans/cycle=${tokensPerCycle}; top-traders=${traderLimit}; rescan=${rescanHours}h; trending-refresh=${trendingRefreshMinutes}m`);
   });
   queueMicrotask(() => discoveryCycle());
   const timer = setInterval(discoveryCycle, intervalMinutes * 60 * 1000);
   timer.unref?.();
   server.once("close", () => clearInterval(timer));
-
-  return { db, server, store, dashboardStore, discoveryCycle };
+  return { db, server, store, dashboardStore, phase2Lab, discoveryCycle };
 }
 
-module.exports = {
-  clampInt,
-  createCli,
-  createDiscoveryCycleRunner,
-  isGlobalGmgnThrottle,
-  publicHealth,
-  readFormBody,
-  renderDashboard,
-  safeTokenEqual,
-  startRecurrenceApp,
-};
+module.exports = { clampInt, createCli, createDiscoveryCycleRunner, isGlobalGmgnThrottle, publicHealth, readFormBody, renderDashboard, safeTokenEqual, startRecurrenceApp };
