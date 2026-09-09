@@ -1,6 +1,7 @@
 "use strict";
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const { selectRecurrenceToken } = require("./recurrence-selection");
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -122,6 +123,26 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   ensureColumn(db, "recurrence_token_queue", "priority", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "recurrence_token_queue", "source", "TEXT NOT NULL DEFAULT 'trending'");
   ensureColumn(db, "recurrence_token_queue", "priority_queued_at", "INTEGER");
+  ensureColumn(db, "recurrence_token_queue", "opportunity_score", "REAL NOT NULL DEFAULT 0");
+  ensureColumn(db, "recurrence_token_queue", "selection_reason", "TEXT");
+  const updateSelection = db.prepare(`
+    UPDATE recurrence_token_queue SET opportunity_score = ?, selection_reason = ?,
+      status = CASE
+        WHEN priority > 0 OR status IN ('done', 'cancelled') THEN status
+        WHEN ? = 0 THEN 'filtered'
+        WHEN status = 'filtered' THEN 'pending'
+        ELSE status END
+    WHERE token_address = ?
+  `);
+  // Re-evaluate saved metadata on upgrade without deleting tokens or evidence.
+  db.transaction(() => {
+    for (const token of db.prepare("SELECT * FROM recurrence_token_queue").all()) {
+      let meta = {};
+      try { meta = JSON.parse(token.trend_json); } catch {}
+      const selection = selectRecurrenceToken(meta, token.last_seen_at);
+      updateSelection.run(selection.score, selection.reason, Number(selection.eligible), token.token_address);
+    }
+  })();
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_recurrence_token_queue_status
       ON recurrence_token_queue(status, priority DESC, first_seen_at ASC);
@@ -142,6 +163,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     UPDATE recurrence_token_queue
     SET last_seen_at = ?, trend_json = ?,
         status = CASE
+          WHEN status = 'cancelled' THEN 'cancelled'
           WHEN status = 'failed' THEN 'failed'
           WHEN last_scanned_at IS NULL OR last_scanned_at <= ? THEN 'pending'
           ELSE status
@@ -164,6 +186,8 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
         WHEN status = 'failed' AND priority > 0 THEN 2
         ELSE 3
       END,
+      CASE WHEN priority = 0 THEN CASE WHEN scan_count = 0 THEN 0 ELSE 1 END END,
+      CASE WHEN priority = 0 THEN opportunity_score END DESC,
       CASE WHEN priority > 0 THEN COALESCE(priority_queued_at, first_seen_at) ELSE first_seen_at END ASC,
       last_seen_at ASC
     LIMIT 1
@@ -236,6 +260,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     let added = 0;
     let refreshed = 0;
     let invalid = 0;
+    const rejected = {};
     for (const row of rows) {
       const address = tokenAddress(row);
       if (!address) { invalid += 1; continue; }
@@ -243,6 +268,8 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       seen.add(address);
       const existing = getToken.get(address);
       const trendJson = JSON.stringify(row);
+      const selection = selectRecurrenceToken(row, observedAt);
+      if (!selection.eligible) rejected[selection.reason] = (rejected[selection.reason] || 0) + 1;
       if (!existing) {
         insertToken.run(address, observedAt, observedAt, trendJson);
         added += 1;
@@ -250,8 +277,9 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
         updateTokenSeen.run(observedAt, trendJson, observedAt - rescanMs, address);
         refreshed += 1;
       }
+      updateSelection.run(selection.score, selection.reason, Number(selection.eligible), address);
     }
-    return { rows: rows.length, uniqueTokens: seen.size, added, refreshed, invalid };
+    return { rows: rows.length, uniqueTokens: seen.size, added, refreshed, invalid, rejected };
   }
 
   function enqueuePriorityToken(address, { observedAt = Date.now(), source = "discord" } = {}) {
