@@ -7,7 +7,8 @@ const { initRecurrenceStore } = require("../src/recurrence-discovery");
 const { initPhase2WalletLab, scoreWalletActivity } = require("../src/phase2-wallet-lab");
 
 const WALLET = "A".repeat(32);
-const TOKENS = Array.from({ length: 12 }, (_, i) => String.fromCharCode(66 + i).repeat(32));
+const TOKEN_CHARS = ["B","C","D","E","F","G","H","J","K","L","M","N"];
+const TOKENS = TOKEN_CHARS.map((char) => char.repeat(32));
 
 function activity() {
   const list = [];
