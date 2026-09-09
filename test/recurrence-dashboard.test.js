@@ -9,6 +9,7 @@ const {
   createRecurrenceDashboardStore,
   dashboardCredentials,
   isAuthorized,
+  renderPrivateDashboard,
 } = require("../src/recurrence-dashboard");
 
 const TOKEN_A = "A".repeat(32);
@@ -53,6 +54,74 @@ test("private dashboard surfaces exact recurring-wallet candidates and last-hour
   assert.equal(wallets[0].top10Tokens, 3);
   assert.equal(activityState(stats).active, true);
   db.close();
+});
+
+test("dashboard lists queue in scanner order and can remove queued work without deleting evidence", () => {
+  const now = 5_000_000;
+  const db = new Database(":memory:");
+  const recurrence = initRecurrenceStore(db);
+  recurrence.enqueueTrending({ data: { list: [
+    { address: TOKEN_A, symbol: "AAA" },
+    { address: TOKEN_B, symbol: "BBB" },
+  ] } }, now - 20_000);
+  recurrence.enqueuePriorityToken(TOKEN_C, { observedAt: now - 5_000, source: "dashboard" });
+
+  const dashboard = createRecurrenceDashboardStore(db, { now: () => now });
+  let queue = dashboard.queue();
+  assert.equal(queue.length, 3);
+  assert.equal(queue[0].tokenAddress, TOKEN_C);
+  assert.equal(queue[0].priority, true);
+  assert.equal(queue[0].source, "dashboard");
+  assert.equal(queue[1].label, "AAA");
+
+  const cancelled = dashboard.cancelQueuedToken(TOKEN_C);
+  assert.equal(cancelled.cancelled, true);
+  assert.equal(recurrence.summary().queuedTokens, 2);
+  queue = dashboard.queue();
+  assert.equal(queue.some((row) => row.tokenAddress === TOKEN_C), false);
+
+  recurrence.enqueuePriorityToken(TOKEN_C, { observedAt: now, source: "dashboard" });
+  assert.equal(recurrence.nextToken().token_address, TOKEN_C);
+  db.close();
+});
+
+test("dashboard HTML includes queue controls and recurrence threshold filters", () => {
+  const stats = {
+    generatedAt: 10_000,
+    lastScanAt: 9_000,
+    tokensScanned: 12,
+    scansLastHour: 4,
+    queuedTokens: 1,
+    priorityQueuedTokens: 1,
+    walletsSeen: 100,
+    walletTokenLinks: 110,
+    repeatWallets: 8,
+    reviewWallets: 2,
+  };
+  const html = renderPrivateDashboard(stats, [], {
+    minDistinctTokens: 2,
+    csrfToken: "csrf-test",
+    queue: [{
+      tokenAddress: TOKEN_A,
+      label: "AAA",
+      status: "pending",
+      priority: true,
+      source: "dashboard",
+      firstSeenAt: 8_000,
+      lastSeenAt: 9_000,
+      lastScannedAt: null,
+      scanCount: 0,
+      lastError: null,
+      priorityQueuedAt: 9_000,
+    }],
+  });
+
+  assert.match(html, /Add priority scan/);
+  assert.match(html, /actions\/token\/cancel/);
+  assert.match(html, /csrf-test/);
+  assert.match(html, /Recurring wallets — 2\+ distinct tokens/);
+  assert.match(html, /href="\/\?min=3"/);
+  assert.match(html, new RegExp(TOKEN_A));
 });
 
 test("dashboard basic auth fails closed without password and accepts exact credentials", () => {
