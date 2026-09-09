@@ -85,7 +85,28 @@ test("dashboard lists queue in scanner order and can remove queued work without 
   db.close();
 });
 
-test("dashboard HTML includes queue controls and recurrence threshold filters", () => {
+test("recently completed scans remain visible after leaving the pending queue", () => {
+  const now = 6_000_000;
+  const db = new Database(":memory:");
+  const recurrence = initRecurrenceStore(db);
+  recurrence.enqueuePriorityToken(TOKEN_A, { observedAt: now - 10_000, source: "dashboard" });
+  recurrence.enqueuePriorityToken(TOKEN_B, { observedAt: now - 9_000, source: "dashboard" });
+  recurrence.enqueuePriorityToken(TOKEN_C, { observedAt: now - 8_000, source: "dashboard" });
+
+  recurrence.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: now - 2_000, traders: [trader(WALLET_REPEAT)] });
+  recurrence.ingestTokenTraders({ tokenAddress: TOKEN_B, observedAt: now - 1_000, traders: [trader(WALLET_OTHER)] });
+
+  const dashboard = createRecurrenceDashboardStore(db, { now: () => now });
+  const activity = dashboard.queue();
+  assert.equal(recurrence.summary().queuedTokens, 1);
+  assert.equal(activity[0].tokenAddress, TOKEN_C);
+  assert.equal(activity[0].status, "pending");
+  assert.equal(activity.some((row) => row.tokenAddress === TOKEN_A && row.status === "done"), true);
+  assert.equal(activity.some((row) => row.tokenAddress === TOKEN_B && row.status === "done"), true);
+  db.close();
+});
+
+test("dashboard HTML includes queue controls, completed state and recurrence threshold filters", () => {
   const stats = {
     generatedAt: 10_000,
     lastScanAt: 9_000,
@@ -113,15 +134,31 @@ test("dashboard HTML includes queue controls and recurrence threshold filters", 
       scanCount: 0,
       lastError: null,
       priorityQueuedAt: 9_000,
+    }, {
+      tokenAddress: TOKEN_B,
+      label: "BBB",
+      status: "done",
+      priority: false,
+      source: "dashboard",
+      firstSeenAt: 7_000,
+      lastSeenAt: 9_000,
+      lastScannedAt: 9_500,
+      scanCount: 1,
+      lastError: null,
+      priorityQueuedAt: null,
     }],
   });
 
   assert.match(html, /Add priority scan/);
   assert.match(html, /actions\/token\/cancel/);
   assert.match(html, /csrf-test/);
+  assert.match(html, /Scanner queue & recent activity/);
+  assert.match(html, />scanned</);
+  assert.match(html, />completed</);
   assert.match(html, /Recurring wallets — 2\+ distinct tokens/);
   assert.match(html, /href="\/\?min=3"/);
   assert.match(html, new RegExp(TOKEN_A));
+  assert.match(html, new RegExp(TOKEN_B));
 });
 
 test("dashboard basic auth fails closed without password and accepts exact credentials", () => {
