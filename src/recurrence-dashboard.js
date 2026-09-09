@@ -2,6 +2,8 @@
 
 const crypto = require("crypto");
 
+const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
 function num(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -19,6 +21,15 @@ function escapeHtml(value) {
 function formatTime(timestamp) {
   if (!timestamp) return "Not yet";
   return new Date(timestamp).toISOString().replace("T", " ").replace(".000Z", " UTC");
+}
+
+function formatAge(timestamp, now = Date.now()) {
+  if (!timestamp) return "—";
+  const ms = Math.max(0, now - Number(timestamp));
+  if (ms < 60_000) return "<1m";
+  if (ms < 60 * 60_000) return `${Math.floor(ms / 60_000)}m`;
+  if (ms < 24 * 60 * 60_000) return `${Math.floor(ms / (60 * 60_000))}h`;
+  return `${Math.floor(ms / (24 * 60 * 60_000))}d`;
 }
 
 function safeEqual(left, right) {
@@ -83,6 +94,35 @@ function createRecurrenceDashboardStore(db, { now = () => Date.now() } = {}) {
     ORDER BY distinct_tokens DESC, top10_tokens DESC, average_best_rank ASC, last_seen_at DESC
     LIMIT ?
   `);
+  const queuedTokens = db.prepare(`
+    SELECT token_address, status, priority, source, first_seen_at, last_seen_at,
+      last_scanned_at, scan_count, last_error, priority_queued_at, trend_json
+    FROM recurrence_token_queue
+    WHERE status IN ('pending', 'failed')
+    ORDER BY
+      CASE
+        WHEN status = 'pending' AND priority > 0 THEN 0
+        WHEN status = 'pending' THEN 1
+        WHEN status = 'failed' AND priority > 0 THEN 2
+        ELSE 3
+      END,
+      CASE WHEN priority > 0 THEN COALESCE(priority_queued_at, first_seen_at) ELSE first_seen_at END ASC,
+      last_seen_at ASC
+    LIMIT ?
+  `);
+  const cancelQueuedToken = db.prepare(`
+    UPDATE recurrence_token_queue
+    SET status = 'cancelled', priority = 0, priority_queued_at = NULL, last_error = NULL
+    WHERE token_address = ? AND status IN ('pending', 'failed')
+  `);
+
+  function tokenLabel(row) {
+    let meta = {};
+    try { meta = JSON.parse(String(row.trend_json || "{}")); } catch {}
+    const symbol = meta?.symbol || meta?.token?.symbol || meta?.base_token?.symbol || null;
+    const name = meta?.name || meta?.token?.name || meta?.base_token?.name || null;
+    return [symbol, name].filter(Boolean).map(String).join(" · ").slice(0, 120);
+  }
 
   return {
     stats(summary) {
@@ -113,6 +153,28 @@ function createRecurrenceDashboardStore(db, { now = () => Date.now() } = {}) {
         everInsider: Boolean(row.ever_insider),
       }));
     },
+    queue({ limit = 100 } = {}) {
+      const bounded = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+      return queuedTokens.all(bounded).map((row) => ({
+        tokenAddress: row.token_address,
+        label: tokenLabel(row),
+        status: row.status,
+        priority: Boolean(row.priority),
+        source: String(row.source || "trending"),
+        firstSeenAt: num(row.first_seen_at),
+        lastSeenAt: num(row.last_seen_at),
+        lastScannedAt: row.last_scanned_at == null ? null : num(row.last_scanned_at),
+        scanCount: num(row.scan_count),
+        lastError: row.last_error ? String(row.last_error).slice(0, 240) : null,
+        priorityQueuedAt: row.priority_queued_at == null ? null : num(row.priority_queued_at),
+      }));
+    },
+    cancelQueuedToken(address) {
+      const token = String(address || "").trim();
+      if (!SOL_ADDR.test(token)) throw new Error("valid token address is required");
+      const result = cancelQueuedToken.run(token);
+      return { tokenAddress: token, cancelled: result.changes > 0 };
+    },
   };
 }
 
@@ -124,26 +186,49 @@ function activityState(stats, { activeWindowMs = 30 * 60 * 1000 } = {}) {
     : { active: false, label: "INACTIVE", reason: `Last scan ${Math.floor(ageMs / 60000)}m ago` };
 }
 
-function renderPrivateDashboard(stats, wallets) {
+function renderPrivateDashboard(stats, wallets, {
+  queue = [],
+  minDistinctTokens = 3,
+  csrfToken = "",
+  notice = "",
+  noticeKind = "success",
+} = {}) {
   const activity = activityState(stats);
-  const rows = wallets.length ? wallets.map((wallet, index) => {
+  const walletRows = wallets.length ? wallets.map((wallet, index) => {
     const flags = [wallet.everCreator ? "creator" : null, wallet.everInsider ? "insider" : null].filter(Boolean).join(", ") || "—";
-    return `<tr><td>${index + 1}</td><td class="wallet"><a href="https://solscan.io/account/${encodeURIComponent(wallet.walletAddress)}" target="_blank" rel="noreferrer">${escapeHtml(wallet.walletAddress)}</a></td><td><strong>${wallet.distinctTokens}</strong></td><td>${wallet.totalAppearances}</td><td>${wallet.top10Tokens}</td><td>${wallet.top25Tokens}</td><td>${wallet.bestRank}</td><td>${wallet.averageBestRank == null ? "—" : escapeHtml(wallet.averageBestRank)}</td><td>${escapeHtml(flags)}</td><td>${escapeHtml(formatTime(wallet.lastSeenAt))}</td></tr>`;
-  }).join("") : '<tr><td colspan="10">No wallets have reached 3 distinct top-trader appearances yet.</td></tr>';
+    return `<tr><td>${index + 1}</td><td class="mono"><a href="https://solscan.io/account/${encodeURIComponent(wallet.walletAddress)}" target="_blank" rel="noreferrer">${escapeHtml(wallet.walletAddress)}</a></td><td><strong>${wallet.distinctTokens}</strong></td><td>${wallet.totalAppearances}</td><td>${wallet.top10Tokens}</td><td>${wallet.top25Tokens}</td><td>${wallet.bestRank}</td><td>${wallet.averageBestRank == null ? "—" : escapeHtml(wallet.averageBestRank)}</td><td>${escapeHtml(flags)}</td><td>${escapeHtml(formatTime(wallet.lastSeenAt))}</td></tr>`;
+  }).join("") : `<tr><td colspan="10">No wallets have reached ${minDistinctTokens}+ distinct token appearances yet.</td></tr>`;
+
+  const queueRows = queue.length ? queue.map((token, index) => {
+    const statusClass = token.status === "failed" ? "badge warn" : token.priority ? "badge priority" : "badge";
+    const statusText = token.priority ? "priority" : token.status;
+    const error = token.lastError ? `<div class="error-text" title="${escapeHtml(token.lastError)}">${escapeHtml(token.lastError)}</div>` : "";
+    const label = token.label ? `<div class="token-label">${escapeHtml(token.label)}</div>` : "";
+    return `<tr><td>${index + 1}</td><td class="mono"><a href="https://solscan.io/token/${encodeURIComponent(token.tokenAddress)}" target="_blank" rel="noreferrer">${escapeHtml(token.tokenAddress)}</a>${label}</td><td><span class="${statusClass}">${escapeHtml(statusText)}</span></td><td>${escapeHtml(token.source)}</td><td>${token.scanCount}</td><td>${escapeHtml(formatAge(token.priorityQueuedAt || token.firstSeenAt, stats.generatedAt))}</td><td>${escapeHtml(formatAge(token.lastSeenAt, stats.generatedAt))}${error}</td><td><form method="post" action="/actions/token/cancel"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="token" value="${escapeHtml(token.tokenAddress)}"><button class="button danger" type="submit">Remove</button></form></td></tr>`;
+  }).join("") : '<tr><td colspan="8">Queue is empty.</td></tr>';
 
   const cards = [
     ["Scanner", `<span class="${activity.active ? "active" : "inactive"}">${activity.label}</span><div class="small">${escapeHtml(activity.reason)}</div>`],
     ["Tokens scanned", stats.tokensScanned],
     ["Scanned / last hour", stats.scansLastHour],
     ["Queued tokens", stats.queuedTokens],
-    ["Discord priority queued", stats.priorityQueuedTokens || 0],
+    ["Priority queued", stats.priorityQueuedTokens || 0],
     ["Unique wallets", stats.walletsSeen],
     ["Wallet/token links", stats.walletTokenLinks],
     ["Recurring wallets 2+", stats.repeatWallets],
     ["Review wallets 3+", stats.reviewWallets],
   ];
 
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>Consensus Phase 1</title><style>:root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif}body{margin:0;background:#0d1117;color:#e6edf3}main{max-width:1320px;margin:0 auto;padding:28px 20px 48px}h1{margin:0 0 6px}.muted,.small{color:#8b949e}.small{font-size:12px;margin-top:5px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:24px 0}.card{border:1px solid #30363d;border-radius:10px;background:#161b22;padding:16px}.label{font-size:13px;color:#8b949e}.value{font-size:27px;font-weight:700;margin-top:6px}.active{color:#3fb950}.inactive{color:#f85149}.table-wrap{overflow-x:auto;border:1px solid #30363d;border-radius:10px;background:#161b22}table{width:100%;min-width:1100px;border-collapse:collapse}th,td{padding:11px;border-bottom:1px solid #30363d;text-align:left;font-size:13px;white-space:nowrap}th{color:#8b949e}.wallet{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}a{color:#58a6ff}</style></head><body><main><h1>Consensus — Phase 1</h1><p class="muted">Private recurrence database view. Auto-refreshes every 30 seconds.</p><div class="grid">${cards.map(([label, value]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${value}</div></div>`).join("")}</div><h2>Recurring wallets — 3+ distinct tokens</h2><p class="muted">These are candidates for manual review only. Recurrence is not yet a trust score. Creator/insider flags are shown rather than silently removed.</p><div class="table-wrap"><table><thead><tr><th>#</th><th>Wallet</th><th>Distinct tokens</th><th>Appearances</th><th>Top 10</th><th>Top 25</th><th>Best rank</th><th>Avg best rank</th><th>Flags</th><th>Last seen</th></tr></thead><tbody>${rows}</tbody></table></div><p class="muted">Private JSON: <a href="/api/wallets">/api/wallets</a>. Public health remains identity-free at <a href="/health">/health</a>.</p></main></body></html>`;
+  const thresholds = [2, 3, 5, 10].map((value) =>
+    `<a class="filter ${Number(minDistinctTokens) === value ? "selected" : ""}" href="/?min=${value}">${value}+</a>`
+  ).join("");
+  const noticeHtml = notice
+    ? `<div class="notice ${noticeKind === "error" ? "notice-error" : "notice-ok"}">${escapeHtml(notice)}</div>`
+    : "";
+
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>Consensus Phase 1</title><style>
+:root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--bg:#0a0f16;--panel:#121923;--panel2:#0f151e;--border:#263241;--text:#edf3f8;--muted:#8ea0b4;--link:#62adff;--green:#42d37c;--red:#ff6875;--amber:#f1bd57;--purple:#b69cff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -10%,#172237 0,transparent 34%),var(--bg);color:var(--text)}main{max-width:1480px;margin:0 auto;padding:28px 24px 64px}h1{margin:0;font-size:30px;letter-spacing:-.5px}h2{margin:0;font-size:20px}.header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.muted,.small{color:var(--muted)}.small{font-size:12px;margin-top:5px}.eyebrow{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.13em;margin-bottom:7px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:22px 0}.card,.panel{border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,var(--panel),var(--panel2));box-shadow:0 8px 28px rgba(0,0,0,.16)}.card{padding:16px}.label{font-size:12px;color:var(--muted)}.value{font-size:27px;font-weight:750;margin-top:7px}.active{color:var(--green)}.inactive{color:var(--red)}.panel{padding:20px;margin-top:18px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.section-head p{margin:5px 0 0}.queue-form{display:flex;gap:10px;align-items:center;margin:14px 0 18px}.queue-form input[type=text]{flex:1;min-width:220px;background:#0a111a;color:var(--text);border:1px solid #334154;border-radius:10px;padding:11px 12px;font:inherit}.button{border:1px solid #3d536c;background:#182536;color:var(--text);padding:9px 12px;border-radius:9px;font-weight:650;cursor:pointer}.button:hover{border-color:#6783a2}.button.primary{background:#1c5ca0;border-color:#2876c7}.button.danger{background:#29171b;border-color:#66313b;color:#ffb3bb;padding:6px 9px;font-size:12px}.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:11px;background:#0c121a}table{width:100%;min-width:1050px;border-collapse:collapse}th,td{padding:11px 12px;border-bottom:1px solid #1f2a37;text-align:left;font-size:12.5px;white-space:nowrap;vertical-align:middle}th{color:#91a4b8;background:#0f1721;font-weight:650}tr:last-child td{border-bottom:0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.mono a{word-break:break-all}.token-label{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:var(--muted);font-size:11px;margin-top:4px}.badge{display:inline-flex;border:1px solid #3d526a;background:#172331;border-radius:999px;padding:3px 8px;color:#b8c8d8}.badge.priority{border-color:#6355a2;background:#211d38;color:#d5c9ff}.badge.warn{border-color:#6b5631;background:#2a2112;color:#ffd88b}.error-text{max-width:260px;overflow:hidden;text-overflow:ellipsis;color:#e9a4aa;margin-top:4px}.filters{display:flex;gap:7px;flex-wrap:wrap}.filter{display:inline-block;text-decoration:none;color:#a9bbce;border:1px solid #334154;background:#111a25;padding:6px 10px;border-radius:999px;font-size:12px}.filter.selected{background:#1a4d7e;border-color:#3476b4;color:white}a{color:var(--link)}.notice{margin:18px 0 0;border-radius:10px;padding:10px 12px;font-size:13px}.notice-ok{border:1px solid #285f41;background:#10271b;color:#aee8c5}.notice-error{border:1px solid #6c303a;background:#2a1217;color:#ffb6bf}.footer{margin-top:18px;font-size:12px;color:var(--muted)}@media(max-width:700px){main{padding:20px 14px 48px}.header,.section-head,.queue-form{align-items:stretch;flex-direction:column}.queue-form input[type=text]{width:100%}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.value{font-size:23px}}
+</style></head><body><main><div class="header"><div><div class="eyebrow">Private control panel</div><h1>Consensus — Phase 1</h1><p class="muted">Recurrence collection, queue control and wallet review. Auto-refreshes every 30 seconds.</p></div><div class="badge ${activity.active ? "priority" : "warn"}">${activity.label}</div></div>${noticeHtml}<div class="grid">${cards.map(([label, value]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${value}</div></div>`).join("")}</div><section class="panel"><div class="section-head"><div><h2>Token queue</h2><p class="muted">Manual additions become priority scans. Removing a token stops it from being selected but keeps any historical wallet evidence.</p></div><a href="/api/queue">Queue JSON</a></div><form class="queue-form" method="post" action="/actions/token/add"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><input type="text" name="token" maxlength="44" autocomplete="off" spellcheck="false" placeholder="Paste a Solana token CA" required><button class="button primary" type="submit">Add priority scan</button></form><div class="table-wrap"><table><thead><tr><th>#</th><th>Token</th><th>State</th><th>Source</th><th>Scans</th><th>Queued age</th><th>Last seen</th><th></th></tr></thead><tbody>${queueRows}</tbody></table></div></section><section class="panel"><div class="section-head"><div><h2>Recurring wallets — ${minDistinctTokens}+ distinct tokens</h2><p class="muted">Recurrence is a discovery signal, not yet a trust score. Creator/insider flags remain visible.</p></div><div class="filters">${thresholds}</div></div><div class="table-wrap"><table><thead><tr><th>#</th><th>Wallet</th><th>Distinct tokens</th><th>Appearances</th><th>Top 10</th><th>Top 25</th><th>Best rank</th><th>Avg best rank</th><th>Flags</th><th>Last seen</th></tr></thead><tbody>${walletRows}</tbody></table></div></section><div class="footer">Private data: <a href="/api/wallets?min=${encodeURIComponent(minDistinctTokens)}">wallet JSON</a> · <a href="/api/queue">queue JSON</a> · public identity-free status: <a href="/health">health</a></div></main></body></html>`;
 }
 
 module.exports = {
