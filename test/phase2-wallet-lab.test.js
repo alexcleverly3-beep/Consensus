@@ -4,7 +4,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 const { initRecurrenceStore } = require("../src/recurrence-discovery");
-const { initPhase2WalletLab, scoreWalletActivity } = require("../src/phase2-wallet-lab");
+const { initPhase2WalletLab, renderPhase2WalletLab, scoreWalletActivity } = require("../src/phase2-wallet-lab");
+const { createRecurrenceDashboardStore } = require("../src/recurrence-dashboard");
 
 const WALLET = "A".repeat(32);
 const TOKEN_CHARS = ["B","C","D","E","F","G","H","J","K","L","M","N"];
@@ -58,5 +59,24 @@ test("known-good label survives re-analysis and is not used to inflate the score
   assert.equal(after.score, before);
   assert.equal(after.humanLabel, "good");
   assert.equal(lab.list()[0].humanLabel, "good");
+  db.close();
+});
+
+test("phase2 cards share the private checked marker without changing calibration", () => {
+  const db = new Database(":memory:");
+  initRecurrenceStore(db);
+  const lab = initPhase2WalletLab(db, { now: () => 123456 });
+  lab.analyze(WALLET, activity());
+  createRecurrenceDashboardStore(db, { now: () => 123999 }).setWalletChecked(WALLET, true);
+
+  const item = lab.list()[0];
+  assert.equal(item.checked, true);
+  assert.equal(item.checkedAt, 123999);
+  assert.equal(item.humanLabel, "unsure");
+  const html = renderPhase2WalletLab([item], "csrf-test");
+  assert.match(html, /action="\/actions\/wallet\/checked"/);
+  assert.match(html, /name="returnTo" value="\/phase2"/);
+  assert.match(html, /name="checked" value="0"/);
+  assert.match(html, /✓ Checked/);
   db.close();
 });
