@@ -124,6 +124,8 @@ function createRecurrenceDashboardStore(db, { now = () => Date.now() } = {}) {
         WHEN status = 'failed' THEN 3
         ELSE 4
       END,
+      CASE WHEN priority = 0 AND status != 'done' THEN CASE WHEN scan_count = 0 THEN 0 ELSE 1 END END,
+      CASE WHEN priority = 0 AND status != 'done' THEN opportunity_score END DESC,
       CASE WHEN status = 'done' THEN last_scanned_at END DESC,
       CASE WHEN priority > 0 THEN COALESCE(priority_queued_at, first_seen_at) ELSE first_seen_at END ASC,
       last_seen_at ASC

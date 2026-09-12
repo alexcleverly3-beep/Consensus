@@ -148,7 +148,7 @@ function renderDashboard(health) {
   return JSON.stringify({ mode: health.mode, tokensScanned: c.tokensScanned, walletsSeen: c.walletsSeen, repeatWallets: c.repeatWallets });
 }
 
-function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle = 2, trendingRefreshMs = 60 * 60 * 1000, now = () => Date.now(), logger = console } = {}) {
+function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle = 2, trendingRefreshMs = 60 * 60 * 1000, gmgnGuard = null, now = () => Date.now(), logger = console } = {}) {
   if (!store || typeof store.summary !== "function" || typeof store.nextToken !== "function") throw new Error("recurrence store is required");
   if (typeof fetchTrending !== "function" || typeof fetchTopTraders !== "function") throw new Error("fetchTrending and fetchTopTraders are required");
   let running = false;
@@ -180,7 +180,10 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
           return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed };
         }
       }
-      for (let i = 0; i < tokensPerCycle; i += 1) {
+      const budget = typeof gmgnGuard?.snapshot === "function" ? gmgnGuard.snapshot() : null;
+      const availableScans = budget ? Math.max(0, Number(budget.remaining || 0)) : tokensPerCycle;
+      const cycleLimit = Math.min(tokensPerCycle, availableScans);
+      for (let i = 0; i < cycleLimit; i += 1) {
         const token = store.nextToken();
         if (!token) break;
         try {
@@ -225,7 +228,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 
   const intervalMinutes = clampInt(env.RECURRENCE_INTERVAL_MINUTES, resolveDiscoveryIntervalMinutes(env), 5, 120);
   const trendingLimit = clampInt(env.RECURRENCE_TRENDING_LIMIT, 50, 10, 100);
-  const tokensPerCycle = clampInt(env.RECURRENCE_TOKENS_PER_CYCLE, 2, 1, 3);
+  const tokensPerCycle = clampInt(env.RECURRENCE_TOKENS_PER_CYCLE, 3, 1, 3);
   const traderLimit = clampInt(env.RECURRENCE_TRADER_LIMIT, 100, 25, 100);
   const rescanHours = clampInt(env.RECURRENCE_RESCAN_HOURS, 24, 6, 168);
   const trendingRefreshMinutes = clampInt(env.RECURRENCE_TRENDING_REFRESH_MINUTES, 60, 15, 360);
@@ -246,7 +249,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     return cli(["portfolio", "activity", "--chain", "sol", "--wallet", wallet, "--limit", "100", "--raw"]);
   }
 
-  const runner = createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle, trendingRefreshMs: trendingRefreshMinutes * 60 * 1000 });
+  const runner = createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle, gmgnGuard, trendingRefreshMs: trendingRefreshMinutes * 60 * 1000 });
   const discoveryCycle = runner.discoveryCycle;
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
