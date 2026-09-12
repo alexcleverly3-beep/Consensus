@@ -52,7 +52,34 @@ test("private dashboard surfaces exact recurring-wallet candidates and last-hour
   assert.equal(wallets[0].walletAddress, WALLET_REPEAT);
   assert.equal(wallets[0].distinctTokens, 3);
   assert.equal(wallets[0].top10Tokens, 3);
+  assert.equal(wallets[0].checked, false);
   assert.equal(activityState(stats).active, true);
+  db.close();
+});
+
+test("wallet checked state persists independently from discovery evidence", () => {
+  let now = 7_000_000;
+  const db = new Database(":memory:");
+  const recurrence = initRecurrenceStore(db);
+  recurrence.enqueueTrending({ data: { list: [{ address: TOKEN_A }, { address: TOKEN_B }] } }, now - 10_000);
+  recurrence.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: now - 2_000, traders: [trader(WALLET_REPEAT)] });
+  recurrence.ingestTokenTraders({ tokenAddress: TOKEN_B, observedAt: now - 1_000, traders: [trader(WALLET_REPEAT)] });
+
+  let dashboard = createRecurrenceDashboardStore(db, { now: () => now });
+  assert.deepEqual(dashboard.setWalletChecked(WALLET_REPEAT, true), { walletAddress: WALLET_REPEAT, checked: true });
+  let wallet = dashboard.wallets({ minDistinctTokens: 2 })[0];
+  assert.equal(wallet.checked, true);
+  assert.equal(wallet.checkedAt, now);
+  assert.equal(wallet.distinctTokens, 2);
+
+  now += 1_000;
+  dashboard = createRecurrenceDashboardStore(db, { now: () => now });
+  assert.equal(dashboard.wallets({ minDistinctTokens: 2 })[0].checked, true);
+  dashboard.setWalletChecked(WALLET_REPEAT, false);
+  wallet = dashboard.wallets({ minDistinctTokens: 2 })[0];
+  assert.equal(wallet.checked, false);
+  assert.equal(wallet.checkedAt, null);
+  assert.equal(wallet.distinctTokens, 2);
   db.close();
 });
 
@@ -106,7 +133,7 @@ test("recently completed scans remain visible after leaving the pending queue", 
   db.close();
 });
 
-test("dashboard HTML includes queue controls, completed state and recurrence threshold filters", () => {
+test("dashboard HTML includes queue controls, wallet check controls and recurrence threshold filters", () => {
   const stats = {
     generatedAt: 10_000,
     lastScanAt: 9_000,
@@ -119,7 +146,20 @@ test("dashboard HTML includes queue controls, completed state and recurrence thr
     repeatWallets: 8,
     reviewWallets: 2,
   };
-  const html = renderPrivateDashboard(stats, [], {
+  const html = renderPrivateDashboard(stats, [{
+    walletAddress: WALLET_REPEAT,
+    distinctTokens: 3,
+    totalAppearances: 5,
+    top10Tokens: 2,
+    top25Tokens: 3,
+    bestRank: 2,
+    averageBestRank: 7.5,
+    lastSeenAt: 9_000,
+    everCreator: false,
+    everInsider: false,
+    checked: true,
+    checkedAt: 8_000,
+  }], {
     minDistinctTokens: 2,
     csrfToken: "csrf-test",
     queue: [{
@@ -157,6 +197,11 @@ test("dashboard HTML includes queue controls, completed state and recurrence thr
   assert.match(html, />completed</);
   assert.match(html, /Recurring wallets — 2\+ distinct tokens/);
   assert.match(html, /href="\/\?min=3"/);
+  assert.match(html, /action="\/actions\/wallet\/checked"/);
+  assert.match(html, /name="checked" value="0"/);
+  assert.match(html, /✓ Checked/);
+  assert.match(html, /wallet-checked/);
+  assert.match(html, new RegExp(WALLET_REPEAT));
   assert.match(html, new RegExp(TOKEN_A));
   assert.match(html, new RegExp(TOKEN_B));
 });

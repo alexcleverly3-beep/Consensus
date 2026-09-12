@@ -142,6 +142,11 @@ function initPhase2WalletLab(db, { now = () => Date.now() } = {}) {
       human_label TEXT NOT NULL DEFAULT 'unsure',
       analysis_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS recurrence_wallet_checks (
+      wallet_address TEXT PRIMARY KEY,
+      checked INTEGER NOT NULL DEFAULT 1,
+      checked_at INTEGER NOT NULL
+    );
   `);
   const recurrenceStmt = db.prepare(`
     SELECT COUNT(*) AS distinct_tokens,
@@ -157,7 +162,12 @@ function initPhase2WalletLab(db, { now = () => Date.now() } = {}) {
       confidence=excluded.confidence, status=excluded.status, analysis_json=excluded.analysis_json
   `);
   const labelStmt = db.prepare("UPDATE phase2_wallet_lab SET human_label = ? WHERE wallet_address = ?");
-  const listStmt = db.prepare("SELECT * FROM phase2_wallet_lab ORDER BY analyzed_at DESC LIMIT ?");
+  const listStmt = db.prepare(`
+    SELECT phase2_wallet_lab.*, COALESCE(checks.checked, 0) AS checked, checks.checked_at
+    FROM phase2_wallet_lab
+    LEFT JOIN recurrence_wallet_checks AS checks USING (wallet_address)
+    ORDER BY analyzed_at DESC LIMIT ?
+  `);
   const getStmt = db.prepare("SELECT * FROM phase2_wallet_lab WHERE wallet_address = ?");
 
   function recurrence(walletAddress) {
@@ -187,6 +197,7 @@ function initPhase2WalletLab(db, { now = () => Date.now() } = {}) {
       return listStmt.all(Math.max(1, Math.min(200, Number(limit) || 50))).map((row) => ({
         walletAddress: row.wallet_address, analyzedAt: row.analyzed_at, score: row.score,
         confidence: row.confidence, status: row.status, humanLabel: row.human_label,
+        checked: Boolean(row.checked), checkedAt: row.checked_at == null ? null : num(row.checked_at),
         analysis: JSON.parse(row.analysis_json),
       }));
     },
@@ -200,7 +211,10 @@ function esc(value) {
 function renderPhase2WalletLab(items, csrfToken = "", notice = "") {
   const cards = items.length ? items.map((item) => {
     const m = item.analysis.metrics;
-    return `<article class="wallet"><div class="score">${item.score}<span>/100</span></div><div class="body"><a class="addr" href="https://solscan.io/account/${encodeURIComponent(item.walletAddress)}" target="_blank" rel="noreferrer">${esc(item.walletAddress)}</a><div class="meta">Confidence ${item.confidence}% · ${esc(item.status)} · ${m.distinctBoughtTokens} recent tokens · ${m.recurrenceDistinctTokens} Phase 1 recurrences</div><div class="metrics"><span>Median hold ${m.medianHoldSec == null ? "—" : Math.round(m.medianHoldSec/60)+"m"}</span><span>Rapid flips ${m.rapidFlipRate == null ? "—" : Math.round(m.rapidFlipRate*100)+"%"}</span><span>Tx/day ${m.txPerDay}</span></div><form method="post" action="/actions/phase2/label"><input type="hidden" name="csrf" value="${esc(csrfToken)}"><input type="hidden" name="wallet" value="${esc(item.walletAddress)}"><button name="label" value="good" class="${item.humanLabel === "good" ? "sel" : ""}">Good</button><button name="label" value="bad" class="${item.humanLabel === "bad" ? "sel bad" : "bad"}">Bad</button><button name="label" value="unsure" class="${item.humanLabel === "unsure" ? "sel" : ""}">Unsure</button></form></div></article>`;
+    const checkedLabel = item.checked ? "✓ Checked" : "Mark checked";
+    const cardStyle = item.checked ? ' style="border-left:4px solid #43d681;background:#102019"' : "";
+    const buttonStyle = item.checked ? ' style="border-color:#2d7950;background:#123321;color:#9aebbb"' : "";
+    return `<article class="wallet ${item.checked ? "wallet-checked" : ""}"${cardStyle}><div class="score">${item.score}<span>/100</span></div><div class="body"><a class="addr" href="https://solscan.io/account/${encodeURIComponent(item.walletAddress)}" target="_blank" rel="noreferrer">${esc(item.walletAddress)}</a><div class="meta">Confidence ${item.confidence}% · ${esc(item.status)} · ${m.distinctBoughtTokens} recent tokens · ${m.recurrenceDistinctTokens} Phase 1 recurrences</div><div class="metrics"><span>Median hold ${m.medianHoldSec == null ? "—" : Math.round(m.medianHoldSec/60)+"m"}</span><span>Rapid flips ${m.rapidFlipRate == null ? "—" : Math.round(m.rapidFlipRate*100)+"%"}</span><span>Tx/day ${m.txPerDay}</span></div><form method="post" action="/actions/phase2/label"><input type="hidden" name="csrf" value="${esc(csrfToken)}"><input type="hidden" name="wallet" value="${esc(item.walletAddress)}"><button name="label" value="good" class="${item.humanLabel === "good" ? "sel" : ""}">Good</button><button name="label" value="bad" class="${item.humanLabel === "bad" ? "sel bad" : "bad"}">Bad</button><button name="label" value="unsure" class="${item.humanLabel === "unsure" ? "sel" : ""}">Unsure</button></form></div><aside class="review-side" style="min-width:112px;text-align:right"><form method="post" action="/actions/wallet/checked"><input type="hidden" name="csrf" value="${esc(csrfToken)}"><input type="hidden" name="wallet" value="${esc(item.walletAddress)}"><input type="hidden" name="checked" value="${item.checked ? "0" : "1"}"><input type="hidden" name="returnTo" value="/phase2"><button class="checked-toggle ${item.checked ? "is-checked" : ""}"${buttonStyle} type="submit" aria-pressed="${item.checked ? "true" : "false"}">${checkedLabel}</button></form></aside></article>`;
   }).join("") : '<div class="empty">No wallets analysed yet.</div>';
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Consensus Phase 2 Lab</title><style>:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#080d14;color:#edf4fa}*{box-sizing:border-box}body{margin:0}main{max-width:1120px;margin:auto;padding:32px 20px}a{color:#69b5ff}h1{margin:0;font-size:30px}.sub{color:#8fa2b7;margin:8px 0 22px}.notice{background:#10271b;border:1px solid #285f41;padding:10px 12px;border-radius:10px;margin-bottom:16px}.analyze{display:flex;gap:10px;background:#111923;border:1px solid #253243;padding:16px;border-radius:14px;margin-bottom:22px}.analyze input{flex:1;background:#091019;color:#fff;border:1px solid #34465a;border-radius:9px;padding:12px}.analyze button,form button{background:#18304a;color:#fff;border:1px solid #355675;border-radius:8px;padding:8px 11px;cursor:pointer}.wallet{display:flex;gap:18px;border:1px solid #263443;background:#101720;border-radius:14px;padding:18px;margin:12px 0}.score{font-size:38px;font-weight:800;min-width:100px}.score span{font-size:13px;color:#899bad}.body{flex:1}.addr{font-family:ui-monospace,monospace}.meta{color:#97a9bb;margin:7px 0 10px;font-size:13px}.metrics{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.metrics span{background:#0b121a;border:1px solid #243240;border-radius:999px;padding:5px 8px;font-size:12px}.sel{border-color:#4bbf79!important}.bad{color:#ffadb5}.sel.bad{border-color:#d45c67!important}.empty{color:#8fa2b7;padding:30px;text-align:center}@media(max-width:650px){.analyze,.wallet{flex-direction:column}.score{min-width:0}}</style></head><body><main><h1>Phase 2 — Wallet Lab</h1><p class="sub">Manual calibration workspace. Scores are provisional research scores, not trusted-wallet promotion.</p>${notice ? `<div class="notice">${esc(notice)}</div>` : ""}<form class="analyze" method="post" action="/actions/phase2/analyze"><input type="hidden" name="csrf" value="${esc(csrfToken)}"><input name="wallet" maxlength="44" placeholder="Paste Solana wallet address" required><button type="submit">Analyse wallet</button></form>${cards}</main></body></html>`;
 }

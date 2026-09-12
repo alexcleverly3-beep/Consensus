@@ -275,7 +275,8 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   }
   function redirectNotice(res, message, kind = "success", base = "/") {
     const query = new URLSearchParams({ notice: String(message).slice(0, 180), kind });
-    res.writeHead(303, { ...privateHeaders, location: `${base}?${query.toString()}` });
+    const separator = base.includes("?") ? "&" : "?";
+    res.writeHead(303, { ...privateHeaders, location: `${base}${separator}${query.toString()}` });
     res.end();
   }
 
@@ -298,7 +299,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     }
 
     const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" || pathname === "/api/queue" ||
-      pathname === "/actions/token/add" || pathname === "/actions/token/cancel" || pathname === "/phase2" ||
+      pathname === "/actions/token/add" || pathname === "/actions/token/cancel" || pathname === "/actions/wallet/checked" || pathname === "/phase2" ||
       pathname === "/api/phase2/wallets" || pathname === "/actions/phase2/analyze" || pathname === "/actions/phase2/label";
     if (privatePath) {
       if (!requirePrivateAccess(req, res)) return;
@@ -355,6 +356,23 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
           }
           const result = dashboardStore.cancelQueuedToken(token);
           redirectNotice(res, result.cancelled ? "Token removed from the current scan queue." : "Token was not currently queued.", result.cancelled ? "success" : "error");
+          return;
+        } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error"); return; }
+      }
+
+      if (pathname === "/actions/wallet/checked") {
+        if (req.method !== "POST") { rejectPrivate(res, 405, "POST required"); return; }
+        const contentType = String(req.headers["content-type"] || "").toLowerCase();
+        if (!contentType.startsWith("application/x-www-form-urlencoded")) { rejectPrivate(res, 415, "Form submission required"); return; }
+        try {
+          const form = await readFormBody(req);
+          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) { rejectPrivate(res, 403, "Invalid dashboard action token"); return; }
+          const checkedValue = String(form.get("checked") || "");
+          if (checkedValue !== "0" && checkedValue !== "1") throw new Error("checked state must be 0 or 1");
+          const result = dashboardStore.setWalletChecked(form.get("wallet"), checkedValue === "1");
+          const minDistinctTokens = clampInt(form.get("min"), 3, 2, 100);
+          const returnTo = form.get("returnTo") === "/phase2" ? "/phase2" : `/?min=${minDistinctTokens}`;
+          redirectNotice(res, result.checked ? "Wallet marked as checked." : "Wallet marked as not checked.", "success", returnTo);
           return;
         } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error"); return; }
       }
