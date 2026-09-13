@@ -128,6 +128,8 @@ function publicHealth(store, gmgnGuard = null, generatedAt = Date.now(), through
       tokensScanned: summary.tokensScanned,
       totalTokenScans: summary.totalTokenScans,
       queuedTokens: summary.queuedTokens,
+      newQueuedTokens: summary.newQueuedTokens,
+      rescanQueuedTokens: summary.rescanQueuedTokens,
       walletsSeen: summary.walletsSeen,
       walletTokenLinks: summary.walletTokenLinks,
       repeatWallets: summary.repeatWallets,
@@ -169,7 +171,8 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
     const trending = await fetchTrending();
     const intake = store.enqueueTrending(trending);
     lastTrendingAt = now();
-    logger.log(`[recurrence] cycle=${cycle} trending rows=${intake.rows} unique=${intake.uniqueTokens} new=${intake.added} queue=${store.summary().queuedTokens}`);
+    const summary = store.summary();
+    logger.log(`[recurrence] cycle=${cycle} trending rows=${intake.rows} unique=${intake.uniqueTokens} new=${intake.added} queue=${summary.queuedTokens} queue-new=${summary.newQueuedTokens ?? "unknown"} queue-rescan=${summary.rescanQueuedTokens ?? "unknown"}`);
     return intake;
   }
 
@@ -188,6 +191,10 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
       const plannedScans = Math.max(0, Math.min(tokensPerCycle, Math.floor(Number(plan?.allowance) || 0)));
       const startingSummary = store.summary();
       const trendingStaleAtStart = now() - lastTrendingAt >= trendingRefreshMs;
+      const hasQueueBreakdown = Number.isFinite(Number(startingSummary.newQueuedTokens));
+      const needsNewTokenIntake = Number(startingSummary.priorityQueuedTokens || 0) === 0 && (hasQueueBreakdown
+        ? Number(startingSummary.newQueuedTokens) === 0
+        : startingSummary.queuedTokens === 0);
       if (plannedScans === 0) {
         if (startingSummary.queuedTokens === 0 && trendingStaleAtStart) {
           try { await refreshTrending(); trendingRefreshed = true; }
@@ -198,7 +205,7 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
         }
         return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed, scanPlan: plan };
       }
-      if (startingSummary.queuedTokens === 0) {
+      if (needsNewTokenIntake) {
         try { await refreshTrending(); trendingRefreshed = true; }
         catch (error) {
           throttled = isGlobalGmgnThrottle(error);
@@ -228,7 +235,9 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
       }
       const summary = store.summary();
       const trendingStale = now() - lastTrendingAt >= trendingRefreshMs;
-      const queueLow = summary.queuedTokens < tokensPerCycle;
+      const queueLow = Number.isFinite(Number(summary.newQueuedTokens))
+        ? Number(summary.newQueuedTokens) < plannedScans
+        : summary.queuedTokens < tokensPerCycle;
       if (!trendingRefreshed && !throttled && (queueLow || trendingStale)) {
         try { await refreshTrending(); trendingRefreshed = true; }
         catch (error) {
@@ -465,6 +474,8 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
             firstScansLastHour: stats.firstScansLastHour,
             rescansLastHour: stats.rescansLastHour,
             queueDepth: stats.queuedTokens,
+            newQueueDepth: stats.newQueuedTokens,
+            rescanQueueDepth: stats.rescanQueuedTokens,
             gmgn: stats.gmgn,
           } }, null, 2));
           return;

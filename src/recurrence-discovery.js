@@ -168,9 +168,11 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     ORDER BY
       CASE
         WHEN status = 'pending' AND priority > 0 THEN 0
-        WHEN status = 'pending' THEN 1
-        WHEN status = 'failed' AND priority > 0 THEN 2
-        ELSE 3
+        WHEN status = 'pending' AND last_scanned_at IS NULL THEN 1
+        WHEN status = 'pending' THEN 2
+        WHEN status = 'failed' AND priority > 0 THEN 3
+        WHEN status = 'failed' AND last_scanned_at IS NULL THEN 4
+        ELSE 5
       END,
       CASE WHEN priority > 0 THEN COALESCE(priority_queued_at, first_seen_at) ELSE first_seen_at END ASC,
       last_seen_at ASC
@@ -224,6 +226,8 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       (SELECT COUNT(*) FROM recurrence_token_queue WHERE scan_count > 0) AS tokens_scanned,
       (SELECT COALESCE(SUM(scan_count), 0) FROM recurrence_token_queue) AS total_token_scans,
       (SELECT COUNT(*) FROM recurrence_token_queue WHERE status IN ('pending', 'failed')) AS queued_tokens,
+      (SELECT COUNT(*) FROM recurrence_token_queue WHERE status IN ('pending', 'failed') AND last_scanned_at IS NULL) AS new_queued_tokens,
+      (SELECT COUNT(*) FROM recurrence_token_queue WHERE status IN ('pending', 'failed') AND last_scanned_at IS NOT NULL) AS rescan_queued_tokens,
       (SELECT COUNT(*) FROM recurrence_token_queue WHERE status = 'pending' AND priority > 0) AS priority_queued_tokens,
       (SELECT COUNT(*) FROM recurrence_wallet_tokens) AS wallet_token_links,
       (SELECT COUNT(DISTINCT wallet_address) FROM recurrence_wallet_tokens) AS wallets_seen,
@@ -357,6 +361,8 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
         tokensScanned: num(row.tokens_scanned),
         totalTokenScans: num(row.total_token_scans),
         queuedTokens: num(row.queued_tokens),
+        newQueuedTokens: num(row.new_queued_tokens),
+        rescanQueuedTokens: num(row.rescan_queued_tokens),
         priorityQueuedTokens: num(row.priority_queued_tokens),
         walletTokenLinks: num(row.wallet_token_links),
         walletsSeen: num(row.wallets_seen),
