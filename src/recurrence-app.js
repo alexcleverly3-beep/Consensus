@@ -450,14 +450,15 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 
       try {
         const minDistinctTokens = clampInt(requestUrl?.searchParams.get("min"), 3, 2, 100);
-        const limit = clampInt(requestUrl?.searchParams.get("limit"), 250, 1, 1000);
+        const apiWalletLimit = clampInt(requestUrl?.searchParams.get("limit"), 250, 1, 1000);
         const queueLimit = clampInt(requestUrl?.searchParams.get("queueLimit"), 100, 1, 500);
         const stats = dashboardStore.stats(store.summary(), gmgnGuard?.snapshot?.() || {});
-        const wallets = dashboardStore.wallets({ minDistinctTokens, limit });
+        const walletTotal = dashboardStore.walletCount({ minDistinctTokens });
+        const wallets = dashboardStore.wallets({ minDistinctTokens, limit: pathname === "/api/wallets" ? apiWalletLimit : 100 });
         const queue = dashboardStore.queue({ limit: queueLimit });
         if (pathname === "/api/wallets") {
           res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ generatedAt: stats.generatedAt, minDistinctTokens, stats, wallets }, null, 2));
+          res.end(JSON.stringify({ generatedAt: stats.generatedAt, minDistinctTokens, walletTotal, stats, wallets }, null, 2));
           return;
         }
         if (pathname === "/api/queue") {
@@ -483,7 +484,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
         const notice = String(requestUrl?.searchParams.get("notice") || "").slice(0, 180);
         const noticeKind = requestUrl?.searchParams.get("kind") === "error" ? "error" : "success";
         res.writeHead(200, { ...privateHeaders, "content-type": "text/html; charset=utf-8" });
-        res.end(renderPrivateDashboard(stats, wallets, { queue, minDistinctTokens, csrfToken: dashboardActionToken, notice, noticeKind }));
+        res.end(renderPrivateDashboard(stats, wallets, { queue, minDistinctTokens, walletTotal, csrfToken: dashboardActionToken, notice, noticeKind }));
       } catch (error) { rejectPrivate(res, 503, `Dashboard temporarily unavailable: ${String(error?.message || error).slice(0, 200)}`); }
       return;
     }

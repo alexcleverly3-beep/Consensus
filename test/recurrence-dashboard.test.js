@@ -54,6 +54,8 @@ test("private dashboard surfaces exact recurring-wallet candidates and last-hour
   assert.equal(wallets[0].distinctTokens, 3);
   assert.equal(wallets[0].top10Tokens, 3);
   assert.equal(wallets[0].checked, false);
+  assert.equal(dashboard.walletCount({ minDistinctTokens: 2 }), 2);
+  assert.equal(dashboard.walletCount({ minDistinctTokens: 3 }), 1);
   assert.equal(activityState(stats).active, true);
   db.close();
 });
@@ -220,6 +222,7 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
     checkedAt: 8_000,
   }], {
     minDistinctTokens: 2,
+    walletTotal: 812,
     csrfToken: "csrf-test",
     queue: [{
       tokenAddress: TOKEN_A,
@@ -262,7 +265,9 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
   assert.match(html, />scanned</);
   assert.match(html, /1 new · 0 rescans/);
   assert.match(html, />completed</);
-  assert.match(html, /Recurring wallets — 2\+ distinct tokens/);
+  assert.match(html, /Top 1 recurring wallets — 2\+ distinct tokens/);
+  assert.match(html, /812<\/strong> wallets qualify at 2\+ distinct tokens/);
+  assert.match(html, /100<\/strong> total unique wallets observed/);
   assert.match(html, /href="\/\?min=3"/);
   assert.match(html, /action="\/actions\/wallet\/checked"/);
   assert.match(html, /name="checked" value="0"/);
