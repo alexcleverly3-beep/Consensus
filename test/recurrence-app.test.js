@@ -26,6 +26,8 @@ test("recurrence health exposes collection progress without wallet or token iden
       tokensScanned: 12,
       totalTokenScans: 13,
       queuedTokens: 38,
+      newQueuedTokens: 30,
+      rescanQueuedTokens: 8,
       walletTokenLinks: 900,
       walletsSeen: 720,
       repeatWallets: 42,
@@ -59,6 +61,8 @@ test("recurrence health exposes collection progress without wallet or token iden
   assert.equal(health.mode, "recurrence-first");
   assert.equal(health.collection.tokensSeen, 50);
   assert.equal(health.collection.repeatWallets, 42);
+  assert.equal(health.collection.newQueuedTokens, 30);
+  assert.equal(health.collection.rescanQueuedTokens, 8);
   assert.equal(health.collection.lastScanAgeMs, 1000);
   assert.equal(health.collection.scansLastHour, 9);
   assert.equal(health.collection.rescansLastHour, 2);
@@ -117,6 +121,74 @@ test("queued top-trader work runs before a trending refresh", async () => {
   assert.equal(result.successfulScans, 1);
   assert.deepEqual(events.slice(0, 2), ["top-traders", "ingest"]);
   assert.ok(events.indexOf("fetch-trending") > events.indexOf("top-traders"));
+});
+
+test("new-token intake refreshes before a routine rescan backlog", async () => {
+  const events = [];
+  let newQueuedTokens = 0;
+  let rescanQueuedTokens = 4;
+  let tokenTaken = false;
+  const store = {
+    summary: () => ({
+      tokensSeen: 10,
+      queuedTokens: newQueuedTokens + rescanQueuedTokens,
+      newQueuedTokens,
+      rescanQueuedTokens,
+      priorityQueuedTokens: 0,
+    }),
+    nextToken: () => {
+      if (tokenTaken) return null;
+      tokenTaken = true;
+      return { token_address: TOKEN_A, trend_json: "{}" };
+    },
+    ingestTokenTraders: () => {
+      events.push("ingest");
+      newQueuedTokens -= 1;
+      return { accepted: 0, rejected: 0 };
+    },
+    enqueueTrending: () => {
+      events.push("enqueue-trending");
+      newQueuedTokens = 2;
+      return { rows: 2, uniqueTokens: 2, added: 2 };
+    },
+    markFailed: () => { throw new Error("unexpected markFailed"); },
+  };
+
+  const runner = createDiscoveryCycleRunner({
+    store,
+    tokensPerCycle: 1,
+    now: () => 1000,
+    logger: { log() {}, warn() {} },
+    fetchTopTraders: async () => { events.push("top-traders"); return []; },
+    fetchTrending: async () => { events.push("fetch-trending"); return { data: { list: [] } }; },
+  });
+
+  const result = await runner.discoveryCycle();
+  assert.equal(result.successfulScans, 1);
+  assert.deepEqual(events, ["fetch-trending", "enqueue-trending", "top-traders", "ingest"]);
+});
+
+test("manual priority work bypasses a new-token intake refresh", async () => {
+  const events = [];
+  let queuedTokens = 1;
+  const store = {
+    summary: () => ({ queuedTokens, newQueuedTokens: 0, rescanQueuedTokens: 1, priorityQueuedTokens: queuedTokens }),
+    nextToken: () => ({ token_address: TOKEN_A, trend_json: "{}" }),
+    ingestTokenTraders: () => { events.push("ingest"); queuedTokens = 0; return { accepted: 0, rejected: 0 }; },
+    enqueueTrending: () => { events.push("enqueue-trending"); return { rows: 0, uniqueTokens: 0, added: 0 }; },
+    markFailed: () => { throw new Error("unexpected markFailed"); },
+  };
+  const runner = createDiscoveryCycleRunner({
+    store,
+    tokensPerCycle: 1,
+    now: () => 1000,
+    logger: { log() {}, warn() {} },
+    fetchTopTraders: async () => { events.push("top-traders"); return []; },
+    fetchTrending: async () => { events.push("fetch-trending"); return {}; },
+  });
+
+  await runner.discoveryCycle();
+  assert.deepEqual(events.slice(0, 2), ["top-traders", "ingest"]);
 });
 
 test("global GMGN budget exhaustion does not demote a healthy queued token", async () => {

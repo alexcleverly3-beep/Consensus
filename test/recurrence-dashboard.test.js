@@ -140,6 +140,7 @@ test("dashboard lists queue in scanner order and can remove queued work without 
   assert.equal(queue[0].priority, true);
   assert.equal(queue[0].source, "dashboard");
   assert.equal(queue[1].label, "AAA");
+  assert.equal(queue[1].scanType, "new");
 
   const cancelled = dashboard.cancelQueuedToken(TOKEN_C);
   assert.equal(cancelled.cancelled, true);
@@ -149,6 +150,22 @@ test("dashboard lists queue in scanner order and can remove queued work without 
 
   recurrence.enqueuePriorityToken(TOKEN_C, { observedAt: now, source: "dashboard" });
   assert.equal(recurrence.nextToken().token_address, TOKEN_C);
+  db.close();
+});
+
+test("dashboard puts new tokens ahead of routine rescans", () => {
+  const now = 5_000_000;
+  const db = new Database(":memory:");
+  const recurrence = initRecurrenceStore(db, { rescanMs: 1 });
+  recurrence.enqueueTrending({ data: { list: [{ address: TOKEN_A }] } }, now - 20_000);
+  recurrence.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: now - 10_000, traders: [] });
+  recurrence.enqueueTrending({ data: { list: [{ address: TOKEN_A }, { address: TOKEN_B }] } }, now);
+
+  const queue = createRecurrenceDashboardStore(db, { now: () => now }).queue();
+  assert.equal(queue[0].tokenAddress, TOKEN_B);
+  assert.equal(queue[0].scanType, "new");
+  assert.equal(queue[1].tokenAddress, TOKEN_A);
+  assert.equal(queue[1].scanType, "rescan");
   db.close();
 });
 
@@ -180,6 +197,8 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
     tokensScanned: 12,
     scansLastHour: 4,
     queuedTokens: 1,
+    newQueuedTokens: 1,
+    rescanQueuedTokens: 0,
     priorityQueuedTokens: 1,
     walletsSeen: 100,
     walletTokenLinks: 110,
@@ -211,6 +230,7 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
       firstSeenAt: 8_000,
       lastSeenAt: 9_000,
       lastScannedAt: null,
+      scanType: "new",
       scanCount: 0,
       lastError: null,
       priorityQueuedAt: 9_000,
@@ -223,6 +243,7 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
       firstSeenAt: 7_000,
       lastSeenAt: 9_000,
       lastScannedAt: 9_500,
+      scanType: "rescan",
       scanCount: 1,
       lastError: null,
       priorityQueuedAt: null,
@@ -234,6 +255,7 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
   assert.match(html, /csrf-test/);
   assert.match(html, /Scanner queue & recent activity/);
   assert.match(html, />scanned</);
+  assert.match(html, /1 new · 0 rescans/);
   assert.match(html, />completed</);
   assert.match(html, /Recurring wallets — 2\+ distinct tokens/);
   assert.match(html, /href="\/\?min=3"/);
