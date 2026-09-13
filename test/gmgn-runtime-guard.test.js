@@ -259,6 +259,7 @@ test("rolling budget and adaptive cooldown survive a guard restart", async () =>
   assert.equal(persisted.freshCalls, 1);
   assert.equal(persisted.effectiveMaxFreshCalls, 4);
   assert.equal(persisted.blockedUntil, 6_000);
+  assert.equal(persisted.lastRateLimitAt, 1_000);
 
   let callsAfterRestart = 0;
   const restarted = createGmgnExecGuard({
@@ -278,6 +279,7 @@ test("rolling budget and adaptive cooldown survive a guard restart", async () =>
 
   assert.equal(restarted.snapshot().freshCalls, 1);
   assert.equal(restarted.snapshot().effectiveMaxFreshCalls, 4);
+  assert.equal(restarted.snapshot().lastRateLimitAt, 1_000);
   await assert.rejects(
     call(restarted, ["token", "info", "--address", "b"]),
     (error) => error.code === "GMGN_COOLDOWN_ACTIVE"

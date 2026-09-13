@@ -11,6 +11,7 @@ const STATE_FIELDS = [
   "freshCalls",
   "effectiveMaxFreshCalls",
   "rateLimitEvents",
+  "lastRateLimitAt",
   "cleanWindows",
   "windowRateLimits",
   "blockedUntil",
@@ -72,4 +73,3 @@ module.exports = {
   createGmgnGuardStateStore,
   openGmgnGuardState,
 };
-

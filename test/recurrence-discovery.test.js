@@ -116,6 +116,12 @@ test("wallet recurrence counts independent tokens rather than repeated rescans",
   assert.equal(top[0].totalAppearances, 3);
   assert.equal(top[0].top10Tokens, 2);
   assert.equal(store.summary().repeatWallets, 2);
+  assert.deepEqual(store.scanActivity({ windowMs: 10_000, at: 5_000 }), {
+    totalScans: 3,
+    firstScans: 2,
+    rescans: 1,
+    lastScanAt: 4_000,
+  });
 
   const dev = top.find((row) => row.walletAddress === WALLET_DEV);
   assert.equal(dev.everCreator, true);

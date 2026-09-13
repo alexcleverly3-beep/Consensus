@@ -22,6 +22,11 @@ function clampInt(value, fallback, min, max) {
   return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
 }
 
+function num(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function safeJson(value, fallback = {}) {
   try { return JSON.parse(String(value || "")); } catch { return fallback; }
 }
@@ -110,7 +115,7 @@ function createCli({ minGapMs = 12_000 } = {}) {
   };
 }
 
-function publicHealth(store, gmgnGuard = null, generatedAt = Date.now()) {
+function publicHealth(store, gmgnGuard = null, generatedAt = Date.now(), throughput = {}) {
   const summary = store.summary();
   const gmgn = typeof gmgnGuard?.snapshot === "function" ? gmgnGuard.snapshot() : {};
   return {
@@ -126,6 +131,11 @@ function publicHealth(store, gmgnGuard = null, generatedAt = Date.now()) {
       walletsSeen: summary.walletsSeen,
       walletTokenLinks: summary.walletTokenLinks,
       repeatWallets: summary.repeatWallets,
+      scansLastHour: num(throughput.scansLastHour),
+      firstScansLastHour: num(throughput.firstScansLastHour),
+      rescansLastHour: num(throughput.rescansLastHour),
+      targetScansPerHour: num(throughput.targetScansPerHour),
+      maxTargetScansPerHour: num(throughput.maxTargetScansPerHour),
       lastScanAt: summary.lastScanAt,
       lastScanAgeMs: summary.lastScanAt == null ? null : Math.max(0, generatedAt - summary.lastScanAt),
     },
@@ -148,7 +158,7 @@ function renderDashboard(health) {
   return JSON.stringify({ mode: health.mode, tokensScanned: c.tokensScanned, walletsSeen: c.walletsSeen, repeatWallets: c.repeatWallets });
 }
 
-function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle = 2, trendingRefreshMs = 60 * 60 * 1000, now = () => Date.now(), logger = console } = {}) {
+function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle = 2, getScanPlan = null, trendingRefreshMs = 60 * 60 * 1000, now = () => Date.now(), logger = console } = {}) {
   if (!store || typeof store.summary !== "function" || typeof store.nextToken !== "function") throw new Error("recurrence store is required");
   if (typeof fetchTrending !== "function" || typeof fetchTopTraders !== "function") throw new Error("fetchTrending and fetchTopTraders are required");
   let running = false;
@@ -172,7 +182,23 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
     let throttled = false;
     let trendingRefreshed = false;
     try {
-      if (store.summary().queuedTokens === 0) {
+      const plan = typeof getScanPlan === "function"
+        ? getScanPlan()
+        : { allowance: tokensPerCycle, reason: "fixed-cycle-limit" };
+      const plannedScans = Math.max(0, Math.min(tokensPerCycle, Math.floor(Number(plan?.allowance) || 0)));
+      const startingSummary = store.summary();
+      const trendingStaleAtStart = now() - lastTrendingAt >= trendingRefreshMs;
+      if (plannedScans === 0) {
+        if (startingSummary.queuedTokens === 0 && trendingStaleAtStart) {
+          try { await refreshTrending(); trendingRefreshed = true; }
+          catch (error) {
+            throttled = isGlobalGmgnThrottle(error);
+            logger.warn(`[recurrence] trending refresh deferred: ${String(error?.message || error).slice(0, 1000)}`);
+          }
+        }
+        return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed, scanPlan: plan };
+      }
+      if (startingSummary.queuedTokens === 0) {
         try { await refreshTrending(); trendingRefreshed = true; }
         catch (error) {
           throttled = isGlobalGmgnThrottle(error);
@@ -180,7 +206,7 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
           return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed };
         }
       }
-      for (let i = 0; i < tokensPerCycle; i += 1) {
+      for (let i = 0; i < plannedScans; i += 1) {
         const token = store.nextToken();
         if (!token) break;
         try {
@@ -210,7 +236,7 @@ function createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tok
           logger.warn(`[recurrence] trending refresh deferred: ${String(error?.message || error).slice(0, 1000)}`);
         }
       }
-      return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed };
+      return { skipped: false, successfulScans, tokenFailures, throttled, trendingRefreshed, scanPlan: plan };
     } finally { running = false; }
   }
   return { discoveryCycle };
@@ -224,19 +250,34 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   db.pragma("synchronous = NORMAL");
 
   const intervalMinutes = clampInt(env.RECURRENCE_INTERVAL_MINUTES, resolveDiscoveryIntervalMinutes(env), 5, 120);
-  const trendingLimit = clampInt(env.RECURRENCE_TRENDING_LIMIT, 50, 10, 100);
-  const tokensPerCycle = clampInt(env.RECURRENCE_TOKENS_PER_CYCLE, 2, 1, 3);
+  const trendingLimit = clampInt(env.RECURRENCE_TRENDING_LIMIT, 100, 10, 100);
   const traderLimit = clampInt(env.RECURRENCE_TRADER_LIMIT, 100, 25, 100);
   const rescanHours = clampInt(env.RECURRENCE_RESCAN_HOURS, 24, 6, 168);
   const trendingRefreshMinutes = clampInt(env.RECURRENCE_TRENDING_REFRESH_MINUTES, 60, 15, 360);
   const minGapMs = clampInt(env.GMGN_MIN_REQUEST_GAP_MS, 12_000, 3_000, 60_000);
+  const requestedDefaultTarget = clampInt(env.RECURRENCE_TARGET_SCANS_PER_HOUR, 12, 1, 60);
+  const requestedMaxTarget = clampInt(env.RECURRENCE_MAX_SCANS_PER_HOUR, 18, 1, 60);
+  const scheduleCapacityPerHour = Math.max(1, Math.floor((60 / intervalMinutes) * 3));
+  const maxTargetScansPerHour = Math.min(requestedMaxTarget, scheduleCapacityPerHour);
+  const defaultTargetScansPerHour = Math.min(requestedDefaultTarget, maxTargetScansPerHour);
+  const configuredTokensPerCycle = clampInt(env.RECURRENCE_TOKENS_PER_CYCLE, 3, 1, 3);
+  const tokensPerCycle = Math.min(3, Math.max(configuredTokensPerCycle, Math.ceil(maxTargetScansPerHour * intervalMinutes / 60)));
   const store = initRecurrenceStore(db, { rescanMs: rescanHours * 60 * 60 * 1000 });
-  const dashboardStore = createRecurrenceDashboardStore(db);
+  const dashboardStore = createRecurrenceDashboardStore(db, { defaultTargetScansPerHour, maxTargetScansPerHour });
   const phase2Lab = initPhase2WalletLab(db);
   const cli = createCli({ minGapMs });
+  const trendingProfiles = [
+    { interval: "24h", orderBy: "volume" },
+    { interval: "6h", orderBy: "swaps" },
+    { interval: "1h", orderBy: "volume" },
+    { interval: "24h", orderBy: "holder_count" },
+  ];
+  let trendingProfileIndex = 0;
 
   async function fetchTrending() {
-    return cli(["market", "trending", "--chain", "sol", "--interval", "24h", "--order-by", "volume", "--limit", String(trendingLimit), "--raw"]);
+    const profile = trendingProfiles[trendingProfileIndex % trendingProfiles.length];
+    trendingProfileIndex += 1;
+    return cli(["market", "trending", "--chain", "sol", "--interval", profile.interval, "--order-by", profile.orderBy, "--direction", "desc", "--limit", String(trendingLimit), "--raw"]);
   }
   async function fetchTopTraders(token) {
     const response = await cli(["token", "traders", "--chain", "sol", "--address", token, "--order-by", "profit", "--direction", "desc", "--limit", String(traderLimit), "--raw"]);
@@ -246,7 +287,14 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     return cli(["portfolio", "activity", "--chain", "sol", "--wallet", wallet, "--limit", "100", "--raw"]);
   }
 
-  const runner = createDiscoveryCycleRunner({ store, fetchTrending, fetchTopTraders, tokensPerCycle, trendingRefreshMs: trendingRefreshMinutes * 60 * 1000 });
+  const runner = createDiscoveryCycleRunner({
+    store,
+    fetchTrending,
+    fetchTopTraders,
+    tokensPerCycle,
+    getScanPlan: () => dashboardStore.scanPlan({ cycleCap: tokensPerCycle }),
+    trendingRefreshMs: trendingRefreshMinutes * 60 * 1000,
+  });
   const discoveryCycle = runner.discoveryCycle;
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
@@ -288,7 +336,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 
     if (pathname === "/health" || pathname === "/api/progress") {
       try {
-        const health = publicHealth(store, gmgnGuard);
+        const health = publicHealth(store, gmgnGuard, Date.now(), dashboardStore.throughput());
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify(health));
       } catch {
@@ -298,8 +346,8 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
       return;
     }
 
-    const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" || pathname === "/api/queue" ||
-      pathname === "/actions/token/add" || pathname === "/actions/token/cancel" || pathname === "/actions/wallet/checked" || pathname === "/phase2" ||
+    const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" || pathname === "/api/queue" || pathname === "/api/throughput" ||
+      pathname === "/actions/token/add" || pathname === "/actions/token/cancel" || pathname === "/actions/wallet/checked" || pathname === "/actions/scanner/target" || pathname === "/phase2" ||
       pathname === "/api/phase2/wallets" || pathname === "/actions/phase2/analyze" || pathname === "/actions/phase2/label";
     if (privatePath) {
       if (!requirePrivateAccess(req, res)) return;
@@ -377,11 +425,25 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
         } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error"); return; }
       }
 
+      if (pathname === "/actions/scanner/target") {
+        if (req.method !== "POST") { rejectPrivate(res, 405, "POST required"); return; }
+        const contentType = String(req.headers["content-type"] || "").toLowerCase();
+        if (!contentType.startsWith("application/x-www-form-urlencoded")) { rejectPrivate(res, 415, "Form submission required"); return; }
+        try {
+          const form = await readFormBody(req);
+          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) { rejectPrivate(res, 403, "Invalid dashboard action token"); return; }
+          const result = dashboardStore.setTargetScansPerHour(Number(form.get("target")));
+          queueMicrotask(() => Promise.resolve(discoveryCycle()).catch((error) => console.warn(`[dashboard] scan-target trigger failed: ${String(error?.message || error).slice(0, 300)}`)));
+          redirectNotice(res, `Scanner target saved at ${result.targetScansPerHour} scans/hour. API protection remains automatic.`);
+          return;
+        } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error"); return; }
+      }
+
       try {
         const minDistinctTokens = clampInt(requestUrl?.searchParams.get("min"), 3, 2, 100);
         const limit = clampInt(requestUrl?.searchParams.get("limit"), 250, 1, 1000);
         const queueLimit = clampInt(requestUrl?.searchParams.get("queueLimit"), 100, 1, 500);
-        const stats = dashboardStore.stats(store.summary());
+        const stats = dashboardStore.stats(store.summary(), gmgnGuard?.snapshot?.() || {});
         const wallets = dashboardStore.wallets({ minDistinctTokens, limit });
         const queue = dashboardStore.queue({ limit: queueLimit });
         if (pathname === "/api/wallets") {
@@ -392,6 +454,19 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
         if (pathname === "/api/queue") {
           res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ generatedAt: stats.generatedAt, stats, queue }, null, 2));
+          return;
+        }
+        if (pathname === "/api/throughput") {
+          res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ generatedAt: stats.generatedAt, throughput: {
+            targetScansPerHour: stats.targetScansPerHour,
+            maxTargetScansPerHour: stats.maxTargetScansPerHour,
+            scansLastHour: stats.scansLastHour,
+            firstScansLastHour: stats.firstScansLastHour,
+            rescansLastHour: stats.rescansLastHour,
+            queueDepth: stats.queuedTokens,
+            gmgn: stats.gmgn,
+          } }, null, 2));
           return;
         }
         const notice = String(requestUrl?.searchParams.get("notice") || "").slice(0, 180);
@@ -406,7 +481,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   });
 
   server.listen(port, host, () => {
-    console.log(`[recurrence] listening on ${host}:${server.address()?.port || port}; interval=${intervalMinutes}m; trending=${trendingLimit}; scans/cycle=${tokensPerCycle}; top-traders=${traderLimit}; rescan=${rescanHours}h; trending-refresh=${trendingRefreshMinutes}m`);
+    console.log(`[recurrence] listening on ${host}:${server.address()?.port || port}; interval=${intervalMinutes}m; trending=${trendingLimit}; scans/cycle=${tokensPerCycle}; target=${dashboardStore.throughput().targetScansPerHour}/h; target-max=${maxTargetScansPerHour}/h; top-traders=${traderLimit}; rescan=${rescanHours}h; trending-refresh=${trendingRefreshMinutes}m`);
   });
   queueMicrotask(() => discoveryCycle());
   const timer = setInterval(discoveryCycle, intervalMinutes * 60 * 1000);

@@ -137,6 +137,7 @@ function createGmgnExecGuard({
   let coalesced = 0;
   let rejected = 0;
   let rateLimitEvents = Math.max(0, Math.floor(Number(initialState.rateLimitEvents) || 0));
+  let lastRateLimitAt = Math.max(0, Math.floor(Number(initialState.lastRateLimitAt) || 0));
   let windowRateLimits = Math.max(0, Math.floor(Number(initialState.windowRateLimits) || 0));
   let cleanWindows = Math.max(0, Math.floor(Number(initialState.cleanWindows) || 0));
   let effectiveMaxFreshCalls = clampInt(
@@ -154,6 +155,7 @@ function createGmgnExecGuard({
       freshCalls,
       effectiveMaxFreshCalls,
       rateLimitEvents,
+      lastRateLimitAt,
       cleanWindows,
       windowRateLimits,
       blockedUntil,
@@ -206,6 +208,7 @@ function createGmgnExecGuard({
       coalesced,
       rejected,
       rateLimitEvents,
+      lastRateLimitAt: lastRateLimitAt || null,
       cleanWindows,
       blockedUntil,
       cooldownRemainingMs: Math.max(0, blockedUntil - at),
@@ -268,6 +271,7 @@ function createGmgnExecGuard({
 
       if (error && adaptive && isRateLimitFailure(error, stdout, stderr)) {
         rateLimitEvents += 1;
+        lastRateLimitAt = now();
         windowRateLimits += 1;
         cleanWindows = 0;
         effectiveMaxFreshCalls = Math.max(minCalls, Math.floor(effectiveMaxFreshCalls / 2));

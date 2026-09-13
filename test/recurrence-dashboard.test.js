@@ -10,6 +10,7 @@ const {
   dashboardCredentials,
   isAuthorized,
   renderPrivateDashboard,
+  throughputState,
 } = require("../src/recurrence-dashboard");
 
 const TOKEN_A = "A".repeat(32);
@@ -80,6 +81,45 @@ test("wallet checked state persists independently from discovery evidence", () =
   assert.equal(wallet.checked, false);
   assert.equal(wallet.checkedAt, null);
   assert.equal(wallet.distinctTokens, 2);
+  db.close();
+});
+
+test("scanner target persists and produces a paced rolling-hour plan", () => {
+  let now = 10_000_000;
+  const db = new Database(":memory:");
+  const recurrence = initRecurrenceStore(db);
+  recurrence.enqueueTrending({ data: { list: [{ address: TOKEN_A }] } }, now);
+  const dashboard = createRecurrenceDashboardStore(db, {
+    now: () => now,
+    defaultTargetScansPerHour: 12,
+    maxTargetScansPerHour: 18,
+  });
+
+  assert.equal(dashboard.throughput().targetScansPerHour, 12);
+  assert.equal(dashboard.scanPlan({ cycleCap: 3 }).allowance, 3);
+  recurrence.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: now, traders: [trader(WALLET_REPEAT)] });
+  now += 10 * 60 * 1000;
+  assert.equal(dashboard.scanPlan({ cycleCap: 3 }).allowance, 2);
+
+  dashboard.setTargetScansPerHour(18);
+  const restarted = createRecurrenceDashboardStore(db, { now: () => now, maxTargetScansPerHour: 18 });
+  assert.equal(restarted.throughput().targetScansPerHour, 18);
+  assert.equal(restarted.scanPlan({ cycleCap: 3 }).allowance, 3);
+  assert.throws(() => restarted.setTargetScansPerHour(19), /1 to 18/);
+
+  const stats = restarted.stats(recurrence.summary(), {
+    freshCalls: 3,
+    maxFreshCalls: 8,
+    effectiveMaxFreshCalls: 4,
+    remaining: 1,
+    rateLimitEvents: 1,
+    windowMs: 20 * 60 * 1000,
+  });
+  assert.equal(stats.scansLastHour, 1);
+  assert.equal(stats.firstScansLastHour, 1);
+  assert.equal(stats.rescansLastHour, 0);
+  assert.equal(stats.gmgn.effectiveMax, 4);
+  assert.equal(throughputState(stats).label, "Automatic backoff");
   db.close();
 });
 
@@ -202,6 +242,11 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
   assert.match(html, /✓ Checked/);
   assert.match(html, /wallet-checked/);
   assert.match(html, new RegExp(WALLET_REPEAT));
+  assert.match(html, /Scanner control/);
+  assert.match(html, /action="\/actions\/scanner\/target"/);
+  assert.match(html, /Target scans\/hour/);
+  assert.match(html, /Automatic/);
+  assert.doesNotMatch(html, /undefined|NaN/);
   assert.match(html, new RegExp(TOKEN_A));
   assert.match(html, new RegExp(TOKEN_B));
 });

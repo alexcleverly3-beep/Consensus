@@ -49,11 +49,20 @@ test("recurrence health exposes collection progress without wallet or token iden
     }),
   };
 
-  const health = publicHealth(store, guard, 10_000);
+  const health = publicHealth(store, guard, 10_000, {
+    scansLastHour: 9,
+    firstScansLastHour: 7,
+    rescansLastHour: 2,
+    targetScansPerHour: 12,
+    maxTargetScansPerHour: 18,
+  });
   assert.equal(health.mode, "recurrence-first");
   assert.equal(health.collection.tokensSeen, 50);
   assert.equal(health.collection.repeatWallets, 42);
   assert.equal(health.collection.lastScanAgeMs, 1000);
+  assert.equal(health.collection.scansLastHour, 9);
+  assert.equal(health.collection.rescansLastHour, 2);
+  assert.equal(health.collection.targetScansPerHour, 12);
   assert.equal(health.gmgn.effectiveMax, 7);
   assert.equal(health.gmgn.remaining, 4);
 
@@ -145,6 +154,33 @@ test("global GMGN budget exhaustion does not demote a healthy queued token", asy
   assert.equal(result.throttled, true);
   assert.equal(result.successfulScans, 0);
   assert.equal(markFailedCalls, 0);
+  assert.equal(trendingCalls, 0);
+});
+
+test("hourly scan plan can pause work without consuming intake or trader calls", async () => {
+  let trendingCalls = 0;
+  let traderCalls = 0;
+  const store = {
+    summary: () => ({ tokensSeen: 10, queuedTokens: 4 }),
+    nextToken: () => ({ token_address: TOKEN_A, trend_json: "{}" }),
+    ingestTokenTraders: () => { throw new Error("unexpected ingest"); },
+    enqueueTrending: () => { throw new Error("unexpected trending enqueue"); },
+    markFailed: () => { throw new Error("unexpected failure"); },
+  };
+  const runner = createDiscoveryCycleRunner({
+    store,
+    tokensPerCycle: 3,
+    getScanPlan: () => ({ allowance: 0, reason: "hourly-target-reached" }),
+    now: () => 1000,
+    logger: { log() {}, warn() {} },
+    fetchTopTraders: async () => { traderCalls += 1; return []; },
+    fetchTrending: async () => { trendingCalls += 1; return {}; },
+  });
+
+  const result = await runner.discoveryCycle();
+  assert.equal(result.successfulScans, 0);
+  assert.equal(result.scanPlan.reason, "hourly-target-reached");
+  assert.equal(traderCalls, 0);
   assert.equal(trendingCalls, 0);
 });
 
