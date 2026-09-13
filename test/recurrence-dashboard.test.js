@@ -254,6 +254,11 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
   assert.match(html, /actions\/token\/cancel/);
   assert.match(html, /csrf-test/);
   assert.match(html, /Scanner queue & recent activity/);
+  assert.match(html, /<details class="panel queue-panel">/);
+  assert.match(html, /<summary class="queue-summary">/);
+  assert.match(html, /Show queue/);
+  assert.match(html, /1 queued · 1 new · 0 rescans/);
+  assert.doesNotMatch(html, /<details class="panel queue-panel" open>/);
   assert.match(html, />scanned</);
   assert.match(html, /1 new · 0 rescans/);
   assert.match(html, />completed</);
