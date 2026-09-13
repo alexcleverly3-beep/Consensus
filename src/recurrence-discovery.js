@@ -114,8 +114,16 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       is_insider INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(wallet_address, token_address)
     );
+    CREATE TABLE IF NOT EXISTS recurrence_scan_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_address TEXT NOT NULL,
+      scanned_at INTEGER NOT NULL,
+      was_rescan INTEGER NOT NULL DEFAULT 0
+    );
     CREATE INDEX IF NOT EXISTS idx_recurrence_wallet_tokens_wallet
       ON recurrence_wallet_tokens(wallet_address, last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_recurrence_scan_events_time
+      ON recurrence_scan_events(scanned_at DESC);
   `);
 
   // Additive migration so existing Railway SQLite data is preserved.
@@ -178,6 +186,18 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     UPDATE recurrence_token_queue
     SET status = 'failed', last_error = ?
     WHERE token_address = ?
+  `);
+  const insertScanEvent = db.prepare(`
+    INSERT INTO recurrence_scan_events(token_address, scanned_at, was_rescan)
+    VALUES (?, ?, ?)
+  `);
+  const scanActivity = db.prepare(`
+    SELECT COUNT(*) AS total_scans,
+      SUM(CASE WHEN was_rescan = 0 THEN 1 ELSE 0 END) AS first_scans,
+      SUM(CASE WHEN was_rescan = 1 THEN 1 ELSE 0 END) AS rescans,
+      MAX(scanned_at) AS last_scan_at
+    FROM recurrence_scan_events
+    WHERE scanned_at >= ?
   `);
   const getWalletToken = db.prepare(`
     SELECT * FROM recurrence_wallet_tokens
@@ -268,6 +288,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   }
 
   const ingestTx = db.transaction(({ tokenAddress: address, traders, tokenMeta, observedAt }) => {
+    const tokenBefore = getToken.get(address);
     const creatorAddress = creatorAddressFromToken(tokenMeta || {});
     const seenWallets = new Set();
     let accepted = 0;
@@ -313,6 +334,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     }
 
     markScanned.run(observedAt, address);
+    insertScanEvent.run(address, observedAt, num(tokenBefore?.scan_count) > 0 ? 1 : 0);
     return { accepted, rejected, rejectedByReason, uniqueWallets: seenWallets.size };
   });
 
@@ -339,6 +361,16 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
         walletTokenLinks: num(row.wallet_token_links),
         walletsSeen: num(row.wallets_seen),
         repeatWallets: num(row.repeat_wallets),
+        lastScanAt: row.last_scan_at == null ? null : num(row.last_scan_at),
+      };
+    },
+    scanActivity({ windowMs = 60 * 60 * 1000, at = Date.now() } = {}) {
+      const safeWindowMs = Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Number(windowMs) || 60 * 60 * 1000));
+      const row = scanActivity.get(Number(at) - safeWindowMs) || {};
+      return {
+        totalScans: num(row.total_scans),
+        firstScans: num(row.first_scans),
+        rescans: num(row.rescans),
         lastScanAt: row.last_scan_at == null ? null : num(row.last_scan_at),
       };
     },

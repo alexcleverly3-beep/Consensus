@@ -63,18 +63,42 @@ function isAuthorized(req, env = process.env) {
     safeEqual(decoded.slice(separator + 1), expected.password);
 }
 
-function createRecurrenceDashboardStore(db, { now = () => Date.now() } = {}) {
+function createRecurrenceDashboardStore(db, {
+  now = () => Date.now(),
+  defaultTargetScansPerHour = 12,
+  maxTargetScansPerHour = 18,
+} = {}) {
+  const safeMaxTarget = Math.max(1, Math.min(60, Math.floor(Number(maxTargetScansPerHour) || 18)));
+  const safeDefaultTarget = Math.max(1, Math.min(safeMaxTarget, Math.floor(Number(defaultTargetScansPerHour) || 12)));
   db.exec(`
     CREATE TABLE IF NOT EXISTS recurrence_wallet_checks (
       wallet_address TEXT PRIMARY KEY,
       checked INTEGER NOT NULL DEFAULT 1,
       checked_at INTEGER NOT NULL
-    )
+    );
+    CREATE TABLE IF NOT EXISTS recurrence_runtime_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `);
-  const scansLastHour = db.prepare(`
-    SELECT COUNT(*) AS count
-    FROM recurrence_token_queue
-    WHERE last_scanned_at IS NOT NULL AND last_scanned_at >= ?
+  db.prepare(`
+    INSERT OR IGNORE INTO recurrence_runtime_settings(key, value, updated_at)
+    VALUES ('target_scans_per_hour', ?, ?)
+  `).run(String(safeDefaultTarget), now());
+  const scanActivity = db.prepare(`
+    SELECT COUNT(*) AS total_scans,
+      SUM(CASE WHEN was_rescan = 0 THEN 1 ELSE 0 END) AS first_scans,
+      SUM(CASE WHEN was_rescan = 1 THEN 1 ELSE 0 END) AS rescans,
+      MAX(scanned_at) AS last_scan_at
+    FROM recurrence_scan_events
+    WHERE scanned_at >= ?
+  `);
+  const getTargetScans = db.prepare("SELECT value FROM recurrence_runtime_settings WHERE key = 'target_scans_per_hour'");
+  const setTargetScans = db.prepare(`
+    INSERT INTO recurrence_runtime_settings(key, value, updated_at)
+    VALUES ('target_scans_per_hour', ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `);
   const recurringCounts = db.prepare(`
     SELECT
@@ -149,17 +173,64 @@ function createRecurrenceDashboardStore(db, { now = () => Date.now() } = {}) {
     return [symbol, name].filter(Boolean).map(String).join(" · ").slice(0, 120);
   }
 
+  function throughput() {
+    const generatedAt = now();
+    const row = scanActivity.get(generatedAt - 60 * 60 * 1000) || {};
+    const storedTarget = Math.floor(Number(getTargetScans.get()?.value));
+    return {
+      generatedAt,
+      targetScansPerHour: Number.isFinite(storedTarget) ? Math.max(1, Math.min(safeMaxTarget, storedTarget)) : safeDefaultTarget,
+      maxTargetScansPerHour: safeMaxTarget,
+      scansLastHour: num(row.total_scans),
+      firstScansLastHour: num(row.first_scans),
+      rescansLastHour: num(row.rescans),
+      lastScanEventAt: row.last_scan_at == null ? null : num(row.last_scan_at),
+    };
+  }
+
   return {
-    stats(summary) {
-      const generatedAt = now();
+    stats(summary, gmgn = {}) {
+      const scanRate = throughput();
       const recurrence = recurringCounts.get() || {};
       return {
         ...summary,
-        generatedAt,
-        scansLastHour: num(scansLastHour.get(generatedAt - 60 * 60 * 1000)?.count),
+        ...scanRate,
         repeatWallets: num(recurrence.repeat_wallets),
         reviewWallets: num(recurrence.review_wallets),
+        gmgn: {
+          freshCalls: num(gmgn.freshCalls),
+          configuredMax: num(gmgn.maxFreshCalls),
+          effectiveMax: num(gmgn.effectiveMaxFreshCalls, num(gmgn.maxFreshCalls)),
+          remaining: num(gmgn.remaining),
+          rateLimitEvents: num(gmgn.rateLimitEvents),
+          cooldownRemainingMs: num(gmgn.cooldownRemainingMs),
+          windowMs: num(gmgn.windowMs, 20 * 60 * 1000),
+          lastRateLimitAt: gmgn.lastRateLimitAt == null ? null : num(gmgn.lastRateLimitAt),
+        },
       };
+    },
+    throughput,
+    scanPlan({ cycleCap = 3 } = {}) {
+      const state = throughput();
+      const remaining = Math.max(0, state.targetScansPerHour - state.scansLastHour);
+      const safeCycleCap = Math.max(1, Math.min(10, Math.floor(Number(cycleCap) || 3)));
+      if (remaining === 0) return { ...state, allowance: 0, reason: "hourly-target-reached" };
+      if (!state.lastScanEventAt) return { ...state, allowance: Math.min(safeCycleCap, remaining), reason: "initial-catch-up" };
+      const desiredGapMs = 60 * 60 * 1000 / state.targetScansPerHour;
+      const dueByPace = Math.floor(Math.max(0, state.generatedAt - state.lastScanEventAt) / desiredGapMs);
+      return {
+        ...state,
+        allowance: Math.min(safeCycleCap, remaining, dueByPace),
+        reason: dueByPace > 0 ? "scan-due" : "pace-wait",
+      };
+    },
+    setTargetScansPerHour(value) {
+      const target = Number(value);
+      if (!Number.isInteger(target) || target < 1 || target > safeMaxTarget) {
+        throw new Error(`target scans/hour must be a whole number from 1 to ${safeMaxTarget}`);
+      }
+      setTargetScans.run(String(target), now());
+      return { targetScansPerHour: target, maxTargetScansPerHour: safeMaxTarget };
     },
     wallets({ minDistinctTokens = 3, limit = 250 } = {}) {
       const min = Math.max(2, Math.min(100, Math.floor(Number(minDistinctTokens) || 3)));
@@ -223,6 +294,26 @@ function activityState(stats, { activeWindowMs = 30 * 60 * 1000 } = {}) {
     : { active: false, label: "INACTIVE", reason: `Last scan ${Math.floor(ageMs / 60000)}m ago` };
 }
 
+function throughputState(stats) {
+  const gmgn = stats?.gmgn || {};
+  if (num(gmgn.cooldownRemainingMs) > 0) {
+    return { kind: "blocked", label: "API cooldown", detail: `Provider rate limit detected; retrying in ${Math.ceil(num(gmgn.cooldownRemainingMs) / 1000)}s.` };
+  }
+  if (num(gmgn.effectiveMax) < num(gmgn.configuredMax)) {
+    return { kind: "limited", label: "Automatic backoff", detail: `Provider limit reduced the safe API budget to ${num(gmgn.effectiveMax)} calls per ${Math.round(num(gmgn.windowMs, 20 * 60 * 1000) / 60000)}m. It will recover gradually after clean windows.` };
+  }
+  if (num(gmgn.remaining) <= 0 && num(gmgn.configuredMax) > 0) {
+    return { kind: "limited", label: "API budget used", detail: "The local safety budget is full for this window; scanning resumes automatically when it resets." };
+  }
+  if (num(stats?.scansLastHour) >= num(stats?.targetScansPerHour)) {
+    return { kind: "healthy", label: "Target reached", detail: "The scanner is holding the configured rolling-hour target." };
+  }
+  if (num(stats?.queuedTokens) === 0) {
+    return { kind: "waiting", label: "Waiting for token intake", detail: "API capacity is available, but no unscanned or due-for-rescan tokens are queued." };
+  }
+  return { kind: "healthy", label: "Scanning toward target", detail: `${num(stats?.queuedTokens)} queued tokens are available and API protection is clear.` };
+}
+
 function renderPrivateDashboard(stats, wallets, {
   queue = [],
   minDistinctTokens = 3,
@@ -231,6 +322,10 @@ function renderPrivateDashboard(stats, wallets, {
   noticeKind = "success",
 } = {}) {
   const activity = activityState(stats);
+  const targetScansPerHour = Math.max(1, num(stats.targetScansPerHour, 12));
+  const maxTargetScansPerHour = Math.max(targetScansPerHour, num(stats.maxTargetScansPerHour, 18));
+  const firstScansLastHour = num(stats.firstScansLastHour);
+  const rescansLastHour = num(stats.rescansLastHour);
   const walletRows = wallets.length ? wallets.map((wallet, index) => {
     const flags = [wallet.everCreator ? "creator" : null, wallet.everInsider ? "insider" : null].filter(Boolean).join(", ") || "—";
     const checkLabel = wallet.checked ? "✓ Checked" : "Mark checked";
@@ -266,11 +361,18 @@ function renderPrivateDashboard(stats, wallets, {
   const thresholds = [2, 3, 5, 10].map((value) =>
     `<a class="filter ${Number(minDistinctTokens) === value ? "selected" : ""}" href="/?min=${value}">${value}+</a>`
   ).join("");
-  const noticeHtml = notice
+  const noticeMessage = notice
     ? `<div class="notice ${noticeKind === "error" ? "notice-error" : "notice-ok"}">${escapeHtml(notice)}</div>`
     : "";
+  const throughput = throughputState({ ...stats, targetScansPerHour });
+  const gmgn = stats.gmgn || {};
+  const windowMinutes = Math.max(1, Math.round(num(gmgn.windowMs, 20 * 60 * 1000) / 60000));
+  const lastLimit = gmgn.lastRateLimitAt ? ` Last provider limit: ${formatAge(gmgn.lastRateLimitAt, stats.generatedAt)} ago.` : "";
+  const throughputPanel = `<section class="throughput-panel"><div class="throughput-head"><div><div class="eyebrow">Adaptive throughput</div><h2>Scanner control</h2><p class="muted">Set the maximum successful token scans per rolling hour. The scanner paces toward it and automatically backs off before retrying after an API limit.</p></div><form class="target-form" method="post" action="/actions/scanner/target"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><label for="scan-target">Target scans/hour</label><div><input id="scan-target" name="target" type="number" min="1" max="${maxTargetScansPerHour}" value="${targetScansPerHour}" required><button class="button primary" type="submit">Save target</button></div><span>Allowed range: 1–${maxTargetScansPerHour}</span></form></div><div class="throughput-grid"><div><span>Actual / target</span><strong>${num(stats.scansLastHour)} / ${targetScansPerHour}</strong></div><div><span>First scans</span><strong>${firstScansLastHour}</strong></div><div><span>Rescans</span><strong>${rescansLastHour}</strong></div><div><span>Queue</span><strong>${num(stats.queuedTokens)}</strong></div><div><span>API calls</span><strong>${num(gmgn.freshCalls)} / ${num(gmgn.effectiveMax)}</strong><small>${windowMinutes}m window</small></div><div><span>Protection</span><strong>Automatic</strong><small>${num(gmgn.rateLimitEvents)} limits recorded</small></div></div><div class="throughput-status ${escapeHtml(throughput.kind)}"><strong>${escapeHtml(throughput.label)}</strong><span>${escapeHtml(throughput.detail + lastLimit)}</span></div></section>`;
+  const noticeHtml = `${noticeMessage}${throughputPanel}`;
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>Consensus Phase 1</title><style>
+.throughput-panel{margin:18px 0 0;border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,#121c28,#0d151e);padding:20px}.throughput-head{display:flex;justify-content:space-between;align-items:flex-start;gap:24px}.throughput-head p{max-width:760px;margin:6px 0 0}.target-form{min-width:270px}.target-form label{display:block;color:#91a4b8;font-size:12px;font-weight:700;margin-bottom:7px}.target-form div{display:flex;gap:8px}.target-form input{width:92px;background:#08111a;color:var(--text);border:1px solid #3a4b60;border-radius:9px;padding:9px 10px;font:inherit}.target-form span{display:block;color:var(--muted);font-size:11px;margin-top:6px}.throughput-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-top:17px}.throughput-grid>div{border:1px solid var(--border-soft);background:#0b131c;border-radius:10px;padding:11px}.throughput-grid span,.throughput-grid small{display:block;color:var(--muted);font-size:11px}.throughput-grid strong{display:block;font-size:20px;margin-top:5px}.throughput-grid small{margin-top:4px}.throughput-status{display:flex;gap:9px;align-items:center;margin-top:12px;padding:9px 11px;border:1px solid #2d5d43;background:#10251a;border-radius:9px;font-size:12px}.throughput-status span{color:#a9bdaf}.throughput-status.limited,.throughput-status.waiting{border-color:#66542f;background:#271f10}.throughput-status.limited span,.throughput-status.waiting span{color:#dbc38f}.throughput-status.blocked{border-color:#70333d;background:#2a1418}.throughput-status.blocked span{color:#efb0b7}@media(max-width:950px){.throughput-head{flex-direction:column}.target-form{min-width:0}.throughput-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:600px){.throughput-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.throughput-status{align-items:flex-start;flex-direction:column}}
 .wallet-checked{background:rgba(67,214,129,.045)}.wallet-checked td:first-child{box-shadow:inset 3px 0 0 var(--green)}.check-form{display:inline-block;margin-left:10px}.check-button{min-width:104px;border:1px solid #3d536c;background:#131e2b;color:#b7c7d8;padding:5px 8px;border-radius:8px;font:12px Inter,ui-sans-serif,system-ui,sans-serif;font-weight:650;cursor:pointer}.check-button:hover{border-color:#5b7694;color:#fff}.check-button.is-checked{border-color:#2d7950;background:#123321;color:#9aebbb}
 :root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--bg:#080d14;--panel:#111923;--panel2:#0d141d;--border:#243244;--border-soft:#1b2735;--text:#f1f5f9;--muted:#8ea1b5;--link:#67b2ff;--green:#43d681;--red:#ff6e7b;--amber:#f2bd58;--blue:#78b8ff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 16% -8%,#16253c 0,transparent 34%),radial-gradient(circle at 82% 0,#111c2d 0,transparent 28%),var(--bg);color:var(--text)}main{max-width:1480px;margin:0 auto;padding:30px 24px 64px}h1{margin:0;font-size:31px;letter-spacing:-.035em}h2{margin:0;font-size:20px}.header,.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.header{padding:4px 2px 0}.muted,.small{color:var(--muted)}.small{font-size:12px;margin-top:5px}.eyebrow{color:#7f93a9;font-size:11px;text-transform:uppercase;letter-spacing:.16em;margin-bottom:8px;font-weight:700}.header-copy{margin:7px 0 0;font-size:13px}.status-pill{display:flex;align-items:center;gap:8px;border:1px solid var(--border);background:rgba(15,23,34,.78);border-radius:999px;padding:8px 12px;font-size:12px;font-weight:750;letter-spacing:.035em}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 0 4px rgba(255,110,123,.09)}.status-pill.live .status-dot{background:var(--green);box-shadow:0 0 0 4px rgba(67,214,129,.09)}.hero{margin:20px 0 22px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(180deg,rgba(18,27,39,.96),rgba(11,18,27,.96));box-shadow:0 18px 45px rgba(0,0,0,.18);overflow:hidden}.hero-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr))}.hero-card{position:relative;padding:21px 20px 19px;min-height:112px;border-right:1px solid var(--border-soft)}.hero-card:last-child{border-right:0}.hero-card:before{content:"";position:absolute;left:20px;right:20px;top:0;height:1px;background:linear-gradient(90deg,transparent,rgba(120,184,255,.5),transparent);opacity:.5}.metric-label{font-size:11px;text-transform:uppercase;letter-spacing:.095em;color:#8195aa;font-weight:700}.metric-value{font-size:34px;line-height:1;font-weight:780;letter-spacing:-.035em;margin-top:11px;font-variant-numeric:tabular-nums}.metric-note{font-size:11.5px;color:#73879c;margin-top:8px}.hero-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:11px 18px;border-top:1px solid var(--border-soft);background:rgba(7,12,18,.32)}.ops{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.op{display:inline-flex;align-items:center;gap:6px;color:#8396aa;font-size:11.5px}.op strong{color:#d9e3ec;font-weight:700;font-variant-numeric:tabular-nums}.hero-freshness{color:#718499;font-size:11.5px}.card,.panel{border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,var(--panel),var(--panel2));box-shadow:0 8px 28px rgba(0,0,0,.16)}.active{color:var(--green)}.inactive{color:var(--red)}.panel{padding:20px;margin-top:18px}.section-head{margin-bottom:14px}.section-head p{margin:5px 0 0}.queue-form{display:flex;gap:10px;align-items:center;margin:14px 0 18px}.queue-form input[type=text]{flex:1;min-width:220px;background:#0a111a;color:var(--text);border:1px solid #334154;border-radius:10px;padding:11px 12px;font:inherit}.button{border:1px solid #3d536c;background:#182536;color:var(--text);padding:9px 12px;border-radius:9px;font-weight:650;cursor:pointer}.button.primary{background:#1c5ca0;border-color:#2876c7}.button.danger{background:#29171b;border-color:#66313b;color:#ffb3bb;padding:6px 9px;font-size:12px}.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:11px;background:#0c121a}table{width:100%;min-width:1050px;border-collapse:collapse}th,td{padding:11px 12px;border-bottom:1px solid #1f2a37;text-align:left;font-size:12.5px;white-space:nowrap;vertical-align:middle}th{color:#91a4b8;background:#0f1721;font-weight:650}tr:last-child td{border-bottom:0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.token-label{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:var(--muted);font-size:11px;margin-top:4px}.badge{display:inline-flex;border:1px solid #3d526a;background:#172331;border-radius:999px;padding:3px 8px;color:#b8c8d8}.badge.priority{border-color:#6355a2;background:#211d38;color:#d5c9ff}.badge.warn{border-color:#6b5631;background:#2a2112;color:#ffd88b}.badge.done{border-color:#285f41;background:#10271b;color:#aee8c5}.error-text{max-width:260px;overflow:hidden;text-overflow:ellipsis;color:#e9a4aa;margin-top:4px}.filters{display:flex;gap:7px;flex-wrap:wrap}.filter{display:inline-block;text-decoration:none;color:#a9bbce;border:1px solid #334154;background:#111a25;padding:6px 10px;border-radius:999px;font-size:12px}.filter.selected{background:#1a4d7e;border-color:#3476b4;color:white}a{color:var(--link)}.notice{margin:18px 0 0;border-radius:10px;padding:10px 12px;font-size:13px}.notice-ok{border:1px solid #285f41;background:#10271b;color:#aee8c5}.notice-error{border:1px solid #6c303a;background:#2a1217;color:#ffb6bf}.footer{margin-top:18px;font-size:12px;color:var(--muted)}@media(max-width:1100px){.hero-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.hero-card:nth-child(3){border-right:0}.hero-card:nth-child(-n+3){border-bottom:1px solid var(--border-soft)}}@media(max-width:700px){main{padding:20px 14px 48px}.header,.section-head,.queue-form,.hero-footer{align-items:stretch;flex-direction:column}.queue-form input[type=text]{width:100%}.hero-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.hero-card{border-right:1px solid var(--border-soft);border-bottom:1px solid var(--border-soft)}.hero-card:nth-child(2n){border-right:0}.hero-card:last-child{grid-column:1/-1;border-right:0}.metric-value{font-size:30px}.status-pill{align-self:flex-start}}
 </style></head><body><main><div class="header"><div><div class="eyebrow">Consensus · Phase 1</div><h1>Smart-wallet discovery</h1><p class="muted header-copy">Live recurrence collection across Solana token trader data.</p></div><div class="status-pill ${activity.active ? "live" : ""}"><span class="status-dot"></span><span>${activity.label}</span><span class="muted">· ${escapeHtml(activity.reason)}</span></div></div>${noticeHtml}<section class="hero"><div class="hero-grid">${primaryCards.map(([label, value, note]) => `<div class="hero-card"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value">${formatNumber(value)}</div><div class="metric-note">${escapeHtml(note)}</div></div>`).join("")}</div><div class="hero-footer"><div class="ops">${secondaryStats.map(([label, value], index) => `${index ? '<span class="muted">•</span>' : ''}<span class="op">${escapeHtml(label)} <strong>${formatNumber(value)}</strong></span>`).join("")}</div><div class="hero-freshness">Updated automatically every 30s</div></div></section><section class="panel"><div class="section-head"><div><h2>Scanner queue & recent activity</h2><p class="muted">Waiting tokens appear first. Manual additions are priority and may be scanned immediately; completed tokens stay visible here for one hour so they do not appear to vanish.</p></div><a href="/api/queue">Queue JSON</a></div><form class="queue-form" method="post" action="/actions/token/add"><input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}"><input type="text" name="token" maxlength="44" autocomplete="off" spellcheck="false" placeholder="Paste a Solana token CA" required><button class="button primary" type="submit">Add priority scan</button></form><div class="table-wrap"><table><thead><tr><th>#</th><th>Token</th><th>State</th><th>Source</th><th>Scans</th><th>State age</th><th>Last seen</th><th></th></tr></thead><tbody>${queueRows}</tbody></table></div></section><section class="panel"><div class="section-head"><div><h2>Recurring wallets — ${minDistinctTokens}+ distinct tokens</h2><p class="muted">Recurrence is a discovery signal, not yet a trust score. Creator/insider flags remain visible.</p></div><div class="filters">${thresholds}</div></div><div class="table-wrap"><table><thead><tr><th>#</th><th>Wallet</th><th>Distinct tokens</th><th>Appearances</th><th>Top 10</th><th>Top 25</th><th>Best rank</th><th>Avg best rank</th><th>Flags</th><th>Last seen</th></tr></thead><tbody>${walletRows}</tbody></table></div></section><div class="footer">Private data: <a href="/api/wallets?min=${encodeURIComponent(minDistinctTokens)}">wallet JSON</a> · <a href="/api/queue">queue/activity JSON</a> · public identity-free status: <a href="/health">health</a></div></main></body></html>`;
@@ -283,4 +385,5 @@ module.exports = {
   formatNumber,
   isAuthorized,
   renderPrivateDashboard,
+  throughputState,
 };

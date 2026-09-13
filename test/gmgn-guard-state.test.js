@@ -13,6 +13,7 @@ test("GMGN limiter state survives a database-backed store round trip", () => {
     freshCalls: 3,
     effectiveMaxFreshCalls: 4,
     rateLimitEvents: 2,
+    lastRateLimitAt: 4000,
     cleanWindows: 1,
     windowRateLimits: 0,
     blockedUntil: 5000,
@@ -24,6 +25,7 @@ test("GMGN limiter state survives a database-backed store round trip", () => {
     freshCalls: 3,
     effectiveMaxFreshCalls: 4,
     rateLimitEvents: 2,
+    lastRateLimitAt: 4000,
     cleanWindows: 1,
     windowRateLimits: 0,
     blockedUntil: 5000,
@@ -39,4 +41,3 @@ test("invalid persisted limiter state fails closed to an empty state", () => {
   assert.deepEqual(store.load(), {});
   db.close();
 });
-
