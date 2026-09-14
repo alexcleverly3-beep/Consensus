@@ -94,7 +94,9 @@ function initPhase2Runtime(db, {
   if (!authSecret) missingConfiguration.push("HELIUS_WEBHOOK_AUTH_SECRET");
   if (!publicBaseUrl) missingConfiguration.push("PUBLIC_BASE_URL or RAILWAY_PUBLIC_DOMAIN");
   const alertChannelId = String(env.DISCORD_ALERT_CHANNEL_ID || env.DISCORD_CHANNEL_ID || "").trim();
-  const refreshMs = boundedInt(env.TRACKED_WALLET_REFRESH_MINUTES, 360, 15, 1440) * 60_000;
+  // Phase 1 leaderboard entries are local SQLite data; refresh frequently
+  // enough to pick up newly eligible wallets without spending provider calls.
+  const refreshMs = boundedInt(env.TRACKED_WALLET_REFRESH_MINUTES, 30, 15, 1440) * 60_000;
   const reconcileMs = boundedInt(env.HELIUS_RECONCILE_INTERVAL_MINUTES, 30, 5, 1440) * 60_000;
   const maxReconcilePages = boundedInt(env.HELIUS_RECONCILE_MAX_PAGES, 3, 1, 10);
   const monthlyCreditBudget = boundedInt(env.HELIUS_MONTHLY_CREDIT_BUDGET, 800_000, 10_000, 100_000_000);
@@ -172,7 +174,7 @@ function initPhase2Runtime(db, {
       webhookId = result?.webhookID || result?.webhookId || webhookId;
       if (!webhookId) throw new Error("Helius did not return a webhook ID");
       updateProvider.run(webhookId, webhookUrl, desiredHash, desiredAuthHash, "active", now(), null);
-      logger.log(`[phase2] Helius webhook active for ${addresses.length} trusted wallet(s)`);
+      logger.log(`[phase2] Helius webhook active for ${addresses.length} Phase 1 trusted wallet(s)`);
       return { active: true, webhookId, tracked: addresses.length };
     } catch (error) {
       updateProvider.run(null, webhookUrl, desiredHash, desiredAuthHash, "error", now(), String(error?.message || error).slice(0, 1000));

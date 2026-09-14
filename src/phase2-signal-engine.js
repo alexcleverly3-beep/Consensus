@@ -4,6 +4,7 @@ const { trustedProfileQuality } = require("./wallet-quality");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SCORE_VERSION = "trusted-reputation-points-v1";
+const LEADERBOARD_SCORE_VERSION = "phase1-leaderboard-v1";
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
@@ -163,22 +164,78 @@ function tableExists(db, name) {
   return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name));
 }
 
-function canonicalTrustedProfiles(db, limit = 100) {
-  if (!tableExists(db, "wallet_profiles")) return [];
+function tableColumns(db, name) {
+  return tableExists(db, name)
+    ? new Set(db.prepare(`PRAGMA table_info(${name})`).all().map((column) => column.name))
+    : new Set();
+}
+
+function phase1LeaderboardProfiles(db, limit = 100) {
+  const columns = tableColumns(db, "recurrence_wallet_tokens");
+  const required = ["wallet_address", "token_address", "scan_appearances", "best_rank", "is_creator", "is_insider"];
+  if (required.some((column) => !columns.has(column))) return [];
   const boundedLimit = Math.max(1, Math.min(1000, Number(limit) || 100));
-  return db.prepare("SELECT * FROM wallet_profiles ORDER BY reputation_score DESC, confidence_score DESC, distinct_tokens DESC LIMIT ?")
-    .all(Math.min(1000, Math.max(boundedLimit, boundedLimit * 10)))
-    .map((profile) => ({ profile, quality: trustedProfileQuality(profile) }))
-    .filter((item) => item.quality.eligible)
-    .map(({ profile }) => ({
-      walletAddress: String(profile.wallet_address || "").trim(),
-      reputation: num(profile.reputation_score),
-      confidence: num(profile.confidence_score),
-      points: signalPoints(profile.reputation_score),
-      source: "trusted-profile",
-      scoreVersion: SCORE_VERSION,
-    }))
-    .filter((item) => SOL_ADDR.test(item.walletAddress) && item.points > 0)
+  const rows = db.prepare(`
+    SELECT wallet_address,
+      COUNT(*) AS distinct_tokens,
+      SUM(scan_appearances) AS total_appearances,
+      SUM(CASE WHEN best_rank <= 10 THEN 1 ELSE 0 END) AS top10_tokens,
+      SUM(CASE WHEN best_rank <= 25 THEN 1 ELSE 0 END) AS top25_tokens,
+      MIN(best_rank) AS best_rank,
+      MAX(is_creator) AS ever_creator,
+      MAX(is_insider) AS ever_insider
+    FROM recurrence_wallet_tokens
+    GROUP BY wallet_address
+    HAVING COUNT(*) >= 12
+    ORDER BY distinct_tokens DESC, top10_tokens DESC, top25_tokens DESC, best_rank ASC, wallet_address ASC
+    LIMIT ?
+  `).all(Math.min(1000, Math.max(boundedLimit, boundedLimit * 10)));
+  return rows.map((row) => {
+    const distinctTokens = Math.max(0, Math.floor(num(row.distinct_tokens)));
+    const top10Tokens = Math.max(0, Math.floor(num(row.top10_tokens)));
+    const top25Tokens = Math.max(0, Math.floor(num(row.top25_tokens)));
+    const bestRank = Math.max(0, Math.floor(num(row.best_rank)));
+    const top10Rate = distinctTokens ? top10Tokens / distinctTokens : 0;
+    // Recurrence is Phase 1 discovery evidence, so require breadth, repeated
+    // high-rank appearances, and no creator/insider flag before monitoring.
+    if (!SOL_ADDR.test(String(row.wallet_address || "").trim()) || Boolean(row.ever_creator) || Boolean(row.ever_insider)) return null;
+    if (distinctTokens < 12 || top10Tokens < 2 || top25Tokens < 4 || bestRank > 25) return null;
+    const reputation = Math.min(100, 70 + Math.min(18, (distinctTokens - 12) * 1.5) + Math.min(8, top10Rate * 16) + (bestRank <= 10 ? 4 : 0));
+    const confidence = Math.min(100, 75 + Math.min(15, distinctTokens - 12) + Math.min(10, top25Tokens / 2));
+    return {
+      walletAddress: String(row.wallet_address).trim(),
+      reputation: Math.round(reputation),
+      confidence: Math.round(confidence),
+      points: signalPoints(reputation),
+      source: "phase1-leaderboard",
+      scoreVersion: LEADERBOARD_SCORE_VERSION,
+    };
+  }).filter(Boolean).slice(0, boundedLimit);
+}
+
+function canonicalTrustedProfiles(db, limit = 100) {
+  const boundedLimit = Math.max(1, Math.min(1000, Number(limit) || 100));
+  const profileCandidates = tableExists(db, "wallet_profiles")
+    ? db.prepare("SELECT * FROM wallet_profiles ORDER BY reputation_score DESC, confidence_score DESC, distinct_tokens DESC LIMIT ?")
+      .all(Math.min(1000, Math.max(boundedLimit, boundedLimit * 10)))
+      .map((profile) => ({ profile, quality: trustedProfileQuality(profile) }))
+      .filter((item) => item.quality.eligible)
+      .map(({ profile }) => ({
+        walletAddress: String(profile.wallet_address || "").trim(),
+        reputation: num(profile.reputation_score),
+        confidence: num(profile.confidence_score),
+        points: signalPoints(profile.reputation_score),
+        source: "trusted-profile",
+        scoreVersion: SCORE_VERSION,
+      }))
+      .filter((item) => SOL_ADDR.test(item.walletAddress) && item.points > 0)
+    : [];
+  const merged = new Map();
+  for (const profile of [...profileCandidates, ...phase1LeaderboardProfiles(db, boundedLimit)]) {
+    if (!merged.has(profile.walletAddress)) merged.set(profile.walletAddress, profile);
+  }
+  return [...merged.values()]
+    .sort((left, right) => right.points - left.points || right.reputation - left.reputation || right.confidence - left.confidence || left.walletAddress.localeCompare(right.walletAddress))
     .slice(0, boundedLimit);
 }
 
@@ -461,6 +518,7 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
 }
 
 module.exports = {
+  LEADERBOARD_SCORE_VERSION,
   QUOTE_MINTS,
   SCORE_VERSION,
   USDC_MINT,
@@ -469,6 +527,7 @@ module.exports = {
   canonicalTrustedProfiles,
   enhancedSwapBuys,
   initPhase2SignalStore,
+  phase1LeaderboardProfiles,
   phase2Config,
   rawTransactionBuys,
   signalPoints,
