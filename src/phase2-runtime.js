@@ -86,7 +86,13 @@ function initPhase2Runtime(db, {
   const store = initPhase2SignalStore(db, { env, now });
   const apiKey = String(env.HELIUS_API_KEY || "").trim();
   const authSecret = String(env.HELIUS_WEBHOOK_AUTH_SECRET || "").trim();
-  const publicBaseUrl = normalizePublicBaseUrl(env.PUBLIC_BASE_URL);
+  const railwayDomain = String(env.RAILWAY_PUBLIC_DOMAIN || "").trim();
+  const publicBaseUrl = normalizePublicBaseUrl(env.PUBLIC_BASE_URL)
+    || normalizePublicBaseUrl(railwayDomain ? `https://${railwayDomain}` : "");
+  const missingConfiguration = [];
+  if (!apiKey) missingConfiguration.push("HELIUS_API_KEY");
+  if (!authSecret) missingConfiguration.push("HELIUS_WEBHOOK_AUTH_SECRET");
+  if (!publicBaseUrl) missingConfiguration.push("PUBLIC_BASE_URL or RAILWAY_PUBLIC_DOMAIN");
   const alertChannelId = String(env.DISCORD_ALERT_CHANNEL_ID || env.DISCORD_CHANNEL_ID || "").trim();
   const refreshMs = boundedInt(env.TRACKED_WALLET_REFRESH_MINUTES, 360, 15, 1440) * 60_000;
   const reconcileMs = boundedInt(env.HELIUS_RECONCILE_INTERVAL_MINUTES, 30, 5, 1440) * 60_000;
@@ -137,9 +143,10 @@ function initPhase2Runtime(db, {
 
   async function syncWebhook() {
     const addresses = store.trackedWallets().map((item) => item.walletAddress).sort();
-    if (!helius || !authSecret || !webhookUrl) {
-      updateProvider.run(null, webhookUrl || null, addressHash(addresses), secretHash(authSecret) || null, "needs-configuration", now(), "Set HELIUS_API_KEY, HELIUS_WEBHOOK_AUTH_SECRET and PUBLIC_BASE_URL");
-      return { active: false, reason: "needs-configuration" };
+    if (missingConfiguration.length) {
+      const detail = `Missing or invalid Railway variable${missingConfiguration.length === 1 ? "" : "s"}: ${missingConfiguration.join(", ")}`;
+      updateProvider.run(null, webhookUrl || null, addressHash(addresses), secretHash(authSecret) || null, "needs-configuration", now(), detail);
+      return { active: false, reason: "needs-configuration", missing: [...missingConfiguration] };
     }
     if (!addresses.length) {
       updateProvider.run(null, webhookUrl, addressHash(addresses), secretHash(authSecret), "awaiting-trusted-wallets", now(), null);
@@ -320,7 +327,20 @@ function initPhase2Runtime(db, {
 
   function status() {
     const result = store.stats(now());
-    return { ...result, monthlyCreditBudget, heliusCreditsRemaining: Math.max(0, monthlyCreditBudget - result.estimatedHeliusCredits), provider: providerState.get(), alertChannelConfigured: Boolean(alertChannelId), discordConnected: Boolean(discordClient) };
+    return {
+      ...result,
+      monthlyCreditBudget,
+      heliusCreditsRemaining: Math.max(0, monthlyCreditBudget - result.estimatedHeliusCredits),
+      provider: providerState.get(),
+      configuration: {
+        heliusApiKeyConfigured: Boolean(apiKey),
+        webhookAuthSecretConfigured: Boolean(authSecret),
+        publicBaseUrlConfigured: Boolean(publicBaseUrl),
+        missing: [...missingConfiguration],
+      },
+      alertChannelConfigured: Boolean(alertChannelId),
+      discordConnected: Boolean(discordClient),
+    };
   }
 
   function start() {

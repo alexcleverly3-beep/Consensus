@@ -70,6 +70,47 @@ test("webhook provisioning is batched and unchanged configuration does not spend
   assert.equal(calls.length, 2);
 });
 
+test("Railway's public domain is used when an explicit public base URL is absent", async () => {
+  const db = new Database(":memory:");
+  const calls = [];
+  const runtime = initPhase2Runtime(db, {
+    env: {
+      HELIUS_API_KEY: "api-key",
+      HELIUS_WEBHOOK_AUTH_SECRET: "auth-secret",
+      RAILWAY_PUBLIC_DOMAIN: "consensus.example.test",
+    },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      if (options.method === "GET") return new Response(JSON.stringify([]), { status: 200 });
+      return new Response(JSON.stringify({ webhookID: "hook-railway" }), { status: 200 });
+    },
+    autoStart: false,
+  });
+  runtime.store.refreshTrackedWallets(profiles(), 1_000);
+  assert.equal((await runtime.syncWebhook()).active, true);
+  assert.equal(JSON.parse(calls[1].options.body).webhookURL, "https://consensus.example.test/webhooks/helius");
+  assert.deepEqual(runtime.status().configuration.missing, []);
+});
+
+test("configuration diagnostics name missing variables without exposing secret values", async () => {
+  const db = new Database(":memory:");
+  const runtime = initPhase2Runtime(db, {
+    env: { PUBLIC_BASE_URL: "not-a-valid-url" },
+    autoStart: false,
+  });
+  const result = await runtime.syncWebhook();
+  assert.deepEqual(result.missing, [
+    "HELIUS_API_KEY",
+    "HELIUS_WEBHOOK_AUTH_SECRET",
+    "PUBLIC_BASE_URL or RAILWAY_PUBLIC_DOMAIN",
+  ]);
+  const status = runtime.status();
+  assert.deepEqual(status.configuration.missing, result.missing);
+  assert.match(status.provider.last_error, /HELIUS_API_KEY/);
+  assert.match(status.provider.last_error, /HELIUS_WEBHOOK_AUTH_SECRET/);
+  assert.match(status.provider.last_error, /PUBLIC_BASE_URL or RAILWAY_PUBLIC_DOMAIN/);
+});
+
 test("rotating the webhook secret updates Helius without storing the secret", async () => {
   const db = new Database(":memory:");
   const firstCalls = [];
