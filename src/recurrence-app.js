@@ -14,6 +14,7 @@ const {
   renderPrivateDashboard,
 } = require("./recurrence-dashboard");
 const { initPhase2WalletLab, renderPhase2WalletLab } = require("./phase2-wallet-lab");
+const { initPhase2Runtime } = require("./phase2-runtime");
 const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
 
 function clampInt(value, fallback, min, max) {
@@ -60,6 +61,37 @@ function readFormBody(req, maxBytes = 4096) {
       settled = true;
       reject(error);
     });
+  });
+}
+
+function readJsonBody(req, maxBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    req.on("data", (chunk) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        settled = true;
+        const error = new Error("request body too large");
+        error.status = 413;
+        reject(error);
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "null")); }
+      catch {
+        const error = new Error("invalid JSON body");
+        error.status = 400;
+        reject(error);
+      }
+    });
+    req.on("error", reject);
   });
 }
 
@@ -274,6 +306,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   const store = initRecurrenceStore(db, { rescanMs: rescanHours * 60 * 60 * 1000 });
   const dashboardStore = createRecurrenceDashboardStore(db, { defaultTargetScansPerHour, maxTargetScansPerHour });
   const phase2Lab = initPhase2WalletLab(db);
+  const phase2Signals = initPhase2Runtime(db, { env, autoStart: false });
   const cli = createCli({ minGapMs });
   const trendingProfiles = [
     { interval: "24h", orderBy: "volume" },
@@ -343,6 +376,25 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     try { requestUrl = new URL(req.url, "http://recurrence.local"); pathname = requestUrl.pathname; }
     catch { pathname = req.url; }
 
+    if (pathname === "/webhooks/helius") {
+      if (req.method !== "POST") {
+        res.writeHead(405, { "content-type": "application/json; charset=utf-8", allow: "POST" });
+        res.end(JSON.stringify({ error: "POST required" }));
+        return;
+      }
+      try {
+        const payload = await readJsonBody(req);
+        const result = phase2Signals.acceptWebhook(req.headers.authorization, payload);
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const status = Number(error?.status) || 400;
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ error: status === 401 ? "unauthorized" : String(error?.message || error).slice(0, 120) }));
+      }
+      return;
+    }
+
     if (pathname === "/health" || pathname === "/api/progress") {
       try {
         const health = publicHealth(store, gmgnGuard, Date.now(), dashboardStore.throughput());
@@ -357,12 +409,15 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
 
     const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" || pathname === "/api/queue" || pathname === "/api/throughput" ||
       pathname === "/actions/token/add" || pathname === "/actions/token/cancel" || pathname === "/actions/wallet/checked" || pathname === "/actions/scanner/target" || pathname === "/phase2" ||
-      pathname === "/api/phase2/wallets" || pathname === "/actions/phase2/analyze" || pathname === "/actions/phase2/label";
+      pathname === "/api/phase2/wallets" || pathname === "/api/phase2/signals" || pathname === "/actions/phase2/analyze" || pathname === "/actions/phase2/label" ||
+      pathname === "/actions/phase2/test-discord";
     if (privatePath) {
       if (!requirePrivateAccess(req, res)) return;
 
       if (pathname === "/phase2" || pathname === "/api/phase2/wallets") {
         const items = phase2Lab.list(100);
+        const signalStatus = phase2Signals.status();
+        const nearSignals = phase2Signals.store.nearSignals();
         if (pathname === "/api/phase2/wallets") {
           res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ generatedAt: Date.now(), wallets: items }, null, 2));
@@ -370,7 +425,24 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
         }
         const notice = String(requestUrl?.searchParams.get("notice") || "").slice(0, 180);
         res.writeHead(200, { ...privateHeaders, "content-type": "text/html; charset=utf-8" });
-        res.end(renderPhase2WalletLab(items, dashboardActionToken, notice));
+        res.end(renderPhase2WalletLab(items, dashboardActionToken, notice, { status: signalStatus, nearSignals }));
+        return;
+      }
+
+      if (pathname === "/api/phase2/signals") {
+        res.writeHead(200, { ...privateHeaders, "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ generatedAt: Date.now(), status: phase2Signals.status(), nearSignals: phase2Signals.store.nearSignals() }, null, 2));
+        return;
+      }
+
+      if (pathname === "/actions/phase2/test-discord") {
+        if (req.method !== "POST") { rejectPrivate(res, 405, "POST required"); return; }
+        try {
+          const form = await readFormBody(req);
+          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) { rejectPrivate(res, 403, "Invalid dashboard action token"); return; }
+          await phase2Signals.sendTestDiscord();
+          redirectNotice(res, "Discord test notification sent. No production signal was created.", "success", "/phase2");
+        } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error", "/phase2"); }
         return;
       }
 
@@ -495,11 +567,12 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   server.listen(port, host, () => {
     console.log(`[recurrence] listening on ${host}:${server.address()?.port || port}; interval=${intervalMinutes}m; trending=${trendingLimit}; scans/cycle=${tokensPerCycle}; target=${dashboardStore.throughput().targetScansPerHour}/h; target-max=${maxTargetScansPerHour}/h; top-traders=${traderLimit}; rescan=${rescanHours}h; trending-refresh=${trendingRefreshMinutes}m`);
   });
+  server.once("listening", () => phase2Signals.start());
   queueMicrotask(() => discoveryCycle());
   const timer = setInterval(discoveryCycle, intervalMinutes * 60 * 1000);
   timer.unref?.();
-  server.once("close", () => clearInterval(timer));
-  return { db, server, store, dashboardStore, phase2Lab, discoveryCycle };
+  server.once("close", () => { clearInterval(timer); phase2Signals.stop(); });
+  return { db, server, store, dashboardStore, phase2Lab, phase2Signals, discoveryCycle };
 }
 
-module.exports = { clampInt, createCli, createDiscoveryCycleRunner, isGlobalGmgnThrottle, publicHealth, readFormBody, renderDashboard, safeTokenEqual, startRecurrenceApp };
+module.exports = { clampInt, createCli, createDiscoveryCycleRunner, isGlobalGmgnThrottle, publicHealth, readFormBody, readJsonBody, renderDashboard, safeTokenEqual, startRecurrenceApp };

@@ -49,5 +49,6 @@ const discordPriority = require("./discord-priority-intake").startDiscordPriorit
   onQueued: recurrence.discoveryCycle,
 });
 if (discordPriority) {
+  recurrence.phase2Signals?.attachDiscordClient(discordPriority);
   recurrence.server.once("close", () => discordPriority.destroy?.());
 }

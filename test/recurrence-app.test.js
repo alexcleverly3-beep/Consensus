@@ -2,11 +2,13 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { PassThrough } = require("node:stream");
 const {
   clampInt,
   createDiscoveryCycleRunner,
   isGlobalGmgnThrottle,
   publicHealth,
+  readJsonBody,
 } = require("../src/recurrence-app");
 
 const TOKEN_A = "A".repeat(32);
@@ -17,6 +19,20 @@ test("missing dashboard query parameters keep their intended defaults", () => {
   assert.equal(clampInt("", 250, 1, 1000), 250);
   assert.equal(clampInt("4", 3, 2, 100), 4);
   assert.equal(clampInt("5000", 250, 1, 1000), 1000);
+});
+
+test("webhook JSON reader validates JSON and enforces its byte limit", async () => {
+  const valid = new PassThrough();
+  valid.end(JSON.stringify([{ signature: "one" }]));
+  assert.deepEqual(await readJsonBody(valid, 100), [{ signature: "one" }]);
+
+  const malformed = new PassThrough();
+  malformed.end("not-json");
+  await assert.rejects(readJsonBody(malformed, 100), (error) => error.status === 400);
+
+  const oversized = new PassThrough();
+  oversized.end(JSON.stringify({ payload: "x".repeat(200) }));
+  await assert.rejects(readJsonBody(oversized, 20), (error) => error.status === 413);
 });
 
 test("recurrence health exposes collection progress without wallet or token identities", () => {
