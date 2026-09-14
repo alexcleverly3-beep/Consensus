@@ -80,3 +80,16 @@ test("phase2 cards share the private checked marker without changing calibration
   assert.match(html, /✓ Checked/);
   db.close();
 });
+
+test("phase2 dashboard shows the provider's safe configuration diagnostic", () => {
+  const html = renderPhase2WalletLab([], "csrf-test", "", {
+    status: {
+      provider: {
+        status: "needs-configuration",
+        last_error: "Missing or invalid Railway variable: HELIUS_API_KEY",
+      },
+    },
+  });
+  assert.match(html, /Helius setup:/);
+  assert.match(html, /HELIUS_API_KEY/);
+});
