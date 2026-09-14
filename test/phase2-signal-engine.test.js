@@ -9,6 +9,7 @@ const {
   canonicalTrustedProfiles,
   enhancedSwapBuys,
   initPhase2SignalStore,
+  phase1LeaderboardProfiles,
   rawTransactionBuys,
   signalPoints,
 } = require("../src/phase2-signal-engine");
@@ -53,6 +54,38 @@ test("tracked selection uses the strict existing trust gate rather than recurren
   const selected = canonicalTrustedProfiles(db, 100);
   assert.deepEqual(selected.map((item) => item.walletAddress), [WALLET_A]);
   assert.equal(selected[0].points, 3);
+});
+
+test("tracked selection automatically includes strong Phase 1 leaderboard wallets", () => {
+  const db = new Database(":memory:");
+  db.exec(`CREATE TABLE recurrence_wallet_tokens (
+    wallet_address TEXT NOT NULL, token_address TEXT NOT NULL, scan_appearances INTEGER NOT NULL DEFAULT 1,
+    best_rank INTEGER NOT NULL, is_creator INTEGER NOT NULL DEFAULT 0, is_insider INTEGER NOT NULL DEFAULT 0
+  )`);
+  const insert = db.prepare("INSERT INTO recurrence_wallet_tokens VALUES (?,?,?,?,?,?)");
+  for (let index = 0; index < 12; index += 1) {
+    insert.run(WALLET_C, `${"C".repeat(31)}${index + 1}`, 1, index < 4 ? index + 1 : 20, 0, 0);
+  }
+  const selected = phase1LeaderboardProfiles(db, 100);
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].walletAddress, WALLET_C);
+  assert.equal(selected[0].source, "phase1-leaderboard");
+  assert.ok(selected[0].points >= 1);
+  assert.deepEqual(canonicalTrustedProfiles(db, 100).map((item) => item.walletAddress), [WALLET_C]);
+});
+
+test("Phase 1 leaderboard bridge excludes creator and insider wallets", () => {
+  const db = new Database(":memory:");
+  db.exec(`CREATE TABLE recurrence_wallet_tokens (
+    wallet_address TEXT NOT NULL, token_address TEXT NOT NULL, scan_appearances INTEGER NOT NULL DEFAULT 1,
+    best_rank INTEGER NOT NULL, is_creator INTEGER NOT NULL DEFAULT 0, is_insider INTEGER NOT NULL DEFAULT 0
+  )`);
+  const insert = db.prepare("INSERT INTO recurrence_wallet_tokens VALUES (?,?,?,?,?,?)");
+  for (let index = 0; index < 12; index += 1) {
+    insert.run(WALLET_A, `${"D".repeat(31)}${index + 1}`, 1, index < 4 ? index + 1 : 20, index === 0 ? 1 : 0, 0);
+    insert.run(WALLET_B, `${"E".repeat(31)}${index + 1}`, 1, index < 4 ? index + 1 : 20, 0, index === 0 ? 1 : 0);
+  }
+  assert.deepEqual(phase1LeaderboardProfiles(db, 100), []);
 });
 
 test("enhanced swaps accept quote-to-token buys and ignore transfers, sells and dust", () => {
