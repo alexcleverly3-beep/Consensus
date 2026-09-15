@@ -5,6 +5,7 @@ const { trustedProfileQuality } = require("./wallet-quality");
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SCORE_VERSION = "trusted-reputation-points-v1";
 const LEADERBOARD_SCORE_VERSION = "phase1-leaderboard-v2";
+const PERFORMANCE_SCORE_VERSION = "gmgn-performance-v1";
 const PHASE1_LEADERBOARD_GATE = Object.freeze({
   minDistinctTokens: 10,
   minTop10Tokens: 1,
@@ -277,7 +278,24 @@ function canonicalTrustedProfiles(db, limit = 100, { leaderboardGate = PHASE1_LE
   for (const profile of [...profileCandidates, ...phase1LeaderboardProfiles(db, boundedLimit, leaderboardGate)]) {
     if (!merged.has(profile.walletAddress)) merged.set(profile.walletAddress, profile);
   }
-  return [...merged.values()]
+  const performance = tableExists(db, "phase2_wallet_performance")
+    ? new Map(db.prepare("SELECT * FROM phase2_wallet_performance WHERE status='ready'").all().map((row) => [row.wallet_address, row]))
+    : new Map();
+  return [...merged.values()].map((profile) => {
+    const measured = performance.get(profile.walletAddress);
+    const performanceBonus = Math.max(0, Math.min(10, Math.floor(num(measured?.performance_bonus))));
+    if (!measured || performanceBonus <= 0) return { ...profile, performanceBonus: 0 };
+    const reputation = Math.min(100, num(profile.reputation) + performanceBonus);
+    return {
+      ...profile,
+      reputation,
+      points: signalPoints(reputation),
+      performanceBonus,
+      winRate: num(measured.win_rate),
+      performanceTokenCount: num(measured.token_count),
+      scoreVersion: `${profile.scoreVersion}+${PERFORMANCE_SCORE_VERSION}`,
+    };
+  })
     .sort((left, right) => right.points - left.points || right.reputation - left.reputation || right.confidence - left.confidence || left.walletAddress.localeCompare(right.walletAddress))
     .slice(0, boundedLimit);
 }
@@ -377,6 +395,25 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
       setting_value INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS phase2_wallet_performance (
+      wallet_address TEXT PRIMARY KEY,
+      analyzed_at INTEGER NOT NULL DEFAULT 0,
+      period TEXT NOT NULL DEFAULT '30d',
+      win_rate REAL NOT NULL DEFAULT 0,
+      realized_profit REAL NOT NULL DEFAULT 0,
+      total_cost REAL NOT NULL DEFAULT 0,
+      roi REAL NOT NULL DEFAULT 0,
+      token_count INTEGER NOT NULL DEFAULT 0,
+      positive_token_count INTEGER NOT NULL DEFAULT 0,
+      severe_loss_token_count INTEGER NOT NULL DEFAULT 0,
+      performance_bonus INTEGER NOT NULL DEFAULT 0,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'retry',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      stats_json TEXT NOT NULL DEFAULT '{}'
+    );
     CREATE INDEX IF NOT EXISTS idx_phase2_inbox_pending ON phase2_event_inbox(status, received_at);
     CREATE INDEX IF NOT EXISTS idx_phase2_buys_token_time ON phase2_wallet_buys(token_mint, bought_at DESC);
     CREATE INDEX IF NOT EXISTS idx_phase2_outbox_pending ON phase2_discord_outbox(status, next_attempt_at);
@@ -454,6 +491,22 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
   const nextOutbox = db.prepare(`SELECT o.*,a.payload_json FROM phase2_discord_outbox o JOIN phase2_signal_alerts a ON a.id=o.alert_id WHERE o.status IN ('pending','retry') AND o.next_attempt_at<=? ORDER BY o.next_attempt_at,o.alert_id LIMIT 1`);
   const markOutboxSent = db.prepare("UPDATE phase2_discord_outbox SET status='sent',attempts=attempts+1,sent_at=?,last_error=NULL WHERE alert_id=?");
   const markOutboxRetry = db.prepare("UPDATE phase2_discord_outbox SET status=?,attempts=attempts+1,next_attempt_at=?,last_error=? WHERE alert_id=?");
+  const performanceGet = db.prepare("SELECT * FROM phase2_wallet_performance WHERE wallet_address=?");
+  const performanceReady = db.prepare(`
+    INSERT INTO phase2_wallet_performance(wallet_address,analyzed_at,period,win_rate,realized_profit,total_cost,roi,token_count,positive_token_count,severe_loss_token_count,performance_bonus,reason,status,attempts,next_attempt_at,last_error,stats_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'ready',1,0,NULL,?)
+    ON CONFLICT(wallet_address) DO UPDATE SET analyzed_at=excluded.analyzed_at,period=excluded.period,win_rate=excluded.win_rate,
+      realized_profit=excluded.realized_profit,total_cost=excluded.total_cost,roi=excluded.roi,token_count=excluded.token_count,
+      positive_token_count=excluded.positive_token_count,severe_loss_token_count=excluded.severe_loss_token_count,
+      performance_bonus=excluded.performance_bonus,reason=excluded.reason,status='ready',attempts=phase2_wallet_performance.attempts+1,
+      next_attempt_at=0,last_error=NULL,stats_json=excluded.stats_json
+  `);
+  const performanceFailed = db.prepare(`
+    INSERT INTO phase2_wallet_performance(wallet_address,analyzed_at,status,attempts,next_attempt_at,last_error)
+    VALUES (?,0,'retry',1,?,?)
+    ON CONFLICT(wallet_address) DO UPDATE SET status='retry',attempts=phase2_wallet_performance.attempts+1,
+      next_attempt_at=excluded.next_attempt_at,last_error=excluded.last_error
+  `);
 
   const refreshWalletsTx = db.transaction((profiles, at) => {
     const desired = new Map(profiles.slice(0, config.trackedWalletLimit).map((profile) => [profile.walletAddress, profile]));
@@ -531,6 +584,32 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
       })();
       return loadSettings();
     },
+    performanceDueWallets(walletAddresses, { at = now(), limit = 5, refreshMs = 7 * 24 * 60 * 60_000 } = {}) {
+      const due = [];
+      for (const walletAddress of [...new Set((walletAddresses || []).map(String))]) {
+        if (!SOL_ADDR.test(walletAddress)) continue;
+        const current = performanceGet.get(walletAddress);
+        const stale = current?.status === "ready" && num(current.analyzed_at) <= at - refreshMs;
+        const retryable = current?.status !== "ready" && num(current?.next_attempt_at) <= at;
+        if (!current || stale || retryable) due.push(walletAddress);
+      }
+      return due.slice(0, Math.max(1, Math.min(20, Math.floor(num(limit, 5)))));
+    },
+    recordPerformance(walletAddress, result, { at = now(), period = "30d" } = {}) {
+      const wallet = String(walletAddress || "");
+      if (!SOL_ADDR.test(wallet)) throw new Error("valid Solana wallet address is required");
+      performanceReady.run(wallet, at, period, num(result?.winRate), num(result?.realizedProfit), num(result?.totalCost),
+        num(result?.roi), Math.max(0, Math.floor(num(result?.tokenCount))), Math.max(0, Math.floor(num(result?.positiveTokens))),
+        Math.max(0, Math.floor(num(result?.severeLossTokens))), Math.max(0, Math.min(10, Math.floor(num(result?.bonus)))),
+        String(result?.reason || ""), JSON.stringify(result?.raw || {}));
+      return performanceGet.get(wallet);
+    },
+    recordPerformanceFailure(walletAddress, error, { at = now(), retryMs = 6 * 60 * 60_000 } = {}) {
+      const wallet = String(walletAddress || "");
+      if (!SOL_ADDR.test(wallet)) return null;
+      performanceFailed.run(wallet, at + retryMs, String(error?.message || error).slice(0, 500));
+      return performanceGet.get(wallet);
+    },
     refreshTrackedWallets(profiles = canonicalTrustedProfiles(db, config.trackedWalletLimit, { leaderboardGate: config.phase1LeaderboardGate }), at = now()) {
       return refreshWalletsTx(profiles, at);
     },
@@ -605,6 +684,9 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
         (SELECT COUNT(*) FROM phase2_signal_alerts) signals,
         (SELECT COUNT(*) FROM phase2_discord_outbox WHERE status='sent') sent_alerts,
         (SELECT COUNT(*) FROM phase2_discord_outbox WHERE status IN ('retry','failed')) outbox_failures,
+        (SELECT COUNT(*) FROM phase2_wallet_performance WHERE status='ready') performance_analyzed,
+        (SELECT COUNT(*) FROM phase2_wallet_performance WHERE status='ready' AND performance_bonus>0) performance_bonused,
+        (SELECT MAX(analyzed_at) FROM phase2_wallet_performance WHERE status='ready') last_performance_at,
         (SELECT MAX(received_at) FROM phase2_event_inbox WHERE source='helius-webhook') last_webhook_at,
         (SELECT MAX(processed_at) FROM phase2_event_inbox WHERE status='done') last_processed_at
       `).get();
@@ -647,6 +729,7 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
 
 module.exports = {
   LEADERBOARD_SCORE_VERSION,
+  PERFORMANCE_SCORE_VERSION,
   PHASE1_LEADERBOARD_GATE,
   QUOTE_MINTS,
   SCORE_VERSION,

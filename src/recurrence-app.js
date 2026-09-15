@@ -15,6 +15,7 @@ const {
 } = require("./recurrence-dashboard");
 const { initPhase2WalletLab, renderPhase2WalletLab } = require("./phase2-wallet-lab");
 const { initPhase2Runtime } = require("./phase2-runtime");
+const { parseWalletStats } = require("./phase2-performance");
 const { resolveDbPath, resolveDiscoveryIntervalMinutes } = require("./runtime-config");
 
 function clampInt(value, fallback, min, max) {
@@ -311,6 +312,9 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   const defaultTargetScansPerHour = Math.min(requestedDefaultTarget, maxTargetScansPerHour);
   const configuredTokensPerCycle = clampInt(env.RECURRENCE_TOKENS_PER_CYCLE, 3, 1, 3);
   const tokensPerCycle = Math.min(3, Math.max(configuredTokensPerCycle, Math.ceil(maxTargetScansPerHour * intervalMinutes / 60)));
+  const performanceBatchSize = clampInt(env.PHASE2_PERFORMANCE_BATCH_SIZE, 5, 1, 10);
+  const performanceIntervalMinutes = clampInt(env.PHASE2_PERFORMANCE_INTERVAL_MINUTES, 30, 15, 1440);
+  const performanceRefreshDays = clampInt(env.PHASE2_PERFORMANCE_REFRESH_DAYS, 7, 1, 30);
   const store = initRecurrenceStore(db, { rescanMs: rescanHours * 60 * 60 * 1000 });
   const dashboardStore = createRecurrenceDashboardStore(db, { defaultTargetScansPerHour, maxTargetScansPerHour });
   const phase2Lab = initPhase2WalletLab(db);
@@ -336,6 +340,9 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   async function fetchWalletActivity(wallet) {
     return cli(["portfolio", "activity", "--chain", "sol", "--wallet", wallet, "--limit", "100", "--raw"]);
   }
+  async function fetchWalletStats(wallets) {
+    return cli(["portfolio", "stats", "--chain", "sol", "--wallet", ...wallets, "--period", "30d", "--raw"]);
+  }
 
   const runner = createDiscoveryCycleRunner({
     store,
@@ -346,6 +353,43 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     trendingRefreshMs: trendingRefreshMinutes * 60 * 1000,
   });
   const discoveryCycle = runner.discoveryCycle;
+  let performanceRunning = false;
+  async function performanceEnrichmentCycle() {
+    if (performanceRunning) return { skipped: true, reason: "already-running" };
+    const budget = typeof gmgnGuard?.snapshot === "function" ? gmgnGuard.snapshot() : null;
+    if (budget && Number(budget.remaining || 0) < 2) return { skipped: true, reason: "preserving-phase1-budget" };
+    const candidates = phase2Signals.candidateProfiles(100);
+    const due = phase2Signals.store.performanceDueWallets(candidates.map((profile) => profile.walletAddress), {
+      limit: performanceBatchSize,
+      refreshMs: performanceRefreshDays * 24 * 60 * 60_000,
+    });
+    if (!due.length) return { skipped: true, reason: "up-to-date" };
+
+    performanceRunning = true;
+    try {
+      const response = await fetchWalletStats(due);
+      const parsed = parseWalletStats(response, due);
+      let analyzed = 0;
+      for (const wallet of due) {
+        const result = parsed.get(wallet);
+        if (result) {
+          phase2Signals.store.recordPerformance(wallet, result);
+          analyzed += 1;
+        } else {
+          phase2Signals.store.recordPerformanceFailure(wallet, new Error("GMGN returned no wallet statistics"));
+        }
+      }
+      await phase2Signals.refreshAndSync();
+      console.log(`[phase2] GMGN performance enrichment analyzed ${analyzed}/${due.length} candidate wallet(s)`);
+      return { analyzed, requested: due.length };
+    } catch (error) {
+      if (!isGlobalGmgnThrottle(error)) {
+        for (const wallet of due) phase2Signals.store.recordPerformanceFailure(wallet, error);
+      }
+      console.warn(`[phase2] performance enrichment deferred: ${String(error?.message || error).slice(0, 240)}`);
+      return { skipped: true, reason: isGlobalGmgnThrottle(error) ? "gmgn-budget" : "provider-error" };
+    } finally { performanceRunning = false; }
+  }
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
   // Derive the action token from the existing private-dashboard secret so an
@@ -602,9 +646,15 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   server.once("listening", () => phase2Signals.start());
   queueMicrotask(() => discoveryCycle());
   const timer = setInterval(discoveryCycle, intervalMinutes * 60 * 1000);
+  const performanceStartTimer = setTimeout(() => performanceEnrichmentCycle()
+    .catch((error) => console.warn(`[phase2] performance scheduler failed: ${String(error?.message || error).slice(0, 240)}`)), 2 * 60 * 1000);
+  const performanceTimer = setInterval(() => performanceEnrichmentCycle()
+    .catch((error) => console.warn(`[phase2] performance scheduler failed: ${String(error?.message || error).slice(0, 240)}`)), performanceIntervalMinutes * 60 * 1000);
   timer.unref?.();
-  server.once("close", () => { clearInterval(timer); phase2Signals.stop(); });
-  return { db, server, store, dashboardStore, phase2Lab, phase2Signals, discoveryCycle };
+  performanceStartTimer.unref?.();
+  performanceTimer.unref?.();
+  server.once("close", () => { clearInterval(timer); clearTimeout(performanceStartTimer); clearInterval(performanceTimer); phase2Signals.stop(); });
+  return { db, server, store, dashboardStore, phase2Lab, phase2Signals, discoveryCycle, performanceEnrichmentCycle };
 }
 
 module.exports = { clampInt, createCli, createDiscoveryCycleRunner, isGlobalGmgnThrottle, publicHealth, readFormBody, readJsonBody, renderDashboard, safeTokenEqual, stableDashboardActionToken, startRecurrenceApp };

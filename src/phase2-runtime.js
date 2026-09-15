@@ -144,8 +144,14 @@ function initPhase2Runtime(db, {
   const cursorGet = db.prepare("SELECT * FROM phase2_reconcile_cursors WHERE wallet_address=?");
   const cursorSave = db.prepare(`INSERT INTO phase2_reconcile_cursors(wallet_address,last_signature,last_run_at,overflow_count,last_error) VALUES (?,?,?,COALESCE(?,0),?) ON CONFLICT(wallet_address) DO UPDATE SET last_signature=excluded.last_signature,last_run_at=excluded.last_run_at,overflow_count=overflow_count+excluded.overflow_count,last_error=excluded.last_error`);
 
+  function candidateProfiles(limit = 100) {
+    return canonicalTrustedProfiles(db, Math.max(1, Math.min(100, Number(limit) || 100)), { leaderboardGate: store.config.phase1LeaderboardGate });
+  }
+
   function refreshTrackedWallets() {
-    const profiles = canonicalTrustedProfiles(db, store.config.trackedWalletLimit, { leaderboardGate: store.config.phase1LeaderboardGate });
+    // Keep a 100-wallet candidate pool so cached performance can rank the best
+    // wallets correctly even when the active tracking cap is lower.
+    const profiles = candidateProfiles(100);
     const result = store.refreshTrackedWallets(profiles, now());
     return { ...result, eligible: profiles.length };
   }
@@ -372,7 +378,7 @@ function initPhase2Runtime(db, {
 
   function stop() { for (const timer of timers) clearInterval(timer); }
 
-  const runtime = { acceptWebhook, attachDiscordClient, discordSignalMessage, drainInbox, pumpOutbox, reconcile, refreshAndSync, sendTestDiscord, start, status, stop, store, syncWebhook, updateSettings };
+  const runtime = { acceptWebhook, attachDiscordClient, candidateProfiles, discordSignalMessage, drainInbox, pumpOutbox, reconcile, refreshAndSync, sendTestDiscord, start, status, stop, store, syncWebhook, updateSettings };
   if (autoStart) start();
   return runtime;
 }
