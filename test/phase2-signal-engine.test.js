@@ -296,6 +296,7 @@ test("Phase 2 reports the last wallet refresh and separates today's Helius credi
   assert.equal(status.heliusCallsThisMonth, 2);
   assert.equal(status.estimatedHeliusCreditsToday, 7);
   assert.equal(status.heliusCallsToday, 1);
+  assert.deepEqual(status.heliusUsageTodayByKind, { "webhook-delivery": { calls: 1, credits: 7 } });
   assert.deepEqual(store.heliusUsage(clock), { calls: 2, credits: 107, callsToday: 1, creditsToday: 7 });
 });
 

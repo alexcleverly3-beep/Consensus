@@ -431,6 +431,7 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
   `);
   const usageForMonth = db.prepare("SELECT COALESCE(SUM(calls),0) calls,COALESCE(SUM(credits),0) credits FROM phase2_helius_usage WHERE usage_month=?");
   const usageForDay = db.prepare("SELECT COALESCE(SUM(calls),0) calls,COALESCE(SUM(credits),0) credits FROM phase2_helius_daily_usage WHERE usage_day=?");
+  const usageKindsForDay = db.prepare("SELECT usage_kind,calls,credits FROM phase2_helius_daily_usage WHERE usage_day=? ORDER BY usage_kind");
   const currentWallet = db.prepare("SELECT * FROM phase2_tracked_wallets WHERE wallet_address=?");
   const allCurrentWallets = db.prepare("SELECT * FROM phase2_tracked_wallets ORDER BY points DESC, reputation DESC, wallet_address");
   const allHistoricalWallets = db.prepare("SELECT DISTINCT wallet_address FROM phase2_tracked_wallet_history");
@@ -611,6 +612,8 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
       const open = db.prepare("SELECT COUNT(DISTINCT token_mint) n FROM phase2_wallet_buys WHERE bought_at>=?").get(at - config.signalWindowMs)?.n || 0;
       const usage = usageForMonth.get(new Date(at).toISOString().slice(0, 7));
       const dailyUsage = usageForDay.get(new Date(at).toISOString().slice(0, 10));
+      const dailyUsageByKind = Object.fromEntries(usageKindsForDay.all(new Date(at).toISOString().slice(0, 10))
+        .map((row) => [row.usage_kind, { calls: num(row.calls), credits: num(row.credits) }]));
       return {
         ...counts,
         openTokens: open,
@@ -621,6 +624,7 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
         estimatedHeliusCredits: num(usage.credits),
         heliusCallsToday: num(dailyUsage.calls),
         estimatedHeliusCreditsToday: num(dailyUsage.credits),
+        heliusUsageTodayByKind: dailyUsageByKind,
         lastWalletRefreshAt: metrics.wallet_refresh_at == null ? null : num(metrics.wallet_refresh_at),
         config,
         scoreVersion: SCORE_VERSION,

@@ -26,8 +26,10 @@ function formatDuration(ms) {
   return minutes < 1 ? "under 1 minute" : `${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 
-function discordSignalMessage(signal) {
+function discordSignalMessage(signal, { sentAt = Date.now() } = {}) {
   const mint = signal.tokenMint;
+  const sentUnix = Math.floor(sentAt / 1000);
+  const formedUnix = Math.floor(signal.lastBuyAt / 1000);
   const contributions = (signal.contributions || []).map((item) =>
     `\`${short(item.walletAddress)}\` — **${item.points} point${item.points === 1 ? "" : "s"}**`
   ).join("\n");
@@ -38,11 +40,13 @@ function discordSignalMessage(signal) {
       description: `**${signal.walletCount} distinct wallets · ${signal.totalPoints} total points**\nDetected across ${formatDuration(signal.lastBuyAt - signal.firstBuyAt)}.`,
       fields: [
         { name: "Token contract", value: `\`${mint}\`` },
+        { name: "Consensus alert sent", value: `<t:${sentUnix}:F> · <t:${sentUnix}:R>` },
+        { name: "Signal formed", value: `<t:${formedUnix}:F>` },
         { name: "Wallet contributions", value: contributions || "Unavailable" },
         { name: "Research links", value: `[DexScreener](https://dexscreener.com/solana/${mint}) · [Solscan](https://solscan.io/token/${mint})` },
       ],
       footer: { text: "Token safety has not been checked. This is a research signal, not trading advice." },
-      timestamp: new Date(signal.lastBuyAt).toISOString(),
+      timestamp: new Date(sentAt).toISOString(),
     }],
   };
 }
@@ -233,7 +237,8 @@ function initPhase2Runtime(db, {
             store.markOutboxFailed(item.alert_id, new Error("Discord alert channel is unavailable"), { permanent: true, at: now() });
             break;
           }
-          await channel.send(discordSignalMessage(item.payload));
+          const sentAt = now();
+          await channel.send(discordSignalMessage(item.payload, { sentAt }));
           store.markOutboxSent(item.alert_id, now());
           sent += 1;
         } catch (error) {
@@ -340,6 +345,7 @@ function initPhase2Runtime(db, {
     return {
       ...result,
       monthlyCreditBudget,
+      dailyCreditAllowance: Math.floor(monthlyCreditBudget / 30),
       heliusCreditsRemaining: Math.max(0, monthlyCreditBudget - result.estimatedHeliusCredits),
       provider: providerState.get(),
       configuration: {

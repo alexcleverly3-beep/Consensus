@@ -125,3 +125,21 @@ test("phase2 dashboard displays refresh time, daily Helius usage, and the exact 
   assert.match(html, /action="\/actions\/phase2\/settings"/);
   assert.match(html, /Alert at 3\+ wallets and 6\+ points/);
 });
+
+test("phase2 dashboard warns on excessive daily Helius usage and shows the source", () => {
+  const html = renderPhase2WalletLab([], "csrf-test", "", {
+    status: {
+      estimatedHeliusCreditsToday: 52_000,
+      monthlyCreditBudget: 800_000,
+      dailyCreditAllowance: 26_666,
+      heliusUsageTodayByKind: {
+        "webhook-delivery": { calls: 40_000, credits: 40_000 },
+        rpc: { calls: 12_000, credits: 12_000 },
+      },
+    },
+  });
+  assert.match(html, /Credit warning:/);
+  assert.match(html, /40000 live events/);
+  assert.match(html, /12000 recovery checks/);
+  assert.match(html, /Live \/ recovery today/);
+});

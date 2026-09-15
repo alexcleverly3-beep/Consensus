@@ -165,6 +165,8 @@ test("earned signal is delivered by the existing Discord client and test message
   assert.equal(sent.length, 1);
   assert.equal(sent[0].id, "alerts");
   assert.match(sent[0].message.embeds[0].description, /3 distinct wallets · 7 total points/);
+  assert.equal(sent[0].message.embeds[0].fields.find((field) => field.name === "Consensus alert sent").value, "<t:4:F> · <t:4:R>");
+  assert.equal(sent[0].message.embeds[0].timestamp, new Date(4_000).toISOString());
   assert.doesNotMatch(JSON.stringify(sent[0].message), /amount|position size|sold/i);
   assert.equal(runtime.status().sent_alerts, 1);
 
