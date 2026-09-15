@@ -38,6 +38,14 @@ function safeTokenEqual(left, right) {
   return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
 }
 
+function stableDashboardActionToken(env = process.env) {
+  const credentials = dashboardCredentials(env);
+  if (!credentials.password) return "";
+  return crypto.createHmac("sha256", credentials.password)
+    .update(`consensus-dashboard-actions-v1\0${credentials.username}`)
+    .digest("hex");
+}
+
 function readFormBody(req, maxBytes = 4096) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -340,7 +348,10 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   const discoveryCycle = runner.discoveryCycle;
   const port = clampInt(env.PORT || env.DASHBOARD_PORT, 3000, 0, 65535);
   const host = env.DASHBOARD_HOST || "0.0.0.0";
-  const dashboardActionToken = crypto.randomBytes(24).toString("hex");
+  // Derive the action token from the existing private-dashboard secret so an
+  // ordinary Railway restart does not invalidate forms in an open browser tab.
+  // Changing the dashboard password intentionally invalidates old forms.
+  const dashboardActionToken = stableDashboardActionToken(env);
   const privateHeaders = {
     "cache-control": "no-store",
     "content-security-policy": "default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
@@ -596,4 +607,4 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
   return { db, server, store, dashboardStore, phase2Lab, phase2Signals, discoveryCycle };
 }
 
-module.exports = { clampInt, createCli, createDiscoveryCycleRunner, isGlobalGmgnThrottle, publicHealth, readFormBody, readJsonBody, renderDashboard, safeTokenEqual, startRecurrenceApp };
+module.exports = { clampInt, createCli, createDiscoveryCycleRunner, isGlobalGmgnThrottle, publicHealth, readFormBody, readJsonBody, renderDashboard, safeTokenEqual, stableDashboardActionToken, startRecurrenceApp };

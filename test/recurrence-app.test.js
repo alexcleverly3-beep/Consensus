@@ -9,9 +9,18 @@ const {
   isGlobalGmgnThrottle,
   publicHealth,
   readJsonBody,
+  stableDashboardActionToken,
 } = require("../src/recurrence-app");
 
 const TOKEN_A = "A".repeat(32);
+
+test("dashboard action token survives restarts but changes with private credentials", () => {
+  const first = stableDashboardActionToken({ DASHBOARD_PASSWORD: "private", DASHBOARD_USERNAME: "consensus" });
+  assert.equal(first, stableDashboardActionToken({ DASHBOARD_PASSWORD: "private", DASHBOARD_USERNAME: "consensus" }));
+  assert.notEqual(first, stableDashboardActionToken({ DASHBOARD_PASSWORD: "changed", DASHBOARD_USERNAME: "consensus" }));
+  assert.notEqual(first, stableDashboardActionToken({ DASHBOARD_PASSWORD: "private", DASHBOARD_USERNAME: "other" }));
+  assert.equal(stableDashboardActionToken({}), "");
+});
 
 test("missing dashboard query parameters keep their intended defaults", () => {
   assert.equal(clampInt(null, 3, 2, 100), 3);
