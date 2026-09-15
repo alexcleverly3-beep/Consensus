@@ -5,6 +5,14 @@ const { trustedProfileQuality } = require("./wallet-quality");
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SCORE_VERSION = "trusted-reputation-points-v1";
 const LEADERBOARD_SCORE_VERSION = "phase1-leaderboard-v1";
+const PHASE1_LEADERBOARD_GATE = Object.freeze({
+  minDistinctTokens: 12,
+  minTop10Tokens: 2,
+  minTop25Tokens: 4,
+  maxBestRank: 25,
+  excludeCreators: true,
+  excludeInsiders: true,
+});
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
@@ -30,6 +38,7 @@ function phase2Config(env = process.env) {
     realertPointsDelta: boundedInt(env.SIGNAL_REALERT_MIN_ADDITIONAL_POINTS, 3, 1, 100),
     minBuyLamports: boundedInt(env.SIGNAL_MIN_BUY_LAMPORTS, 10_000_000, 1_000_000, 10_000_000_000),
     minStableRaw: boundedInt(env.SIGNAL_MIN_STABLE_RAW, 1_000_000, 100_000, 1_000_000_000),
+    phase1LeaderboardGate: PHASE1_LEADERBOARD_GATE,
   };
 }
 
@@ -186,10 +195,10 @@ function phase1LeaderboardProfiles(db, limit = 100) {
       MAX(is_insider) AS ever_insider
     FROM recurrence_wallet_tokens
     GROUP BY wallet_address
-    HAVING COUNT(*) >= 12
+    HAVING COUNT(*) >= ?
     ORDER BY distinct_tokens DESC, top10_tokens DESC, top25_tokens DESC, best_rank ASC, wallet_address ASC
     LIMIT ?
-  `).all(Math.min(1000, Math.max(boundedLimit, boundedLimit * 10)));
+  `).all(PHASE1_LEADERBOARD_GATE.minDistinctTokens, Math.min(1000, Math.max(boundedLimit, boundedLimit * 10)));
   return rows.map((row) => {
     const distinctTokens = Math.max(0, Math.floor(num(row.distinct_tokens)));
     const top10Tokens = Math.max(0, Math.floor(num(row.top10_tokens)));
@@ -198,8 +207,13 @@ function phase1LeaderboardProfiles(db, limit = 100) {
     const top10Rate = distinctTokens ? top10Tokens / distinctTokens : 0;
     // Recurrence is Phase 1 discovery evidence, so require breadth, repeated
     // high-rank appearances, and no creator/insider flag before monitoring.
-    if (!SOL_ADDR.test(String(row.wallet_address || "").trim()) || Boolean(row.ever_creator) || Boolean(row.ever_insider)) return null;
-    if (distinctTokens < 12 || top10Tokens < 2 || top25Tokens < 4 || bestRank > 25) return null;
+    if (!SOL_ADDR.test(String(row.wallet_address || "").trim())) return null;
+    if (PHASE1_LEADERBOARD_GATE.excludeCreators && Boolean(row.ever_creator)) return null;
+    if (PHASE1_LEADERBOARD_GATE.excludeInsiders && Boolean(row.ever_insider)) return null;
+    if (distinctTokens < PHASE1_LEADERBOARD_GATE.minDistinctTokens ||
+        top10Tokens < PHASE1_LEADERBOARD_GATE.minTop10Tokens ||
+        top25Tokens < PHASE1_LEADERBOARD_GATE.minTop25Tokens ||
+        bestRank > PHASE1_LEADERBOARD_GATE.maxBestRank) return null;
     const reputation = Math.min(100, 70 + Math.min(18, (distinctTokens - 12) * 1.5) + Math.min(8, top10Rate * 16) + (bestRank <= 10 ? 4 : 0));
     const confidence = Math.min(100, 75 + Math.min(15, distinctTokens - 12) + Math.min(10, top25Tokens / 2));
     return {
@@ -321,6 +335,14 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(usage_month, usage_kind)
     );
+    CREATE TABLE IF NOT EXISTS phase2_helius_daily_usage (
+      usage_day TEXT NOT NULL,
+      usage_kind TEXT NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      credits INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(usage_day, usage_kind)
+    );
     CREATE INDEX IF NOT EXISTS idx_phase2_inbox_pending ON phase2_event_inbox(status, received_at);
     CREATE INDEX IF NOT EXISTS idx_phase2_buys_token_time ON phase2_wallet_buys(token_mint, bought_at DESC);
     CREATE INDEX IF NOT EXISTS idx_phase2_outbox_pending ON phase2_discord_outbox(status, next_attempt_at);
@@ -338,7 +360,12 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
     INSERT INTO phase2_helius_usage(usage_month,usage_kind,calls,credits,updated_at) VALUES (?,?,1,?,?)
     ON CONFLICT(usage_month,usage_kind) DO UPDATE SET calls=calls+1,credits=credits+excluded.credits,updated_at=excluded.updated_at
   `);
+  const dailyUsageUpsert = db.prepare(`
+    INSERT INTO phase2_helius_daily_usage(usage_day,usage_kind,calls,credits,updated_at) VALUES (?,?,1,?,?)
+    ON CONFLICT(usage_day,usage_kind) DO UPDATE SET calls=calls+1,credits=credits+excluded.credits,updated_at=excluded.updated_at
+  `);
   const usageForMonth = db.prepare("SELECT COALESCE(SUM(calls),0) calls,COALESCE(SUM(credits),0) credits FROM phase2_helius_usage WHERE usage_month=?");
+  const usageForDay = db.prepare("SELECT COALESCE(SUM(calls),0) calls,COALESCE(SUM(credits),0) credits FROM phase2_helius_daily_usage WHERE usage_day=?");
   const currentWallet = db.prepare("SELECT * FROM phase2_tracked_wallets WHERE wallet_address=?");
   const allCurrentWallets = db.prepare("SELECT * FROM phase2_tracked_wallets ORDER BY points DESC, reputation DESC, wallet_address");
   const allHistoricalWallets = db.prepare("SELECT DISTINCT wallet_address FROM phase2_tracked_wallet_history");
@@ -440,11 +467,24 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
     incrementMetric(key, at = now()) { metricIncrement.run(String(key), at); },
     setMetric(key, value, at = now()) { metricSet.run(String(key), Math.floor(num(value)), at); },
     recordHeliusUsage(kind, credits, at = now()) {
-      usageUpsert.run(new Date(at).toISOString().slice(0, 7), String(kind), Math.max(0, Math.floor(num(credits))), at);
+      const timestamp = new Date(at).toISOString();
+      const safeKind = String(kind);
+      const safeCredits = Math.max(0, Math.floor(num(credits)));
+      db.transaction(() => {
+        usageUpsert.run(timestamp.slice(0, 7), safeKind, safeCredits, at);
+        dailyUsageUpsert.run(timestamp.slice(0, 10), safeKind, safeCredits, at);
+      })();
     },
     heliusUsage(at = now()) {
-      const row = usageForMonth.get(new Date(at).toISOString().slice(0, 7));
-      return { calls: num(row.calls), credits: num(row.credits) };
+      const timestamp = new Date(at).toISOString();
+      const month = usageForMonth.get(timestamp.slice(0, 7));
+      const day = usageForDay.get(timestamp.slice(0, 10));
+      return {
+        calls: num(month.calls),
+        credits: num(month.credits),
+        callsToday: num(day.calls),
+        creditsToday: num(day.credits),
+      };
     },
     processNext() {
       const row = nextInbox.get();
@@ -490,6 +530,7 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
       const metrics = Object.fromEntries(db.prepare("SELECT metric_key,metric_value FROM phase2_metrics").all().map((row) => [row.metric_key, row.metric_value]));
       const open = db.prepare("SELECT COUNT(DISTINCT token_mint) n FROM phase2_wallet_buys WHERE bought_at>=?").get(at - config.signalWindowMs)?.n || 0;
       const usage = usageForMonth.get(new Date(at).toISOString().slice(0, 7));
+      const dailyUsage = usageForDay.get(new Date(at).toISOString().slice(0, 10));
       return {
         ...counts,
         openTokens: open,
@@ -498,6 +539,9 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
         reconcileOverflows: num(metrics.reconcile_overflows),
         heliusCallsThisMonth: num(usage.calls),
         estimatedHeliusCredits: num(usage.credits),
+        heliusCallsToday: num(dailyUsage.calls),
+        estimatedHeliusCreditsToday: num(dailyUsage.credits),
+        lastWalletRefreshAt: metrics.wallet_refresh_at == null ? null : num(metrics.wallet_refresh_at),
         config,
         scoreVersion: SCORE_VERSION,
       };
@@ -519,6 +563,7 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
 
 module.exports = {
   LEADERBOARD_SCORE_VERSION,
+  PHASE1_LEADERBOARD_GATE,
   QUOTE_MINTS,
   SCORE_VERSION,
   USDC_MINT,

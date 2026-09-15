@@ -93,3 +93,30 @@ test("phase2 dashboard shows the provider's safe configuration diagnostic", () =
   assert.match(html, /Helius setup:/);
   assert.match(html, /HELIUS_API_KEY/);
 });
+
+test("phase2 dashboard displays refresh time, daily Helius usage, and the exact Phase 1 entry gate", () => {
+  const html = renderPhase2WalletLab([], "csrf-test", "", {
+    status: {
+      lastWalletRefreshAt: Date.parse("2026-09-15T00:10:00Z"),
+      estimatedHeliusCreditsToday: 321,
+      config: {
+        trackedWalletLimit: 100,
+        phase1LeaderboardGate: {
+          minDistinctTokens: 12,
+          minTop10Tokens: 2,
+          minTop25Tokens: 4,
+          maxBestRank: 25,
+        },
+      },
+    },
+  });
+  assert.match(html, /Last wallet refresh/);
+  assert.match(html, /15 Sept, 01:10:00 UK/);
+  assert.match(html, /Helius credits today/);
+  assert.match(html, />321</);
+  assert.match(html, /12\+ distinct Phase 1 tokens/);
+  assert.match(html, /2\+ top-10 appearances/);
+  assert.match(html, /4\+ top-25 appearances/);
+  assert.match(html, /best rank 25 or better/);
+  assert.match(html, /top 100 qualifying wallets/);
+});

@@ -245,6 +245,23 @@ test("additive signal-store initialization preserves existing Phase 1 and Phase 
   assert.equal(store.trackedWallets().length, 1);
 });
 
+test("Phase 2 reports the last wallet refresh and separates today's Helius credits", () => {
+  const db = new Database(":memory:");
+  let clock = Date.parse("2026-09-14T23:50:00Z");
+  const store = initPhase2SignalStore(db, { now: () => clock });
+  store.refreshTrackedWallets([profilesForStore(WALLET_A, 3)], clock);
+  store.recordHeliusUsage("webhook-management", 100, clock);
+  clock = Date.parse("2026-09-15T00:10:00Z");
+  store.recordHeliusUsage("webhook-delivery", 7, clock);
+  const status = store.stats(clock);
+  assert.equal(status.lastWalletRefreshAt, Date.parse("2026-09-14T23:50:00Z"));
+  assert.equal(status.estimatedHeliusCredits, 107);
+  assert.equal(status.heliusCallsThisMonth, 2);
+  assert.equal(status.estimatedHeliusCreditsToday, 7);
+  assert.equal(status.heliusCallsToday, 1);
+  assert.deepEqual(store.heliusUsage(clock), { calls: 2, credits: 107, callsToday: 1, creditsToday: 7 });
+});
+
 function profilesForStore(walletAddress, points) {
   return { walletAddress, reputation: points === 3 ? 92 : 82, confidence: 90, points, source: "test", scoreVersion: "v1" };
 }

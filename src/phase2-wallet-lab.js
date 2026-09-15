@@ -208,6 +208,20 @@ function esc(value) {
   return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
 
+function formatUkTime(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "Not yet";
+  return `${new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date(timestamp))} UK`;
+}
+
 function renderPhase2WalletLab(items, csrfToken = "", notice = "", live = {}) {
   const cards = items.length ? items.map((item) => {
     const m = item.analysis.metrics;
@@ -219,8 +233,10 @@ function renderPhase2WalletLab(items, csrfToken = "", notice = "", live = {}) {
   const status = live.status || {};
   const provider = status.provider || {};
   const config = status.config || {};
+  const gate = config.phase1LeaderboardGate || {};
   const liveCards = [
     ["Tracked wallets", status.tracked_wallets || 0], ["Provider", provider.status || "disabled"],
+    ["Last wallet refresh", formatUkTime(status.lastWalletRefreshAt)], ["Helius credits today", status.estimatedHeliusCreditsToday || 0],
     ["Events received", status.inbox_events || 0], ["Genuine buys", status.genuine_buys || 0],
     ["Open tokens", status.openTokens || 0], ["Signals sent", status.sent_alerts || 0],
     ["Duplicates blocked", status.duplicateEvents || 0], ["Delivery issues", status.outbox_failures || 0],
@@ -232,8 +248,11 @@ function renderPhase2WalletLab(items, csrfToken = "", notice = "", live = {}) {
   const providerNote = provider.last_error && provider.status !== "active"
     ? `<p class="provider-note"><strong>Helius setup:</strong> ${esc(provider.last_error)}</p>`
     : "";
-  const livePanel = `<section class="live"><div class="live-head"><div><h2>Live wallet signals</h2><p>Separate Phase 2 monitoring. Phase 1 scanning continues unchanged.</p></div><form method="post" action="/actions/phase2/test-discord"><input type="hidden" name="csrf" value="${esc(csrfToken)}"><button type="submit">Send Discord test</button></form></div><div class="live-grid">${liveCards}</div>${providerNote}<p class="settings">Alert at ${esc(config.minDistinctWallets || 2)}+ wallets and ${esc(config.pointsThreshold || 5)}+ points within ${esc(Math.round((config.signalWindowMs || 3600000)/60000))} minutes.</p><details><summary>Near-threshold tokens</summary><table><thead><tr><th>Token</th><th>Wallets</th><th>Points</th></tr></thead><tbody>${nearSignals}</tbody></table></details></section>`;
+  const entryRule = gate.minDistinctTokens
+    ? `<p class="settings"><strong>Phase 2 entry:</strong> ${esc(gate.minDistinctTokens)}+ distinct Phase 1 tokens, ${esc(gate.minTop10Tokens)}+ top-10 appearances, ${esc(gate.minTop25Tokens)}+ top-25 appearances, best rank ${esc(gate.maxBestRank)} or better, and no creator/insider flags. Tracks the top ${esc(config.trackedWalletLimit || 100)} qualifying wallets.</p>`
+    : "";
+  const livePanel = `<section class="live"><div class="live-head"><div><h2>Live wallet signals</h2><p>Separate Phase 2 monitoring. Phase 1 scanning continues unchanged.</p></div><form method="post" action="/actions/phase2/test-discord"><input type="hidden" name="csrf" value="${esc(csrfToken)}"><button type="submit">Send Discord test</button></form></div><div class="live-grid">${liveCards}</div>${providerNote}<p class="settings">Alert at ${esc(config.minDistinctWallets || 2)}+ wallets and ${esc(config.pointsThreshold || 5)}+ points within ${esc(Math.round((config.signalWindowMs || 3600000)/60000))} minutes.</p>${entryRule}<details><summary>Near-threshold tokens</summary><table><thead><tr><th>Token</th><th>Wallets</th><th>Points</th></tr></thead><tbody>${nearSignals}</tbody></table></details></section>`;
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Consensus Phase 2 Lab</title><style>:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#080d14;color:#edf4fa}*{box-sizing:border-box}body{margin:0}main{max-width:1120px;margin:auto;padding:32px 20px}a{color:#69b5ff}h1{margin:0;font-size:30px}h2{margin:0}.sub{color:#8fa2b7;margin:8px 0 22px}.notice{background:#10271b;border:1px solid #285f41;padding:10px 12px;border-radius:10px;margin-bottom:16px}.live{background:#0e1822;border:1px solid #274057;border-radius:14px;padding:18px;margin-bottom:22px}.live-head{display:flex;align-items:center;justify-content:space-between;gap:16px}.live-head p,.settings{color:#8fa2b7;margin:6px 0 0}.provider-note{color:#ffd68a;background:#261d0d;border:1px solid #654a20;border-radius:9px;padding:10px 12px;margin:0 0 12px}.live-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:16px 0}.live-card{background:#091019;border:1px solid #223344;border-radius:10px;padding:12px}.live-card span{display:block;color:#8fa2b7;font-size:12px}.live-card strong{display:block;font-size:20px;margin-top:4px}.live details{margin-top:14px}.live table{width:100%;border-collapse:collapse;margin-top:10px}.live th,.live td{text-align:left;padding:8px;border-bottom:1px solid #223344;font-size:12px}.analyze{display:flex;gap:10px;background:#111923;border:1px solid #253243;padding:16px;border-radius:14px;margin-bottom:22px}.analyze input{flex:1;background:#091019;color:#fff;border:1px solid #34465a;border-radius:9px;padding:12px}.analyze button,form button{background:#18304a;color:#fff;border:1px solid #355675;border-radius:8px;padding:8px 11px;cursor:pointer}.wallet{display:flex;gap:18px;border:1px solid #263443;background:#101720;border-radius:14px;padding:18px;margin:12px 0}.score{font-size:38px;font-weight:800;min-width:100px}.score span{font-size:13px;color:#899bad}.body{flex:1}.addr{font-family:ui-monospace,monospace}.meta{color:#97a9bb;margin:7px 0 10px;font-size:13px}.metrics{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.metrics span{background:#0b121a;border:1px solid #243240;border-radius:999px;padding:5px 8px;font-size:12px}.sel{border-color:#4bbf79!important}.bad{color:#ffadb5}.sel.bad{border-color:#d45c67!important}.empty{color:#8fa2b7;padding:20px;text-align:center}@media(max-width:800px){.live-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.analyze,.wallet,.live-head{flex-direction:column;align-items:stretch}.score{min-width:0}}</style></head><body><main><h1>Phase 2 — Wallet Lab</h1><p class="sub">Manual calibration workspace. Scores are provisional research scores, not trusted-wallet promotion.</p>${notice ? `<div class="notice">${esc(notice)}</div>` : ""}${livePanel}<form class="analyze" method="post" action="/actions/phase2/analyze"><input type="hidden" name="csrf" value="${esc(csrfToken)}"><input name="wallet" maxlength="44" placeholder="Paste Solana wallet address" required><button type="submit">Analyse wallet</button></form>${cards}</main></body></html>`;
 }
 
-module.exports = { initPhase2WalletLab, renderPhase2WalletLab, scoreWalletActivity };
+module.exports = { formatUkTime, initPhase2WalletLab, renderPhase2WalletLab, scoreWalletActivity };
