@@ -50,7 +50,9 @@ function discordSignalMessage(signal) {
 function webhookBody(url, addresses, secret) {
   return {
     webhookURL: url,
-    transactionTypes: ["SWAP"],
+    // Raydium-style DEX activity is classified as SWAP, while Pump AMM emits
+    // BUY/SELL. Subscribe to SWAP and BUY, then admit only quote-to-token buys.
+    transactionTypes: ["SWAP", "BUY"],
     accountAddresses: addresses,
     webhookType: "enhanced",
     authHeader: secret,
@@ -138,7 +140,7 @@ function initPhase2Runtime(db, {
   const cursorSave = db.prepare(`INSERT INTO phase2_reconcile_cursors(wallet_address,last_signature,last_run_at,overflow_count,last_error) VALUES (?,?,?,COALESCE(?,0),?) ON CONFLICT(wallet_address) DO UPDATE SET last_signature=excluded.last_signature,last_run_at=excluded.last_run_at,overflow_count=overflow_count+excluded.overflow_count,last_error=excluded.last_error`);
 
   function refreshTrackedWallets() {
-    const profiles = canonicalTrustedProfiles(db, store.config.trackedWalletLimit);
+    const profiles = canonicalTrustedProfiles(db, store.config.trackedWalletLimit, { leaderboardGate: store.config.phase1LeaderboardGate });
     const result = store.refreshTrackedWallets(profiles, now());
     return { ...result, eligible: profiles.length };
   }
@@ -314,6 +316,11 @@ function initPhase2Runtime(db, {
     return result;
   }
 
+  async function updateSettings(settings) {
+    store.updateSettings(settings);
+    return refreshAndSync();
+  }
+
   async function sendTestDiscord() {
     if (!discordClient || !alertChannelId) throw new Error("Discord alert delivery is not configured");
     const channel = await discordClient.channels.fetch(alertChannelId).catch(() => null);
@@ -358,7 +365,7 @@ function initPhase2Runtime(db, {
 
   function stop() { for (const timer of timers) clearInterval(timer); }
 
-  const runtime = { acceptWebhook, attachDiscordClient, discordSignalMessage, drainInbox, pumpOutbox, reconcile, refreshAndSync, sendTestDiscord, start, status, stop, store, syncWebhook };
+  const runtime = { acceptWebhook, attachDiscordClient, discordSignalMessage, drainInbox, pumpOutbox, reconcile, refreshAndSync, sendTestDiscord, start, status, stop, store, syncWebhook, updateSettings };
   if (autoStart) start();
   return runtime;
 }

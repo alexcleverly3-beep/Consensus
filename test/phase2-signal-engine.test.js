@@ -17,6 +17,7 @@ const {
 const WALLET_A = "CaHbjM1AGhDPBR6JwiNHaUZAJBykqvj9LPxDouxXbiWB";
 const WALLET_B = "7YttLkHDo4yisJ9fsgFj6aNfA7SKz3JcM1wQh2Ve8XrP";
 const WALLET_C = "8YttLkHDo4yisJ9fsgFj6aNfA7SKz3JcM1wQh2Ve8XrQ";
+const WALLET_D = "9ZttLkHDo4yisJ9fsgFj6aNfA7SKz3JcM1wQh2Ve8XrS";
 const TOKEN = "9YttLkHDo4yisJ9fsgFj6aNfA7SKz3JcM1wQh2Ve8XrR";
 
 function enhanced({ wallet = WALLET_A, signature = "sig-1", token = TOKEN, timestamp = 2 } = {}) {
@@ -63,8 +64,8 @@ test("tracked selection automatically includes strong Phase 1 leaderboard wallet
     best_rank INTEGER NOT NULL, is_creator INTEGER NOT NULL DEFAULT 0, is_insider INTEGER NOT NULL DEFAULT 0
   )`);
   const insert = db.prepare("INSERT INTO recurrence_wallet_tokens VALUES (?,?,?,?,?,?)");
-  for (let index = 0; index < 12; index += 1) {
-    insert.run(WALLET_C, `${"C".repeat(31)}${index + 1}`, 1, index < 4 ? index + 1 : 20, 0, 0);
+  for (let index = 0; index < 10; index += 1) {
+    insert.run(WALLET_C, `${"C".repeat(31)}${index + 1}`, 1, index === 0 ? 8 : 45, 0, 0);
   }
   const selected = phase1LeaderboardProfiles(db, 100);
   assert.equal(selected.length, 1);
@@ -74,7 +75,7 @@ test("tracked selection automatically includes strong Phase 1 leaderboard wallet
   assert.deepEqual(canonicalTrustedProfiles(db, 100).map((item) => item.walletAddress), [WALLET_C]);
 });
 
-test("Phase 1 leaderboard bridge excludes creator and insider wallets", () => {
+test("Phase 1 leaderboard bridge allows creator and insider wallets during calibration", () => {
   const db = new Database(":memory:");
   db.exec(`CREATE TABLE recurrence_wallet_tokens (
     wallet_address TEXT NOT NULL, token_address TEXT NOT NULL, scan_appearances INTEGER NOT NULL DEFAULT 1,
@@ -85,7 +86,7 @@ test("Phase 1 leaderboard bridge excludes creator and insider wallets", () => {
     insert.run(WALLET_A, `${"D".repeat(31)}${index + 1}`, 1, index < 4 ? index + 1 : 20, index === 0 ? 1 : 0, 0);
     insert.run(WALLET_B, `${"E".repeat(31)}${index + 1}`, 1, index < 4 ? index + 1 : 20, 0, index === 0 ? 1 : 0);
   }
-  assert.deepEqual(phase1LeaderboardProfiles(db, 100), []);
+  assert.deepEqual(phase1LeaderboardProfiles(db, 100).map((profile) => profile.walletAddress), [WALLET_B, WALLET_A]);
 });
 
 test("enhanced swaps accept quote-to-token buys and ignore transfers, sells and dust", () => {
@@ -103,6 +104,16 @@ test("enhanced swaps accept quote-to-token buys and ignore transfers, sells and 
   assert.deepEqual(enhancedSwapBuys(dust, tracked), []);
   const quoteOutput = enhanced({ token: USDC_MINT });
   assert.deepEqual(enhancedSwapBuys(quoteOutput, tracked), []);
+});
+
+test("enhanced BUY events cover classified launchpad buys without accepting sells", () => {
+  const buy = {
+    type: "BUY", signature: "classified-buy", timestamp: 2, feePayer: WALLET_A,
+    nativeTransfers: [{ fromUserAccount: WALLET_A, toUserAccount: WALLET_B, amount: 50_000_000 }],
+    tokenTransfers: [{ fromUserAccount: WALLET_B, toUserAccount: WALLET_A, tokenAmount: 100, mint: TOKEN }],
+  };
+  assert.deepEqual(enhancedSwapBuys(buy, new Set([WALLET_A])).map((item) => item.tokenMint), [TOKEN]);
+  assert.deepEqual(enhancedSwapBuys({ ...buy, type: "SELL", signature: "classified-sell" }, new Set([WALLET_A])), []);
 });
 
 test("raw reconciliation requires a signer spending a quote asset and gaining a token", () => {
@@ -133,6 +144,7 @@ test("store freezes points, deduplicates rebuys and creates one durable threshol
   store.refreshTrackedWallets([
     { walletAddress: WALLET_A, reputation: 92, confidence: 90, points: 3, source: "test", scoreVersion: "v1" },
     { walletAddress: WALLET_B, reputation: 82, confidence: 85, points: 2, source: "test", scoreVersion: "v1" },
+    { walletAddress: WALLET_C, reputation: 75, confidence: 80, points: 1, source: "test", scoreVersion: "v1" },
   ], clock);
 
   clock = 2_000;
@@ -140,16 +152,19 @@ test("store freezes points, deduplicates rebuys and creates one durable threshol
   assert.equal(first.alerted, false);
   clock = 3_000;
   const second = store.recordBuy({ signature: "b1", walletAddress: WALLET_B, tokenMint: TOKEN, boughtAt: clock, source: "test" });
-  assert.equal(second.alerted, true);
-  assert.equal(second.signal.walletCount, 2);
-  assert.equal(second.signal.totalPoints, 5);
-  assert.equal(store.nextOutbox().alert_id, second.alertId);
+  assert.equal(second.alerted, false);
+  clock = 3_500;
+  const third = store.recordBuy({ signature: "c1", walletAddress: WALLET_C, tokenMint: TOKEN, boughtAt: clock, source: "test" });
+  assert.equal(third.alerted, true);
+  assert.equal(third.signal.walletCount, 3);
+  assert.equal(third.signal.totalPoints, 6);
+  assert.equal(store.nextOutbox().alert_id, third.alertId);
 
   clock = 4_000;
   const rebuy = store.recordBuy({ signature: "a2", walletAddress: WALLET_A, tokenMint: TOKEN, boughtAt: clock, source: "test" });
   assert.equal(rebuy.alerted, false);
-  assert.equal(rebuy.signal.walletCount, 2);
-  assert.equal(rebuy.signal.totalPoints, 5);
+  assert.equal(rebuy.signal.walletCount, 3);
+  assert.equal(rebuy.signal.totalPoints, 6);
   assert.equal(db.prepare("SELECT COUNT(*) n FROM phase2_signal_alerts").get().n, 1);
 });
 
@@ -223,14 +238,36 @@ test("a token re-alerts only after a new wallet adds the configured point increa
   let clock = 1_000;
   const store = initPhase2SignalStore(db, { now: () => clock });
   store.refreshTrackedWallets([
-    profilesForStore(WALLET_A, 3), profilesForStore(WALLET_B, 2), profilesForStore(WALLET_C, 3),
+    profilesForStore(WALLET_A, 3), profilesForStore(WALLET_B, 2), profilesForStore(WALLET_C, 1), profilesForStore(WALLET_D, 3),
   ], clock);
   store.recordBuy({ signature: "a", walletAddress: WALLET_A, tokenMint: TOKEN, boughtAt: 2_000, source: "test" });
-  assert.equal(store.recordBuy({ signature: "b", walletAddress: WALLET_B, tokenMint: TOKEN, boughtAt: 3_000, source: "test" }).alerted, true);
-  const stronger = store.recordBuy({ signature: "c", walletAddress: WALLET_C, tokenMint: TOKEN, boughtAt: 4_000, source: "test" });
+  assert.equal(store.recordBuy({ signature: "b", walletAddress: WALLET_B, tokenMint: TOKEN, boughtAt: 3_000, source: "test" }).alerted, false);
+  assert.equal(store.recordBuy({ signature: "c", walletAddress: WALLET_C, tokenMint: TOKEN, boughtAt: 4_000, source: "test" }).alerted, true);
+  const stronger = store.recordBuy({ signature: "d", walletAddress: WALLET_D, tokenMint: TOKEN, boughtAt: 5_000, source: "test" });
   assert.equal(stronger.alerted, true);
-  assert.equal(stronger.signal.totalPoints, 8);
+  assert.equal(stronger.signal.totalPoints, 9);
   assert.equal(db.prepare("SELECT COUNT(*) n FROM phase2_signal_alerts").get().n, 2);
+});
+
+test("dashboard settings persist, clamp the wallet cap, and immediately change alert rules", () => {
+  const db = new Database(":memory:");
+  const store = initPhase2SignalStore(db, { now: () => 1_000 });
+  const updated = store.updateSettings({
+    minDistinctTokens: "7", minTop10Tokens: "2", maxAverageRank: "40",
+    trackedWalletLimit: "500", minDistinctWallets: "4", pointsThreshold: "9", signalWindowMinutes: "90",
+  });
+  assert.equal(updated.trackedWalletLimit, 100);
+  assert.equal(updated.minDistinctWallets, 4);
+  assert.equal(updated.pointsThreshold, 9);
+  assert.equal(updated.signalWindowMs, 90 * 60_000);
+  assert.deepEqual(updated.phase1LeaderboardGate, {
+    minDistinctTokens: 7, minTop10Tokens: 2, maxAverageRank: 40,
+    excludeCreators: false, excludeInsiders: false,
+  });
+  const restarted = initPhase2SignalStore(db, { now: () => 2_000 });
+  assert.equal(restarted.config.trackedWalletLimit, 100);
+  assert.equal(restarted.config.pointsThreshold, 9);
+  assert.equal(restarted.config.phase1LeaderboardGate.maxAverageRank, 40);
 });
 
 test("additive signal-store initialization preserves existing Phase 1 and Phase 2 data", () => {

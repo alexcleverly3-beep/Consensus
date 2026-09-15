@@ -410,7 +410,7 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
     const privatePath = pathname === "/" || pathname === "/index.html" || pathname === "/api/wallets" || pathname === "/api/queue" || pathname === "/api/throughput" ||
       pathname === "/actions/token/add" || pathname === "/actions/token/cancel" || pathname === "/actions/wallet/checked" || pathname === "/actions/scanner/target" || pathname === "/phase2" ||
       pathname === "/api/phase2/wallets" || pathname === "/api/phase2/signals" || pathname === "/actions/phase2/analyze" || pathname === "/actions/phase2/label" ||
-      pathname === "/actions/phase2/test-discord";
+      pathname === "/actions/phase2/test-discord" || pathname === "/actions/phase2/settings";
     if (privatePath) {
       if (!requirePrivateAccess(req, res)) return;
 
@@ -442,6 +442,27 @@ function startRecurrenceApp({ gmgnGuard = null, env = process.env } = {}) {
           if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) { rejectPrivate(res, 403, "Invalid dashboard action token"); return; }
           await phase2Signals.sendTestDiscord();
           redirectNotice(res, "Discord test notification sent. No production signal was created.", "success", "/phase2");
+        } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error", "/phase2"); }
+        return;
+      }
+
+      if (pathname === "/actions/phase2/settings") {
+        if (req.method !== "POST") { rejectPrivate(res, 405, "POST required"); return; }
+        const contentType = String(req.headers["content-type"] || "").toLowerCase();
+        if (!contentType.startsWith("application/x-www-form-urlencoded")) { rejectPrivate(res, 415, "Form submission required"); return; }
+        try {
+          const form = await readFormBody(req);
+          if (!safeTokenEqual(form.get("csrf"), dashboardActionToken)) { rejectPrivate(res, 403, "Invalid dashboard action token"); return; }
+          const result = await phase2Signals.updateSettings({
+            minDistinctTokens: form.get("minDistinctTokens"),
+            minTop10Tokens: form.get("minTop10Tokens"),
+            maxAverageRank: form.get("maxAverageRank"),
+            trackedWalletLimit: form.get("trackedWalletLimit"),
+            minDistinctWallets: form.get("minDistinctWallets"),
+            pointsThreshold: form.get("pointsThreshold"),
+            signalWindowMinutes: form.get("signalWindowMinutes"),
+          });
+          redirectNotice(res, `Phase 2 settings saved. Now tracking ${result.tracked} eligible wallet${result.tracked === 1 ? "" : "s"}.`, "success", "/phase2");
         } catch (error) { redirectNotice(res, String(error?.message || error).slice(0, 160), "error", "/phase2"); }
         return;
       }

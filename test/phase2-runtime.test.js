@@ -7,12 +7,14 @@ const { initPhase2Runtime, normalizePublicBaseUrl, secureEqual } = require("../s
 
 const WALLET_A = "CaHbjM1AGhDPBR6JwiNHaUZAJBykqvj9LPxDouxXbiWB";
 const WALLET_B = "7YttLkHDo4yisJ9fsgFj6aNfA7SKz3JcM1wQh2Ve8XrP";
+const WALLET_C = "8YttLkHDo4yisJ9fsgFj6aNfA7SKz3JcM1wQh2Ve8XrQ";
 const TOKEN = "9YttLkHDo4yisJ9fsgFj6aNfA7SKz3JcM1wQh2Ve8XrR";
 
 function profiles() {
   return [
     { walletAddress: WALLET_A, reputation: 92, confidence: 90, points: 3, source: "test", scoreVersion: "v1" },
     { walletAddress: WALLET_B, reputation: 82, confidence: 85, points: 2, source: "test", scoreVersion: "v1" },
+    { walletAddress: WALLET_C, reputation: 82, confidence: 85, points: 2, source: "test", scoreVersion: "v1" },
   ];
 }
 
@@ -63,8 +65,8 @@ test("webhook provisioning is batched and unchanged configuration does not spend
   assert.equal(calls.length, 2);
   const created = JSON.parse(calls[1].options.body);
   assert.equal(created.webhookURL, "https://example.test/webhooks/helius");
-  assert.deepEqual(created.transactionTypes, ["SWAP"]);
-  assert.deepEqual(created.accountAddresses.sort(), [WALLET_A, WALLET_B].sort());
+  assert.deepEqual(created.transactionTypes, ["SWAP", "BUY"]);
+  assert.deepEqual(created.accountAddresses.sort(), [WALLET_A, WALLET_B, WALLET_C].sort());
   const second = await runtime.syncWebhook();
   assert.equal(second.unchanged, true);
   assert.equal(calls.length, 2);
@@ -157,10 +159,12 @@ test("earned signal is delivered by the existing Discord client and test message
   runtime.store.recordBuy({ signature: "a", walletAddress: WALLET_A, tokenMint: TOKEN, boughtAt: clock, source: "test" });
   clock = 3_000;
   runtime.store.recordBuy({ signature: "b", walletAddress: WALLET_B, tokenMint: TOKEN, boughtAt: clock, source: "test" });
+  clock = 4_000;
+  runtime.store.recordBuy({ signature: "c", walletAddress: WALLET_C, tokenMint: TOKEN, boughtAt: clock, source: "test" });
   await runtime.pumpOutbox();
   assert.equal(sent.length, 1);
   assert.equal(sent[0].id, "alerts");
-  assert.match(sent[0].message.embeds[0].description, /2 distinct wallets · 5 total points/);
+  assert.match(sent[0].message.embeds[0].description, /3 distinct wallets · 7 total points/);
   assert.doesNotMatch(JSON.stringify(sent[0].message), /amount|position size|sold/i);
   assert.equal(runtime.status().sent_alerts, 1);
 
@@ -181,6 +185,8 @@ test("temporary Discord failure leaves an earned alert in the durable retry queu
   runtime.store.recordBuy({ signature: "a", walletAddress: WALLET_A, tokenMint: TOKEN, boughtAt: clock, source: "test" });
   clock = 3_000;
   runtime.store.recordBuy({ signature: "b", walletAddress: WALLET_B, tokenMint: TOKEN, boughtAt: clock, source: "test" });
+  clock = 4_000;
+  runtime.store.recordBuy({ signature: "c", walletAddress: WALLET_C, tokenMint: TOKEN, boughtAt: clock, source: "test" });
   await runtime.pumpOutbox();
   const row = db.prepare("SELECT status,attempts,last_error FROM phase2_discord_outbox").get();
   assert.equal(row.status, "retry");

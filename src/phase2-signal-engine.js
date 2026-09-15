@@ -4,14 +4,13 @@ const { trustedProfileQuality } = require("./wallet-quality");
 
 const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SCORE_VERSION = "trusted-reputation-points-v1";
-const LEADERBOARD_SCORE_VERSION = "phase1-leaderboard-v1";
+const LEADERBOARD_SCORE_VERSION = "phase1-leaderboard-v2";
 const PHASE1_LEADERBOARD_GATE = Object.freeze({
-  minDistinctTokens: 12,
-  minTop10Tokens: 2,
-  minTop25Tokens: 4,
-  maxBestRank: 25,
-  excludeCreators: true,
-  excludeInsiders: true,
+  minDistinctTokens: 10,
+  minTop10Tokens: 1,
+  maxAverageRank: 50,
+  excludeCreators: false,
+  excludeInsiders: false,
 });
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -31,14 +30,14 @@ function boundedInt(value, fallback, min, max) {
 
 function phase2Config(env = process.env) {
   return {
-    trackedWalletLimit: boundedInt(env.TRACKED_WALLET_LIMIT, 100, 1, 1000),
+    trackedWalletLimit: boundedInt(env.TRACKED_WALLET_LIMIT, 100, 1, 100),
     signalWindowMs: boundedInt(env.SIGNAL_WINDOW_MINUTES, 60, 5, 1440) * 60_000,
-    minDistinctWallets: boundedInt(env.SIGNAL_MIN_DISTINCT_WALLETS, 2, 2, 20),
-    pointsThreshold: boundedInt(env.SIGNAL_POINTS_THRESHOLD, 5, 2, 100),
+    minDistinctWallets: boundedInt(env.SIGNAL_MIN_DISTINCT_WALLETS, 3, 2, 20),
+    pointsThreshold: boundedInt(env.SIGNAL_POINTS_THRESHOLD, 6, 2, 100),
     realertPointsDelta: boundedInt(env.SIGNAL_REALERT_MIN_ADDITIONAL_POINTS, 3, 1, 100),
     minBuyLamports: boundedInt(env.SIGNAL_MIN_BUY_LAMPORTS, 10_000_000, 1_000_000, 10_000_000_000),
     minStableRaw: boundedInt(env.SIGNAL_MIN_STABLE_RAW, 1_000_000, 100_000, 1_000_000_000),
-    phase1LeaderboardGate: PHASE1_LEADERBOARD_GATE,
+    phase1LeaderboardGate: { ...PHASE1_LEADERBOARD_GATE },
   };
 }
 
@@ -61,15 +60,38 @@ function rawAmount(item) {
 }
 
 function enhancedSwapBuys(event, trackedWallets, config = phase2Config()) {
-  if (String(event?.type || "").toUpperCase() !== "SWAP") return [];
+  const eventType = String(event?.type || "").toUpperCase();
+  if (eventType !== "SWAP" && eventType !== "BUY") return [];
   if (event?.transactionError || event?.transaction_error) return [];
   const signature = String(event?.signature || "").trim();
   if (!signature) return [];
   const swap = event?.events?.swap;
-  if (!swap || typeof swap !== "object") return [];
-
   const tracked = trackedWallets instanceof Set ? trackedWallets : new Set(trackedWallets || []);
   const feePayer = String(event?.feePayer || event?.fee_payer || "").trim();
+  if (!swap || typeof swap !== "object") {
+    if (eventType !== "BUY" || !tracked.has(feePayer)) return [];
+    const nativeSpent = (event?.nativeTransfers || []).some((item) =>
+      String(item?.fromUserAccount || "").trim() === feePayer && num(item?.amount) >= config.minBuyLamports
+    );
+    const quoteSpent = (event?.tokenTransfers || []).some((item) => {
+      if (String(item?.fromUserAccount || "").trim() !== feePayer) return false;
+      const mint = String(item?.mint || "").trim();
+      const uiAmount = num(item?.tokenAmount);
+      if (mint === WSOL_MINT) return uiAmount >= config.minBuyLamports / 1_000_000_000;
+      if (mint === USDC_MINT || mint === USDT_MINT) return uiAmount >= config.minStableRaw / 1_000_000;
+      return false;
+    });
+    if (!nativeSpent && !quoteSpent) return [];
+    return (event?.tokenTransfers || []).filter((item) => {
+      const mint = String(item?.mint || "").trim();
+      return String(item?.toUserAccount || "").trim() === feePayer && SOL_ADDR.test(mint) &&
+        !QUOTE_MINTS.has(mint) && num(item?.tokenAmount) > 0;
+    }).map((item) => ({
+      signature, walletAddress: feePayer, tokenMint: String(item.mint).trim(),
+      boughtAt: eventTimeMs(event), source: "helius-enhanced",
+    }));
+  }
+
   const involved = new Set();
   if (tracked.has(feePayer)) involved.add(feePayer);
   for (const item of [...(swap.tokenInputs || []), ...(swap.tokenOutputs || [])]) {
@@ -179,7 +201,7 @@ function tableColumns(db, name) {
     : new Set();
 }
 
-function phase1LeaderboardProfiles(db, limit = 100) {
+function phase1LeaderboardProfiles(db, limit = 100, gate = PHASE1_LEADERBOARD_GATE) {
   const columns = tableColumns(db, "recurrence_wallet_tokens");
   const required = ["wallet_address", "token_address", "scan_appearances", "best_rank", "is_creator", "is_insider"];
   if (required.some((column) => !columns.has(column))) return [];
@@ -191,31 +213,38 @@ function phase1LeaderboardProfiles(db, limit = 100) {
       SUM(CASE WHEN best_rank <= 10 THEN 1 ELSE 0 END) AS top10_tokens,
       SUM(CASE WHEN best_rank <= 25 THEN 1 ELSE 0 END) AS top25_tokens,
       MIN(best_rank) AS best_rank,
+      AVG(best_rank) AS average_best_rank,
       MAX(is_creator) AS ever_creator,
       MAX(is_insider) AS ever_insider
     FROM recurrence_wallet_tokens
     GROUP BY wallet_address
     HAVING COUNT(*) >= ?
-    ORDER BY distinct_tokens DESC, top10_tokens DESC, top25_tokens DESC, best_rank ASC, wallet_address ASC
+      AND SUM(CASE WHEN best_rank <= 10 THEN 1 ELSE 0 END) >= ?
+      AND AVG(best_rank) <= ?
+    ORDER BY distinct_tokens DESC, top10_tokens DESC, average_best_rank ASC, best_rank ASC, wallet_address ASC
     LIMIT ?
-  `).all(PHASE1_LEADERBOARD_GATE.minDistinctTokens, Math.min(1000, Math.max(boundedLimit, boundedLimit * 10)));
+  `).all(gate.minDistinctTokens, gate.minTop10Tokens, gate.maxAverageRank, Math.min(1000, Math.max(boundedLimit, boundedLimit * 10)));
   return rows.map((row) => {
     const distinctTokens = Math.max(0, Math.floor(num(row.distinct_tokens)));
     const top10Tokens = Math.max(0, Math.floor(num(row.top10_tokens)));
     const top25Tokens = Math.max(0, Math.floor(num(row.top25_tokens)));
     const bestRank = Math.max(0, Math.floor(num(row.best_rank)));
+    const averageBestRank = num(row.average_best_rank, Number.POSITIVE_INFINITY);
     const top10Rate = distinctTokens ? top10Tokens / distinctTokens : 0;
-    // Recurrence is Phase 1 discovery evidence, so require breadth, repeated
-    // high-rank appearances, and no creator/insider flag before monitoring.
+    // Recurrence is Phase 1 discovery evidence. Creator and insider flags are
+    // retained as evidence but do not disqualify a wallet during calibration.
     if (!SOL_ADDR.test(String(row.wallet_address || "").trim())) return null;
-    if (PHASE1_LEADERBOARD_GATE.excludeCreators && Boolean(row.ever_creator)) return null;
-    if (PHASE1_LEADERBOARD_GATE.excludeInsiders && Boolean(row.ever_insider)) return null;
-    if (distinctTokens < PHASE1_LEADERBOARD_GATE.minDistinctTokens ||
-        top10Tokens < PHASE1_LEADERBOARD_GATE.minTop10Tokens ||
-        top25Tokens < PHASE1_LEADERBOARD_GATE.minTop25Tokens ||
-        bestRank > PHASE1_LEADERBOARD_GATE.maxBestRank) return null;
-    const reputation = Math.min(100, 70 + Math.min(18, (distinctTokens - 12) * 1.5) + Math.min(8, top10Rate * 16) + (bestRank <= 10 ? 4 : 0));
-    const confidence = Math.min(100, 75 + Math.min(15, distinctTokens - 12) + Math.min(10, top25Tokens / 2));
+    if (gate.excludeCreators && Boolean(row.ever_creator)) return null;
+    if (gate.excludeInsiders && Boolean(row.ever_insider)) return null;
+    if (distinctTokens < gate.minDistinctTokens ||
+        top10Tokens < gate.minTop10Tokens ||
+        averageBestRank > gate.maxAverageRank) return null;
+    // Points describe the evidence itself, not how loose or strict the current
+    // admission controls are, so dashboard edits cannot inflate a wallet score.
+    const breadth = Math.min(15, Math.max(0, distinctTokens - 10) * 1.5);
+    const rankStrength = Math.max(0, Math.min(1, (50 - averageBestRank) / 50));
+    const reputation = Math.min(100, 70 + breadth + Math.min(10, top10Rate * 30) + rankStrength * 5);
+    const confidence = Math.min(100, 72 + Math.min(18, distinctTokens) + Math.min(10, top25Tokens / 2));
     return {
       walletAddress: String(row.wallet_address).trim(),
       reputation: Math.round(reputation),
@@ -227,7 +256,7 @@ function phase1LeaderboardProfiles(db, limit = 100) {
   }).filter(Boolean).slice(0, boundedLimit);
 }
 
-function canonicalTrustedProfiles(db, limit = 100) {
+function canonicalTrustedProfiles(db, limit = 100, { leaderboardGate = PHASE1_LEADERBOARD_GATE } = {}) {
   const boundedLimit = Math.max(1, Math.min(1000, Number(limit) || 100));
   const profileCandidates = tableExists(db, "wallet_profiles")
     ? db.prepare("SELECT * FROM wallet_profiles ORDER BY reputation_score DESC, confidence_score DESC, distinct_tokens DESC LIMIT ?")
@@ -245,7 +274,7 @@ function canonicalTrustedProfiles(db, limit = 100) {
       .filter((item) => SOL_ADDR.test(item.walletAddress) && item.points > 0)
     : [];
   const merged = new Map();
-  for (const profile of [...profileCandidates, ...phase1LeaderboardProfiles(db, boundedLimit)]) {
+  for (const profile of [...profileCandidates, ...phase1LeaderboardProfiles(db, boundedLimit, leaderboardGate)]) {
     if (!merged.has(profile.walletAddress)) merged.set(profile.walletAddress, profile);
   }
   return [...merged.values()]
@@ -343,10 +372,46 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(usage_day, usage_kind)
     );
+    CREATE TABLE IF NOT EXISTS phase2_runtime_settings (
+      setting_key TEXT PRIMARY KEY,
+      setting_value INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_phase2_inbox_pending ON phase2_event_inbox(status, received_at);
     CREATE INDEX IF NOT EXISTS idx_phase2_buys_token_time ON phase2_wallet_buys(token_mint, bought_at DESC);
     CREATE INDEX IF NOT EXISTS idx_phase2_outbox_pending ON phase2_discord_outbox(status, next_attempt_at);
   `);
+
+  const settingDefaults = {
+    tracked_wallet_limit: config.trackedWalletLimit,
+    signal_window_minutes: Math.round(config.signalWindowMs / 60_000),
+    signal_min_distinct_wallets: config.minDistinctWallets,
+    signal_points_threshold: config.pointsThreshold,
+    leaderboard_min_distinct_tokens: config.phase1LeaderboardGate.minDistinctTokens,
+    leaderboard_min_top10_tokens: config.phase1LeaderboardGate.minTop10Tokens,
+    leaderboard_max_average_rank: config.phase1LeaderboardGate.maxAverageRank,
+  };
+  const insertSetting = db.prepare("INSERT OR IGNORE INTO phase2_runtime_settings(setting_key,setting_value,updated_at) VALUES (?,?,?)");
+  for (const [key, value] of Object.entries(settingDefaults)) insertSetting.run(key, value, now());
+  const readSettings = db.prepare("SELECT setting_key,setting_value FROM phase2_runtime_settings");
+  const saveSetting = db.prepare("INSERT INTO phase2_runtime_settings(setting_key,setting_value,updated_at) VALUES (?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at");
+
+  function loadSettings() {
+    const values = Object.fromEntries(readSettings.all().map((row) => [row.setting_key, row.setting_value]));
+    config.trackedWalletLimit = boundedInt(values.tracked_wallet_limit, 100, 1, 100);
+    config.signalWindowMs = boundedInt(values.signal_window_minutes, 60, 5, 1440) * 60_000;
+    config.minDistinctWallets = boundedInt(values.signal_min_distinct_wallets, 3, 2, 20);
+    config.pointsThreshold = boundedInt(values.signal_points_threshold, 6, 2, 100);
+    config.phase1LeaderboardGate = {
+      minDistinctTokens: boundedInt(values.leaderboard_min_distinct_tokens, 10, 3, 100),
+      minTop10Tokens: boundedInt(values.leaderboard_min_top10_tokens, 1, 0, 100),
+      maxAverageRank: boundedInt(values.leaderboard_max_average_rank, 50, 1, 100),
+      excludeCreators: false,
+      excludeInsiders: false,
+    };
+    return config;
+  }
+  loadSettings();
 
   const metricIncrement = db.prepare(`
     INSERT INTO phase2_metrics(metric_key, metric_value, updated_at) VALUES (?, 1, ?)
@@ -450,7 +515,22 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
 
   return {
     config,
-    refreshTrackedWallets(profiles = canonicalTrustedProfiles(db, config.trackedWalletLimit), at = now()) {
+    updateSettings(input = {}) {
+      const values = {
+        tracked_wallet_limit: boundedInt(input.trackedWalletLimit, config.trackedWalletLimit, 1, 100),
+        signal_window_minutes: boundedInt(input.signalWindowMinutes, Math.round(config.signalWindowMs / 60_000), 5, 1440),
+        signal_min_distinct_wallets: boundedInt(input.minDistinctWallets, config.minDistinctWallets, 2, 20),
+        signal_points_threshold: boundedInt(input.pointsThreshold, config.pointsThreshold, 2, 100),
+        leaderboard_min_distinct_tokens: boundedInt(input.minDistinctTokens, config.phase1LeaderboardGate.minDistinctTokens, 3, 100),
+        leaderboard_min_top10_tokens: boundedInt(input.minTop10Tokens, config.phase1LeaderboardGate.minTop10Tokens, 0, 100),
+        leaderboard_max_average_rank: boundedInt(input.maxAverageRank, config.phase1LeaderboardGate.maxAverageRank, 1, 100),
+      };
+      db.transaction(() => {
+        for (const [key, value] of Object.entries(values)) saveSetting.run(key, value, now());
+      })();
+      return loadSettings();
+    },
+    refreshTrackedWallets(profiles = canonicalTrustedProfiles(db, config.trackedWalletLimit, { leaderboardGate: config.phase1LeaderboardGate }), at = now()) {
       return refreshWalletsTx(profiles, at);
     },
     trackedWallets() {

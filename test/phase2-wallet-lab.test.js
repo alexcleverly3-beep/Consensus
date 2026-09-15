@@ -101,11 +101,13 @@ test("phase2 dashboard displays refresh time, daily Helius usage, and the exact 
       estimatedHeliusCreditsToday: 321,
       config: {
         trackedWalletLimit: 100,
+        minDistinctWallets: 3,
+        pointsThreshold: 6,
+        signalWindowMs: 3_600_000,
         phase1LeaderboardGate: {
-          minDistinctTokens: 12,
-          minTop10Tokens: 2,
-          minTop25Tokens: 4,
-          maxBestRank: 25,
+          minDistinctTokens: 10,
+          minTop10Tokens: 1,
+          maxAverageRank: 50,
         },
       },
     },
@@ -114,9 +116,12 @@ test("phase2 dashboard displays refresh time, daily Helius usage, and the exact 
   assert.match(html, /15 Sept, 01:10:00 UK/);
   assert.match(html, /Helius credits today/);
   assert.match(html, />321</);
-  assert.match(html, /12\+ distinct Phase 1 tokens/);
-  assert.match(html, /2\+ top-10 appearances/);
-  assert.match(html, /4\+ top-25 appearances/);
-  assert.match(html, /best rank 25 or better/);
+  assert.match(html, /10\+ distinct Phase 1 tokens/);
+  assert.match(html, /1\+ top-10 appearances/);
+  assert.match(html, /average rank 50 or better/);
+  assert.match(html, /Creator and insider wallets are allowed/);
   assert.match(html, /top 100 qualifying wallets/);
+  assert.match(html, /Phase 2 controls/);
+  assert.match(html, /action="\/actions\/phase2\/settings"/);
+  assert.match(html, /Alert at 3\+ wallets and 6\+ points/);
 });
