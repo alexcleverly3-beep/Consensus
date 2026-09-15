@@ -50,9 +50,10 @@ function discordSignalMessage(signal) {
 function webhookBody(url, addresses, secret) {
   return {
     webhookURL: url,
-    // Raydium-style DEX activity is classified as SWAP, while Pump AMM emits
-    // BUY/SELL. Subscribe to SWAP and BUY, then admit only quote-to-token buys.
-    transactionTypes: ["SWAP", "BUY"],
+    // Helius' production webhook validator currently rejects BUY despite it
+    // appearing in the public transaction taxonomy. SWAP is accepted here;
+    // the reconciliation path still recovers quote-to-token buys it misses.
+    transactionTypes: ["SWAP"],
     accountAddresses: addresses,
     webhookType: "enhanced",
     authHeader: secret,

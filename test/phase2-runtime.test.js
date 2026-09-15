@@ -65,7 +65,7 @@ test("webhook provisioning is batched and unchanged configuration does not spend
   assert.equal(calls.length, 2);
   const created = JSON.parse(calls[1].options.body);
   assert.equal(created.webhookURL, "https://example.test/webhooks/helius");
-  assert.deepEqual(created.transactionTypes, ["SWAP", "BUY"]);
+  assert.deepEqual(created.transactionTypes, ["SWAP"]);
   assert.deepEqual(created.accountAddresses.sort(), [WALLET_A, WALLET_B, WALLET_C].sort());
   const second = await runtime.syncWebhook();
   assert.equal(second.unchanged, true);
