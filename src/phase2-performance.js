@@ -28,20 +28,31 @@ function performanceScore(row = {}) {
   const tokenCount = Math.max(0, Math.floor(num(pnl.token_num ?? row.token_num, distributionTokens)));
   const severeLossTokens = Math.max(0, Math.floor(num(pnl.pnl_lt_nd5_num)));
   const severeLossRate = tokenCount > 0 ? severeLossTokens / tokenCount : 0;
+  const averageHoldSeconds = Math.max(0, num(
+    pnl.avg_holding_period ?? pnl.avgHoldingPeriod ?? pnl.avg_hold_sec ??
+    row.avg_holding_period ?? row.avgHoldingPeriod ?? row.avg_hold_sec
+  ));
 
   let bonus = 0;
+  let holdBonus = 0;
   let reason = "insufficient-sample";
   if (tokenCount >= 20 && realizedProfit > 0 && severeLossRate <= 0.25) {
     reason = "win-rate-below-bonus-floor";
     if (winRate >= 0.70) bonus = 8;
     else if (winRate >= 0.60) bonus = 6;
     else if (winRate >= 0.50) bonus = 3;
+    if (averageHoldSeconds >= 24 * 60 * 60) holdBonus = 2;
+    else if (averageHoldSeconds >= 6 * 60 * 60) holdBonus = 1;
+    bonus += holdBonus;
     if (bonus > 0) {
       if (tokenCount >= 50) bonus += 1;
       if (roi >= 0.20) bonus += 1;
       bonus = Math.min(10, bonus);
       reason = "qualified-performance-bonus";
     }
+  } else if (tokenCount >= 30 && winRate < 0.35 && realizedProfit <= 0) {
+    bonus = -10;
+    reason = "low-win-rate-and-unprofitable-penalty";
   } else if (tokenCount >= 20 && realizedProfit <= 0) reason = "non-positive-realized-profit";
   else if (tokenCount >= 20 && severeLossRate > 0.25) reason = "excessive-severe-loss-rate";
 
@@ -54,6 +65,8 @@ function performanceScore(row = {}) {
     positiveTokens,
     severeLossTokens,
     severeLossRate,
+    averageHoldSeconds,
+    holdBonus,
     bonus,
     reason,
   };

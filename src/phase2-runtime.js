@@ -104,11 +104,21 @@ function initPhase2Runtime(db, {
   // Phase 1 leaderboard entries are local SQLite data; refresh frequently
   // enough to pick up newly eligible wallets without spending provider calls.
   const refreshMs = boundedInt(env.TRACKED_WALLET_REFRESH_MINUTES, 30, 15, 1440) * 60_000;
-  const reconcileMs = boundedInt(env.HELIUS_RECONCILE_INTERVAL_MINUTES, 30, 5, 1440) * 60_000;
+  const reconcileMs = boundedInt(env.HELIUS_RECONCILE_INTERVAL_MINUTES, 60, 5, 1440) * 60_000;
   const maxReconcilePages = boundedInt(env.HELIUS_RECONCILE_MAX_PAGES, 3, 1, 10);
   const monthlyCreditBudget = boundedInt(env.HELIUS_MONTHLY_CREDIT_BUDGET, 800_000, 10_000, 100_000_000);
+  const recoveryDailyCallBudget = boundedInt(env.RECOVERY_DAILY_RPC_CALL_BUDGET, 3_000, 100, 100_000);
+  const liveDailyCreditBudget = boundedInt(env.HELIUS_LIVE_DAILY_CREDIT_BUDGET,
+    Math.max(1_000, Math.floor(monthlyCreditBudget / 30) - recoveryDailyCallBudget - 500), 1_000, 1_000_000);
+  const recoveryRpcUrl = String(env.SOLANA_RECOVERY_RPC_URL || "").trim();
   const webhookUrl = publicBaseUrl ? `${publicBaseUrl}/webhooks/helius` : "";
   const helius = apiKey ? createHeliusClient({ apiKey, fetchImpl, logger }) : null;
+  let recoveryRpc = helius;
+  let recoveryConfigurationError = "";
+  if (helius && recoveryRpcUrl) {
+    try { recoveryRpc = createHeliusClient({ apiKey, rpcUrlOverride: recoveryRpcUrl, fetchImpl, logger }); }
+    catch { recoveryRpc = null; recoveryConfigurationError = "SOLANA_RECOVERY_RPC_URL must be a valid private HTTPS RPC endpoint"; }
+  }
   let discordClient = null;
   let reconcileRunning = false;
   let inboxRunning = false;
@@ -134,6 +144,22 @@ function initPhase2Runtime(db, {
       overflow_count INTEGER NOT NULL DEFAULT 0,
       last_error TEXT
     );
+    CREATE TABLE IF NOT EXISTS phase2_recovery_rpc_usage (
+      usage_day TEXT NOT NULL,
+      source TEXT NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(usage_day, source)
+    );
+    CREATE TABLE IF NOT EXISTS phase2_webhook_minute_usage (
+      minute INTEGER PRIMARY KEY,
+      events INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS phase2_live_budget_state (
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      effective_limit INTEGER NOT NULL,
+      observed_since INTEGER NOT NULL,
+      adjusted_at INTEGER NOT NULL
+    );
   `);
   const providerColumns = db.prepare("PRAGMA table_info(phase2_provider_state)").all();
   if (!providerColumns.some((column) => column.name === "auth_hash")) db.exec("ALTER TABLE phase2_provider_state ADD COLUMN auth_hash TEXT");
@@ -143,6 +169,49 @@ function initPhase2Runtime(db, {
   const updateReconcileAt = db.prepare("UPDATE phase2_provider_state SET last_reconcile_at=?,last_error=? WHERE provider='helius'");
   const cursorGet = db.prepare("SELECT * FROM phase2_reconcile_cursors WHERE wallet_address=?");
   const cursorSave = db.prepare(`INSERT INTO phase2_reconcile_cursors(wallet_address,last_signature,last_run_at,overflow_count,last_error) VALUES (?,?,?,COALESCE(?,0),?) ON CONFLICT(wallet_address) DO UPDATE SET last_signature=excluded.last_signature,last_run_at=excluded.last_run_at,overflow_count=overflow_count+excluded.overflow_count,last_error=excluded.last_error`);
+  const recoveryUsage = db.prepare("SELECT COALESCE(SUM(calls),0) calls FROM phase2_recovery_rpc_usage WHERE usage_day=?");
+  const recordRecoveryCall = db.prepare("INSERT INTO phase2_recovery_rpc_usage(usage_day,source,calls) VALUES (?,?,1) ON CONFLICT(usage_day,source) DO UPDATE SET calls=calls+1");
+  const recoverySource = recoveryConfigurationError ? "invalid-config" : recoveryRpcUrl ? "external" : "helius";
+  const recoveryCallsToday = () => recoveryUsage.get(new Date(now()).toISOString().slice(0, 10)).calls;
+  const recordWebhookMinute = db.prepare("INSERT INTO phase2_webhook_minute_usage(minute,events) VALUES (?,?) ON CONFLICT(minute) DO UPDATE SET events=events+excluded.events");
+  const recentWebhookEvents = db.prepare("SELECT COALESCE(SUM(events),0) events FROM phase2_webhook_minute_usage WHERE minute>=?");
+  const budgetStateGet = db.prepare("SELECT * FROM phase2_live_budget_state WHERE id=1");
+  const budgetStateSave = db.prepare("UPDATE phase2_live_budget_state SET effective_limit=?, adjusted_at=? WHERE id=1");
+  const initialLimit = Math.min(store.config.trackedWalletLimit, 40);
+  db.prepare("INSERT OR IGNORE INTO phase2_live_budget_state(id,effective_limit,observed_since,adjusted_at) VALUES (1,?,?,?)")
+    .run(initialLimit, now(), now());
+
+  function liveBudget(adjust = false) {
+    const state = budgetStateGet.get();
+    const requested = store.config.trackedWalletLimit;
+    let effective = Math.min(requested, state.effective_limit);
+    const threeHours = 3 * 60 * 60_000;
+    const observed = now() - state.observed_since >= threeHours;
+    const recentEvents = recentWebhookEvents.get(Math.floor((now() - threeHours) / 60_000)).events;
+    const projectedDaily = observed ? Math.round(recentEvents * 24 * 60 * 60_000 / threeHours) : null;
+    if (adjust && observed && now() - state.adjusted_at >= 2 * 60 * 60_000) {
+      if (projectedDaily > liveDailyCreditBudget * 1.1) {
+        effective = Math.max(Math.min(3, requested), Math.min(effective - 1,
+          Math.floor(effective * liveDailyCreditBudget / projectedDaily)));
+      } else if (projectedDaily < liveDailyCreditBudget * 0.65 && effective < requested) {
+        effective = Math.min(requested, effective + 5);
+      }
+      if (effective !== state.effective_limit) budgetStateSave.run(effective, now());
+    }
+    return { effectiveLimit: effective, requestedLimit: requested, liveDailyCreditBudget, projectedDaily };
+  }
+
+  async function recoveryCall(method, ...args) {
+    if (recoveryCallsToday() >= recoveryDailyCallBudget ||
+      (!recoveryRpcUrl && store.heliusUsage(now()).credits >= monthlyCreditBudget)) {
+      const error = new Error("recovery RPC budget reached");
+      error.recoveryBudgetReached = true;
+      throw error;
+    }
+    recordRecoveryCall.run(new Date(now()).toISOString().slice(0, 10), recoverySource);
+    if (!recoveryRpcUrl) store.recordHeliusUsage("rpc", 1);
+    return recoveryRpc[method](...args);
+  }
 
   function candidateProfiles(limit = 100) {
     return canonicalTrustedProfiles(db, Math.max(1, Math.min(100, Number(limit) || 100)), { leaderboardGate: store.config.phase1LeaderboardGate });
@@ -152,8 +221,9 @@ function initPhase2Runtime(db, {
     // Keep a 100-wallet candidate pool so cached performance can rank the best
     // wallets correctly even when the active tracking cap is lower.
     const profiles = candidateProfiles(100);
-    const result = store.refreshTrackedWallets(profiles, now());
-    return { ...result, eligible: profiles.length };
+    const budget = liveBudget(true);
+    const result = store.refreshTrackedWallets(profiles.slice(0, budget.effectiveLimit), now());
+    return { ...result, eligible: profiles.length, budget };
   }
 
   async function syncWebhook() {
@@ -210,6 +280,7 @@ function initPhase2Runtime(db, {
       throw error;
     }
     for (let index = 0; index < events.length; index += 1) store.recordHeliusUsage("webhook-delivery", 1);
+    recordWebhookMinute.run(Math.floor(now() / 60_000), events.length);
     const accepted = events.map((event) => store.acceptEnvelope(event, { source: "helius-webhook", receivedAt: now() }));
     queueMicrotask(() => drainInbox().catch((error) => logger.warn(`[phase2] inbox drain failed: ${String(error?.message || error).slice(0, 300)}`)));
     return { received: accepted.length, inserted: accepted.filter((item) => item.inserted).length };
@@ -260,8 +331,7 @@ function initPhase2Runtime(db, {
   async function reconcileWallet(wallet) {
     const cursor = cursorGet.get(wallet);
     if (!cursor?.last_signature) {
-      store.recordHeliusUsage("rpc", 1);
-      const latest = await helius.getSignaturesForAddress(wallet, { limit: 1 });
+      const latest = await recoveryCall("getSignaturesForAddress", wallet, { limit: 1 });
       cursorSave.run(wallet, latest?.[0]?.signature || null, now(), 0, null);
       return { wallet, bootstrapped: true, recovered: 0 };
     }
@@ -269,8 +339,7 @@ function initPhase2Runtime(db, {
     let before;
     let overflow = 0;
     for (let page = 0; page < maxReconcilePages; page += 1) {
-      store.recordHeliusUsage("rpc", 1);
-      const batch = await helius.getSignaturesForAddress(wallet, { until: cursor.last_signature, before, limit: 100 });
+      const batch = await recoveryCall("getSignaturesForAddress", wallet, { until: cursor.last_signature, before, limit: 100 });
       if (!Array.isArray(batch) || !batch.length) break;
       signatures.push(...batch.filter((item) => !item.err));
       if (batch.length < 100) break;
@@ -282,8 +351,7 @@ function initPhase2Runtime(db, {
     let recovered = 0;
     for (const item of signatures.reverse()) {
       if (store.hasSignature(item.signature)) continue;
-      store.recordHeliusUsage("rpc", 1);
-      const transaction = await helius.getTransaction(item.signature);
+      const transaction = await recoveryCall("getTransaction", item.signature);
       if (!transaction) continue;
       store.acceptEnvelope({ result: transaction, signature: item.signature }, { source: "helius-reconcile", receivedAt: now() });
       recovered += 1;
@@ -296,19 +364,24 @@ function initPhase2Runtime(db, {
   }
 
   async function reconcile() {
-    if (reconcileRunning || !helius) return { skipped: true };
-    if (store.heliusUsage(now()).credits >= monthlyCreditBudget) {
+    if (reconcileRunning || !recoveryRpc) return { skipped: true };
+    if (!recoveryRpcUrl && store.heliusUsage(now()).credits >= monthlyCreditBudget) {
       return { skipped: true, reason: "monthly-credit-budget" };
     }
+    if (recoveryCallsToday() >= recoveryDailyCallBudget) return { skipped: true, reason: "daily-recovery-budget" };
     reconcileRunning = true;
     let recovered = 0;
     let failures = 0;
     try {
-      for (const item of store.trackedWallets()) {
+      const wallets = store.trackedWallets().sort((left, right) =>
+        Number(cursorGet.get(left.walletAddress)?.last_run_at || 0) - Number(cursorGet.get(right.walletAddress)?.last_run_at || 0) ||
+        right.points - left.points);
+      for (const item of wallets) {
         try {
           const result = await reconcileWallet(item.walletAddress);
           recovered += result.recovered || 0;
         } catch (error) {
+          if (error.recoveryBudgetReached) break;
           failures += 1;
           const cursor = cursorGet.get(item.walletAddress);
           cursorSave.run(item.walletAddress, cursor?.last_signature || null, now(), 0, String(error?.message || error).slice(0, 1000));
@@ -353,6 +426,11 @@ function initPhase2Runtime(db, {
       monthlyCreditBudget,
       dailyCreditAllowance: Math.floor(monthlyCreditBudget / 30),
       heliusCreditsRemaining: Math.max(0, monthlyCreditBudget - result.estimatedHeliusCredits),
+      recoveryRpcSource: recoverySource,
+      recoveryConfigurationError,
+      recoveryCallsToday: recoveryCallsToday(),
+      recoveryDailyCallBudget,
+      liveBudget: liveBudget(),
       provider: providerState.get(),
       configuration: {
         heliusApiKeyConfigured: Boolean(apiKey),

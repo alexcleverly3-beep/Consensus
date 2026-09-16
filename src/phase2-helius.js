@@ -6,11 +6,18 @@ function retryableStatus(status) {
   return status === 408 || status === 429 || status === 503 || status >= 500;
 }
 
-function createHeliusClient({ apiKey, fetchImpl = globalThis.fetch, maxRetries = 4, logger = console } = {}) {
+function createHeliusClient({ apiKey, rpcUrlOverride, fetchImpl = globalThis.fetch, maxRetries = 4, logger = console } = {}) {
   const key = String(apiKey || "").trim();
   if (!key) throw new Error("HELIUS_API_KEY is required");
   if (typeof fetchImpl !== "function") throw new Error("fetch implementation is required");
-  const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
+  let rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
+  if (rpcUrlOverride) {
+    const parsed = new URL(String(rpcUrlOverride));
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.hash) {
+      throw new Error("SOLANA_RECOVERY_RPC_URL must be a private HTTPS RPC endpoint");
+    }
+    rpcUrl = parsed.toString();
+  }
   const webhookBase = "https://api-mainnet.helius-rpc.com/v0/webhooks";
 
   async function request(url, options = {}, attempt = 0) {

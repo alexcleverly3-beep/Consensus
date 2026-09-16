@@ -240,3 +240,62 @@ test("monthly Helius budget pauses reconciliation before provider limits are exh
   assert.deepEqual(await runtime.reconcile(), { skipped: true, reason: "monthly-credit-budget" });
   assert.equal(runtime.status().heliusCreditsRemaining, 0);
 });
+
+test("recovery has an independent daily limit and cannot consume unlimited Helius credits", async () => {
+  const db = new Database(":memory:");
+  const clock = Date.parse("2026-09-16T12:00:00Z");
+  const runtime = initPhase2Runtime(db, {
+    env: { HELIUS_API_KEY: "key", RECOVERY_DAILY_RPC_CALL_BUDGET: "100" },
+    fetchImpl: async () => { throw new Error("RPC should not run"); },
+    now: () => clock, autoStart: false,
+  });
+  db.prepare("INSERT INTO phase2_recovery_rpc_usage VALUES (?,?,?)").run("2026-09-16", "helius", 100);
+  assert.deepEqual(await runtime.reconcile(), { skipped: true, reason: "daily-recovery-budget" });
+  assert.equal(runtime.status().recoveryCallsToday, 100);
+});
+
+test("a separate private RPC can handle recovery without spending Helius RPC credits", async () => {
+  const db = new Database(":memory:");
+  const calls = [];
+  const runtime = initPhase2Runtime(db, {
+    env: { HELIUS_API_KEY: "key", SOLANA_RECOVERY_RPC_URL: "https://example.test/private-rpc?key=secret" },
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), method: JSON.parse(options.body).method });
+      return new Response(JSON.stringify({ result: [{ signature: "cursor" }] }), { status: 200 });
+    },
+    now: () => Date.parse("2026-09-16T12:00:00Z"), autoStart: false,
+  });
+  runtime.store.refreshTrackedWallets([profiles()[0]], Date.parse("2026-09-16T12:00:00Z"));
+  assert.deepEqual(await runtime.reconcile(), { recovered: 0, failures: 0 });
+  assert.equal(calls[0].url, "https://example.test/private-rpc?key=secret");
+  assert.equal(calls[0].method, "getSignaturesForAddress");
+  assert.equal(runtime.store.heliusUsage().credits, 0);
+  assert.equal(runtime.status().recoveryRpcSource, "external");
+  assert.equal(runtime.status().recoveryCallsToday, 1);
+  assert.equal(JSON.stringify(runtime.status()).includes("secret"), false);
+});
+
+test("a malformed optional recovery endpoint does not stop Phase 1 or live webhook setup", async () => {
+  const db = new Database(":memory:");
+  const runtime = initPhase2Runtime(db, {
+    env: { HELIUS_API_KEY: "key", SOLANA_RECOVERY_RPC_URL: "http://invalid.example" },
+    autoStart: false,
+  });
+  assert.equal(runtime.status().recoveryRpcSource, "invalid-config");
+  assert.match(runtime.status().recoveryConfigurationError, /HTTPS/);
+  assert.deepEqual(await runtime.reconcile(), { skipped: true });
+});
+
+test("live webhook tracking starts at a safe cap and adjusts using measured three-hour traffic", async () => {
+  const db = new Database(":memory:");
+  let clock = Date.parse("2026-09-16T00:00:00Z");
+  const runtime = initPhase2Runtime(db, { env: { TRACKED_WALLET_LIMIT: "80" }, now: () => clock, autoStart: false });
+  assert.equal(runtime.status().liveBudget.effectiveLimit, 40);
+  assert.equal(runtime.status().liveBudget.requestedLimit, 80);
+  clock += 4 * 60 * 60_000;
+  db.prepare("INSERT INTO phase2_webhook_minute_usage VALUES (?,?)").run(Math.floor((clock - 60 * 60_000) / 60_000), 6_000);
+  assert.equal(runtime.status().liveBudget.effectiveLimit, 40);
+  await runtime.refreshAndSync();
+  assert.ok(runtime.status().liveBudget.effectiveLimit < 40);
+  assert.ok(runtime.status().liveBudget.projectedDaily > runtime.status().liveBudget.liveDailyCreditBudget);
+});

@@ -297,6 +297,29 @@ test("cached GMGN performance can promote a proven wallet without repeated resca
   assert.deepEqual(store.performanceDueWallets([WALLET_A]), [WALLET_A]);
 });
 
+test("mature low-win-rate losses demote softly without excluding the wallet", () => {
+  const db = new Database(":memory:");
+  db.exec(`CREATE TABLE recurrence_wallet_tokens (
+    wallet_address TEXT NOT NULL, token_address TEXT NOT NULL, scan_appearances INTEGER NOT NULL DEFAULT 1,
+    best_rank INTEGER NOT NULL, is_creator INTEGER NOT NULL DEFAULT 0, is_insider INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(wallet_address, token_address)
+  )`);
+  const insert = db.prepare("INSERT INTO recurrence_wallet_tokens VALUES (?,?,?,?,?,?)");
+  for (let index = 0; index < 10; index += 1) insert.run(WALLET_A, `${"G".repeat(31)}${index + 1}`, 1, 10, 0, 0);
+  const store = initPhase2SignalStore(db, { now: () => 1_000 });
+  const before = canonicalTrustedProfiles(db, 100)[0];
+  store.recordPerformance(WALLET_A, {
+    winRate: 0.30, realizedProfit: -500, totalCost: 20_000, roi: -0.025,
+    tokenCount: 40, positiveTokens: 12, severeLossTokens: 5, averageHoldSeconds: 60,
+    holdBonus: 0, bonus: -10, reason: "low-win-rate-and-unprofitable-penalty", raw: { source: "test" },
+  });
+  const after = canonicalTrustedProfiles(db, 100)[0];
+  assert.equal(after.walletAddress, WALLET_A);
+  assert.equal(after.reputation, before.reputation - 10);
+  assert.equal(after.performanceBonus, -10);
+  assert.equal(store.stats().performance_penalized, 1);
+});
+
 test("additive signal-store initialization preserves existing Phase 1 and Phase 2 data", () => {
   const db = new Database(":memory:");
   db.exec("CREATE TABLE recurrence_token_queue(token_address TEXT PRIMARY KEY); INSERT INTO recurrence_token_queue VALUES ('phase-one-token')");

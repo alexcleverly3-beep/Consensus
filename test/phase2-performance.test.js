@@ -16,6 +16,7 @@ function strongStats(walletAddress = WALLET_A) {
     pnl_stat: {
       token_num: 60,
       winrate: 0.72,
+      avg_holding_period: 25 * 60 * 60,
       pnl_gt_5x_num: 2,
       pnl_2x_5x_num: 8,
       pnl_0x_2x_num: 33,
@@ -29,8 +30,37 @@ test("performance bonus rewards repeatable profitable win rate but stays capped"
   const scored = performanceScore(strongStats());
   assert.equal(scored.winRate, 0.72);
   assert.equal(scored.tokenCount, 60);
+  assert.equal(scored.holdBonus, 2);
   assert.equal(scored.bonus, 10);
   assert.equal(scored.reason, "qualified-performance-bonus");
+});
+
+test("longer average holds receive only a small, profitable-sample boost", () => {
+  const sixHours = performanceScore({
+    ...strongStats(), pnl: 0.1,
+    pnl_stat: { ...strongStats().pnl_stat, token_num: 25, winrate: 0.50, avg_holding_period: 6 * 60 * 60 },
+  });
+  assert.equal(sixHours.holdBonus, 1);
+  assert.equal(sixHours.bonus, 4);
+
+  const losingHolder = performanceScore({
+    ...strongStats(), realized_profit: -100,
+    pnl_stat: { ...strongStats().pnl_stat, token_num: 25, winrate: 0.50, avg_holding_period: 48 * 60 * 60 },
+  });
+  assert.equal(losingHolder.holdBonus, 0);
+  assert.equal(losingHolder.bonus, 0);
+});
+
+test("low win rate is a soft penalty only with a mature unprofitable sample", () => {
+  const penalized = performanceScore({
+    ...strongStats(), realized_profit: -100,
+    pnl_stat: { ...strongStats().pnl_stat, token_num: 30, winrate: 0.34 },
+  });
+  assert.equal(penalized.bonus, -10);
+  assert.equal(penalized.reason, "low-win-rate-and-unprofitable-penalty");
+
+  assert.equal(performanceScore({ ...strongStats(), realized_profit: -100, pnl_stat: { token_num: 29, winrate: 0.10 } }).bonus, 0);
+  assert.equal(performanceScore({ ...strongStats(), realized_profit: 100, pnl_stat: { token_num: 60, winrate: 0.10 } }).bonus, 0);
 });
 
 test("performance bonus rejects thin samples, losses and severe downside", () => {
