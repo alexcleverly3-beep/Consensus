@@ -6,6 +6,7 @@ const SOL_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SCORE_VERSION = "trusted-reputation-points-v1";
 const LEADERBOARD_SCORE_VERSION = "phase1-leaderboard-v2";
 const PERFORMANCE_SCORE_VERSION = "gmgn-performance-v2";
+const DISCORD_EVIDENCE_SCORE_VERSION = "discord-token-evidence-v1";
 const PHASE1_LEADERBOARD_GATE = Object.freeze({
   minDistinctTokens: 10,
   minTop10Tokens: 1,
@@ -281,26 +282,33 @@ function canonicalTrustedProfiles(db, limit = 100, { leaderboardGate = PHASE1_LE
       .filter((item) => SOL_ADDR.test(item.walletAddress) && item.points > 0)
     : [];
   const merged = new Map();
-  for (const profile of [...profileCandidates, ...phase1LeaderboardProfiles(db, boundedLimit, leaderboardGate)]) {
+  for (const profile of [...profileCandidates, ...phase1LeaderboardProfiles(db, Math.min(1000, boundedLimit * 10), leaderboardGate)]) {
     if (!merged.has(profile.walletAddress)) merged.set(profile.walletAddress, profile);
   }
+  const discordEvidence = tableColumns(db, "recurrence_wallet_tokens").has("user_discord_evidence")
+    ? new Map(db.prepare("SELECT wallet_address, COUNT(*) token_count FROM recurrence_wallet_tokens WHERE user_discord_evidence=1 GROUP BY wallet_address")
+      .all().map((row) => [row.wallet_address, num(row.token_count)]))
+    : new Map();
   const performance = tableExists(db, "phase2_wallet_performance")
     ? new Map(db.prepare("SELECT * FROM phase2_wallet_performance WHERE status='ready'").all().map((row) => [row.wallet_address, row]))
     : new Map();
   return [...merged.values()].map((profile) => {
     const measured = performance.get(profile.walletAddress);
     const performanceBonus = Math.max(-10, Math.min(10, Math.trunc(num(measured?.performance_bonus))));
-    if (!measured || performanceBonus === 0) return { ...profile, performanceBonus: 0 };
-    const reputation = Math.max(0, Math.min(100, num(profile.reputation) + performanceBonus));
+    const discordEvidenceTokens = num(discordEvidence.get(profile.walletAddress));
+    const discordBonus = Math.min(6, discordEvidenceTokens * 3);
+    const reputation = Math.max(0, Math.min(100, num(profile.reputation) + performanceBonus + discordBonus));
     return {
       ...profile,
       reputation,
       points: signalPoints(reputation),
       performanceBonus,
-      winRate: num(measured.win_rate),
-      performanceTokenCount: num(measured.token_count),
-      averageHoldSeconds: num(measured.average_hold_seconds),
-      scoreVersion: `${profile.scoreVersion}+${PERFORMANCE_SCORE_VERSION}`,
+      discordEvidenceTokens,
+      discordBonus,
+      winRate: measured ? num(measured.win_rate) : null,
+      performanceTokenCount: measured ? num(measured.token_count) : null,
+      averageHoldSeconds: measured ? num(measured.average_hold_seconds) : null,
+      scoreVersion: `${profile.scoreVersion}${discordBonus ? `+${DISCORD_EVIDENCE_SCORE_VERSION}` : ""}${performanceBonus ? `+${PERFORMANCE_SCORE_VERSION}` : ""}`,
     };
   })
     .sort((left, right) => right.points - left.points || right.reputation - left.reputation || right.confidence - left.confidence || left.walletAddress.localeCompare(right.walletAddress))
@@ -711,8 +719,12 @@ function initPhase2SignalStore(db, { env = process.env, now = () => Date.now() }
       const dailyUsage = usageForDay.get(new Date(at).toISOString().slice(0, 10));
       const dailyUsageByKind = Object.fromEntries(usageKindsForDay.all(new Date(at).toISOString().slice(0, 10))
         .map((row) => [row.usage_kind, { calls: num(row.calls), credits: num(row.credits) }]));
+      const discordBoostedWallets = tableColumns(db, "recurrence_wallet_tokens").has("user_discord_evidence")
+        ? db.prepare("SELECT COUNT(DISTINCT wallet_address) n FROM recurrence_wallet_tokens WHERE user_discord_evidence=1").get().n
+        : 0;
       return {
         ...counts,
+        discordBoostedWallets,
         openTokens: open,
         duplicateEvents: num(metrics.duplicate_events),
         recoveredEvents: num(metrics.recovered_events),

@@ -55,6 +55,7 @@ test("priority schema migration preserves an existing recurrence queue", () => {
   assert.ok(columns.includes("priority"));
   assert.ok(columns.includes("source"));
   assert.ok(columns.includes("priority_queued_at"));
+  assert.ok(columns.includes("user_discord_priority"));
   assert.equal(store.summary().tokensSeen, 1);
   assert.equal(store.nextToken().token_address, TOKEN_A);
   db.close();
@@ -91,6 +92,7 @@ test("Discord message handler queues a CA and triggers an immediate recurrence c
   assert.equal(calls.length, 1);
   assert.equal(calls[0].address, TOKEN_A);
   assert.equal(calls[0].options.source, "discord");
+  assert.equal(calls[0].options.userSubmitted, true);
   assert.equal(replies, 1);
   assert.equal(triggered, 1);
 });
@@ -105,4 +107,16 @@ test("Discord priority intake ignores bots, wrong channels and messages without 
   assert.equal((await handlePriorityMessage({ author: { bot: false }, channelId: "allowed", content: "hello" }, { store, env })).handled, false);
   assert.equal(queued, 0);
   assert.equal(findSolAddress(`token=${TOKEN_B}`), TOKEN_B);
+});
+
+test("only the configured scan channel marks Discord tokens as bonus evidence", async () => {
+  const calls = [];
+  const store = { enqueuePriorityToken(_address, options) { calls.push(options); return { added: true }; } };
+  await handlePriorityMessage({ author: { bot: false }, channelId: "scan", content: TOKEN_A },
+    { store, env: { DISCORD_CHANNEL_ID: "scan" } });
+  await handlePriorityMessage({ author: { bot: false }, channelId: "other", content: TOKEN_A },
+    { store, env: { DISCORD_CHANNEL_ID: "scan" } });
+  await handlePriorityMessage({ author: { bot: false }, channelId: "scan", content: TOKEN_A },
+    { store, env: {} });
+  assert.deepEqual(calls.map((call) => call.userSubmitted), [true, false]);
 });

@@ -156,3 +156,38 @@ test("wallet recurrence counts independent tokens rather than repeated rescans",
   assert.equal(dev.everInsider, true);
   db.close();
 });
+
+test("Discord scan evidence is one durable wallet-token fact, not one point per post or rescan", () => {
+  const db = new Database(":memory:");
+  const store = initRecurrenceStore(db);
+  store.enqueuePriorityToken(TOKEN_A, { observedAt: 1000, source: "discord", userSubmitted: true });
+  store.enqueuePriorityToken(TOKEN_A, { observedAt: 1100, source: "discord", userSubmitted: true });
+  assert.equal(store.nextToken().user_discord_priority, 1);
+  store.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: 2000, traders: [trader(WALLET_REPEAT)] });
+  assert.equal(db.prepare("SELECT user_discord_evidence FROM recurrence_wallet_tokens WHERE wallet_address=? AND token_address=?")
+    .get(WALLET_REPEAT, TOKEN_A).user_discord_evidence, 1);
+  assert.equal(db.prepare("SELECT user_discord_priority FROM recurrence_token_queue WHERE token_address=?").get(TOKEN_A).user_discord_priority, 0);
+  store.enqueuePriorityToken(TOKEN_A, { observedAt: 3000, source: "discord", userSubmitted: true });
+  store.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: 4000, traders: [trader(WALLET_REPEAT)] });
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM recurrence_wallet_tokens WHERE wallet_address=? AND user_discord_evidence=1")
+    .get(WALLET_REPEAT).n, 1);
+
+  store.enqueuePriorityToken(TOKEN_B, { observedAt: 5000, source: "dashboard", userSubmitted: true });
+  store.ingestTokenTraders({ tokenAddress: TOKEN_B, observedAt: 6000, traders: [trader(WALLET_REPEAT)] });
+  assert.equal(db.prepare("SELECT user_discord_evidence FROM recurrence_wallet_tokens WHERE wallet_address=? AND token_address=?")
+    .get(WALLET_REPEAT, TOKEN_B).user_discord_evidence, 0);
+  db.close();
+});
+
+test("Discord scan bonus evidence stops after the first 50 trader results", () => {
+  const db = new Database(":memory:");
+  const store = initRecurrenceStore(db);
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  const wallets = Array.from({ length: 51 }, (_, index) => `${"Z".repeat(31)}${alphabet[index]}`);
+  store.enqueuePriorityToken(TOKEN_A, { observedAt: 1000, source: "discord", userSubmitted: true });
+  store.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: 2000, traders: wallets.map((wallet) => trader(wallet)) });
+  const getEvidence = db.prepare("SELECT user_discord_evidence FROM recurrence_wallet_tokens WHERE wallet_address=? AND token_address=?");
+  assert.equal(getEvidence.get(wallets[49], TOKEN_A).user_discord_evidence, 1);
+  assert.equal(getEvidence.get(wallets[50], TOKEN_A).user_discord_evidence, 0);
+  db.close();
+});

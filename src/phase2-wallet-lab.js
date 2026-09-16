@@ -249,6 +249,7 @@ function renderPhase2WalletLab(items, csrfToken = "", notice = "", live = {}) {
     ["Events received", status.inbox_events || 0], ["Genuine buys", status.genuine_buys || 0],
     ["Open tokens", status.openTokens || 0], ["Signals sent", status.sent_alerts || 0],
     ["Wallet stats enriched", status.performance_analyzed || 0], ["Performance boosts", status.performance_bonused || 0],
+    ["Discord token boosts", status.discordBoostedWallets || 0],
     ["Long-hold boosts", status.hold_bonused || 0], ["Soft penalties", status.performance_penalized || 0],
     ["Last score refresh", formatUkTime(status.last_performance_at)],
     ["Duplicates blocked", status.duplicateEvents || 0], ["Delivery issues", status.outbox_failures || 0],

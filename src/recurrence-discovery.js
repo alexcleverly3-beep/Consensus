@@ -130,9 +130,13 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   ensureColumn(db, "recurrence_token_queue", "priority", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "recurrence_token_queue", "source", "TEXT NOT NULL DEFAULT 'trending'");
   ensureColumn(db, "recurrence_token_queue", "priority_queued_at", "INTEGER");
+  ensureColumn(db, "recurrence_token_queue", "user_discord_priority", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recurrence_wallet_tokens", "user_discord_evidence", "INTEGER NOT NULL DEFAULT 0");
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_recurrence_token_queue_status
       ON recurrence_token_queue(status, priority DESC, first_seen_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_recurrence_wallet_tokens_user_discord
+      ON recurrence_wallet_tokens(wallet_address) WHERE user_discord_evidence = 1;
   `);
 
   const getToken = db.prepare("SELECT * FROM recurrence_token_queue WHERE token_address = ?");
@@ -143,8 +147,8 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   `);
   const insertPriorityToken = db.prepare(`
     INSERT INTO recurrence_token_queue(
-      token_address, first_seen_at, last_seen_at, status, trend_json, priority, source, priority_queued_at
-    ) VALUES (?, ?, ?, 'pending', '{}', 1, ?, ?)
+      token_address, first_seen_at, last_seen_at, status, trend_json, priority, source, priority_queued_at, user_discord_priority
+    ) VALUES (?, ?, ?, 'pending', '{}', 1, ?, ?, ?)
   `);
   const updateTokenSeen = db.prepare(`
     UPDATE recurrence_token_queue
@@ -159,7 +163,7 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   const reprioritizeToken = db.prepare(`
     UPDATE recurrence_token_queue
     SET last_seen_at = ?, status = 'pending', priority = 1,
-        source = ?, priority_queued_at = ?, last_error = NULL
+        source = ?, priority_queued_at = ?, user_discord_priority = MAX(user_discord_priority, ?), last_error = NULL
     WHERE token_address = ?
   `);
   const nextToken = db.prepare(`
@@ -181,7 +185,8 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
   const markScanned = db.prepare(`
     UPDATE recurrence_token_queue
     SET last_scanned_at = ?, scan_count = scan_count + 1,
-        status = 'done', last_error = NULL, priority = 0, priority_queued_at = NULL
+        status = 'done', last_error = NULL, priority = 0, priority_queued_at = NULL,
+        user_discord_priority = 0
     WHERE token_address = ?
   `);
   const markFailed = db.prepare(`
@@ -209,15 +214,16 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     INSERT INTO recurrence_wallet_tokens(
       wallet_address, token_address, first_seen_at, last_seen_at,
       scan_appearances, best_rank, latest_rank, latest_profit,
-      latest_profit_change, tags_json, is_creator, is_insider
-    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+      latest_profit_change, tags_json, is_creator, is_insider, user_discord_evidence
+    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const updateWalletToken = db.prepare(`
     UPDATE recurrence_wallet_tokens
     SET last_seen_at = ?, scan_appearances = scan_appearances + 1,
         best_rank = MIN(best_rank, ?), latest_rank = ?,
         latest_profit = ?, latest_profit_change = ?, tags_json = ?,
-        is_creator = MAX(is_creator, ?), is_insider = MAX(is_insider, ?)
+        is_creator = MAX(is_creator, ?), is_insider = MAX(is_insider, ?),
+        user_discord_evidence = MAX(user_discord_evidence, ?)
     WHERE wallet_address = ? AND token_address = ?
   `);
   const totals = db.prepare(`
@@ -278,16 +284,17 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
     return { rows: rows.length, uniqueTokens: seen.size, added, refreshed, invalid };
   }
 
-  function enqueuePriorityToken(address, { observedAt = Date.now(), source = "discord" } = {}) {
+  function enqueuePriorityToken(address, { observedAt = Date.now(), source = "discord", userSubmitted = false } = {}) {
     const canonical = canonicalAddress(address);
     if (!SOL_ADDR.test(canonical)) throw new Error("valid tokenAddress is required");
     const safeSource = String(source || "manual").slice(0, 64);
+    const userDiscordPriority = safeSource === "discord" && userSubmitted === true ? 1 : 0;
     const existing = getToken.get(canonical);
     if (!existing) {
-      insertPriorityToken.run(canonical, observedAt, observedAt, safeSource, observedAt);
+      insertPriorityToken.run(canonical, observedAt, observedAt, safeSource, observedAt, userDiscordPriority);
       return { tokenAddress: canonical, added: true, reprioritized: false };
     }
-    reprioritizeToken.run(observedAt, safeSource, observedAt, canonical);
+    reprioritizeToken.run(observedAt, safeSource, observedAt, userDiscordPriority, canonical);
     return { tokenAddress: canonical, added: false, reprioritized: true };
   }
 
@@ -322,16 +329,17 @@ function initRecurrenceStore(db, { rescanMs = 24 * 60 * 60 * 1000 } = {}) {
       const profit = num(trader?.profit, num(trader?.realized_profit) + num(trader?.unrealized_profit));
       const profitChange = num(trader?.profit_change ?? trader?.realized_pnl, 0);
       const existing = getWalletToken.get(wallet, address);
+      const userDiscordEvidence = num(tokenBefore?.user_discord_priority) > 0 && rank <= 50 ? 1 : 0;
 
       if (!existing) {
         insertWalletToken.run(
           wallet, address, observedAt, observedAt, rank, rank,
-          profit, profitChange, JSON.stringify(tags), isCreator, isInsider
+          profit, profitChange, JSON.stringify(tags), isCreator, isInsider, userDiscordEvidence
         );
       } else {
         updateWalletToken.run(
           observedAt, rank, rank, profit, profitChange, JSON.stringify(tags),
-          isCreator, isInsider, wallet, address
+          isCreator, isInsider, userDiscordEvidence, wallet, address
         );
       }
       accepted += 1;

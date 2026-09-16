@@ -27,7 +27,8 @@ async function handlePriorityMessage(message, { store, onQueued = null, env = pr
   const address = findSolAddress(message?.content);
   if (!address) return { handled: false, reason: "no-token" };
 
-  const queued = store.enqueuePriorityToken(address, { source: "discord" });
+  const userSubmitted = Boolean(channelId && String(message?.channelId || "") === channelId);
+  const queued = store.enqueuePriorityToken(address, { source: "discord", userSubmitted });
   if (typeof message?.reply === "function") {
     await message.reply(`⚡ ${short(address)} queued for priority trader scan.`).catch(() => {});
   }

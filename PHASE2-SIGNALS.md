@@ -17,6 +17,12 @@ Required for alert delivery:
 
 The Discord bot needs View Channel, Send Messages and Embed Links in the alert channel.
 
+## Discord scan evidence
+
+Future token addresses posted by a human in `DISCORD_CHANNEL_ID` remain priority scans. A wallet appearing among the first 50 trader results for one of those completed scans receives a small Phase 2 reputation boost: +3 for one distinct posted token, +6 maximum for two or more. Signal points still use the usual reputation bands, so a boost changes alert points only when it crosses a band. It never bypasses the Phase 2 entry criteria. The Phase 1 wallet table shows the number of distinct qualifying tokens as **Your token hits**.
+
+The submitted-token flag is captured on the pending scan and saved once per wallet/token pair. Reposts and rescans cannot stack the same token, dashboard-submitted tokens do not qualify, and past Discord messages cannot be safely attributed retroactively.
+
 Optional tuning variables and defaults:
 
 - `TRACKED_WALLET_LIMIT=100`

@@ -36,6 +36,7 @@ test("private dashboard surfaces exact recurring-wallet candidates and last-hour
   recurrence.enqueueTrending({ data: { list: [
     { address: TOKEN_A }, { address: TOKEN_B }, { address: TOKEN_C },
   ] } }, now - 10_000);
+  recurrence.enqueuePriorityToken(TOKEN_B, { observedAt: now - 9_000, source: "discord", userSubmitted: true });
 
   recurrence.ingestTokenTraders({ tokenAddress: TOKEN_A, observedAt: now - 50 * 60 * 1000, traders: [trader(WALLET_REPEAT)] });
   recurrence.ingestTokenTraders({ tokenAddress: TOKEN_B, observedAt: now - 30 * 60 * 1000, traders: [trader(WALLET_REPEAT), trader(WALLET_OTHER)] });
@@ -53,6 +54,7 @@ test("private dashboard surfaces exact recurring-wallet candidates and last-hour
   assert.equal(wallets[0].walletAddress, WALLET_REPEAT);
   assert.equal(wallets[0].distinctTokens, 3);
   assert.equal(wallets[0].top10Tokens, 3);
+  assert.equal(wallets[0].discordPickTokens, 1);
   assert.equal(wallets[0].checked, false);
   assert.equal(dashboard.walletCount({ minDistinctTokens: 2 }), 2);
   assert.equal(dashboard.walletCount({ minDistinctTokens: 3 }), 1);
@@ -133,19 +135,20 @@ test("dashboard lists queue in scanner order and can remove queued work without 
     { address: TOKEN_A, symbol: "AAA" },
     { address: TOKEN_B, symbol: "BBB" },
   ] } }, now - 20_000);
-  recurrence.enqueuePriorityToken(TOKEN_C, { observedAt: now - 5_000, source: "dashboard" });
+  recurrence.enqueuePriorityToken(TOKEN_C, { observedAt: now - 5_000, source: "discord", userSubmitted: true });
 
   const dashboard = createRecurrenceDashboardStore(db, { now: () => now });
   let queue = dashboard.queue();
   assert.equal(queue.length, 3);
   assert.equal(queue[0].tokenAddress, TOKEN_C);
   assert.equal(queue[0].priority, true);
-  assert.equal(queue[0].source, "dashboard");
+  assert.equal(queue[0].source, "discord");
   assert.equal(queue[1].label, "AAA");
   assert.equal(queue[1].scanType, "new");
 
   const cancelled = dashboard.cancelQueuedToken(TOKEN_C);
   assert.equal(cancelled.cancelled, true);
+  assert.equal(db.prepare("SELECT user_discord_priority FROM recurrence_token_queue WHERE token_address=?").get(TOKEN_C).user_discord_priority, 0);
   assert.equal(recurrence.summary().queuedTokens, 2);
   queue = dashboard.queue();
   assert.equal(queue.some((row) => row.tokenAddress === TOKEN_C), false);
@@ -213,6 +216,7 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
     totalAppearances: 5,
     top10Tokens: 2,
     top25Tokens: 3,
+    discordPickTokens: 1,
     bestRank: 2,
     averageBestRank: 7.5,
     lastSeenAt: 9_000,
@@ -266,6 +270,7 @@ test("dashboard HTML includes queue controls, wallet check controls and recurren
   assert.match(html, /1 new · 0 rescans/);
   assert.match(html, />completed</);
   assert.match(html, /Top 1 recurring wallets — 2\+ distinct tokens/);
+  assert.match(html, /Your token hits/);
   assert.match(html, /812<\/strong> wallets qualify at 2\+ distinct tokens/);
   assert.match(html, /100<\/strong> total unique wallets observed/);
   assert.match(html, /href="\/\?min=3"/);

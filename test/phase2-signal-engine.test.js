@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
+const { initRecurrenceStore } = require("../src/recurrence-discovery");
 const {
   USDC_MINT,
   WSOL_MINT,
@@ -73,6 +74,35 @@ test("tracked selection automatically includes strong Phase 1 leaderboard wallet
   assert.equal(selected[0].source, "phase1-leaderboard");
   assert.ok(selected[0].points >= 1);
   assert.deepEqual(canonicalTrustedProfiles(db, 100).map((item) => item.walletAddress), [WALLET_C]);
+});
+
+test("distinct Discord-scan tokens give a capped reputation boost before alert points are assigned", () => {
+  const db = new Database(":memory:");
+  const recurrence = initRecurrenceStore(db);
+  const tokenSuffixes = "123456789A";
+  for (let index = 0; index < tokenSuffixes.length; index += 1) {
+    const token = `${"A".repeat(31)}${tokenSuffixes[index]}`;
+    recurrence.enqueueTrending({ data: { list: [{ address: token }] } }, 1_000 + index);
+    recurrence.ingestTokenTraders({ tokenAddress: token, observedAt: 2_000 + index,
+      traders: [{ address: WALLET_A, buy_tx_count_cur: 1, sell_tx_count_cur: 0 }] });
+  }
+  const before = canonicalTrustedProfiles(db, 100)[0];
+  assert.equal(before.discordBonus, 0);
+  for (let index = 0; index < 3; index += 1) {
+    const token = `${"A".repeat(31)}${tokenSuffixes[index]}`;
+    recurrence.enqueuePriorityToken(token, { observedAt: 3_000 + index, source: "discord", userSubmitted: true });
+    recurrence.ingestTokenTraders({ tokenAddress: token, observedAt: 4_000 + index,
+      traders: [{ address: WALLET_A, buy_tx_count_cur: 1, sell_tx_count_cur: 0 }] });
+  }
+  const after = canonicalTrustedProfiles(db, 100)[0];
+  assert.equal(after.discordEvidenceTokens, 3);
+  assert.equal(after.discordBonus, 6);
+  assert.equal(after.reputation, Math.min(100, before.reputation + 6));
+  assert.ok(after.points >= before.points);
+  assert.match(after.scoreVersion, /discord-token-evidence-v1/);
+  const store = initPhase2SignalStore(db);
+  assert.equal(store.stats().discordBoostedWallets, 1);
+  db.close();
 });
 
 test("Phase 1 leaderboard bridge allows creator and insider wallets during calibration", () => {
